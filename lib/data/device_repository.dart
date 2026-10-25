@@ -1,0 +1,17 @@
+import 'models.dart';
+
+/// 控制器依赖的设备能力边界，BLE 是当前唯一实现。
+abstract interface class DeviceRepository {
+  Future<DeviceStatus> getStatus(TimingProfile profile);
+  Future<TimingSettings> getSettings(TimingProfile profile);
+  Future<void> saveSettings(TimingProfile profile, TimingSettings settings);
+  Future<void> resetSettings(TimingProfile profile);
+  Future<void> setAuto(TimingProfile profile,
+      {bool replace = false, bool switchProfile = false});
+  Future<void> startTimed(TimingProfile profile, {bool replace = false});
+  Future<void> startPause(TimingProfile profile, {bool replace = false});
+  Future<void> startFanTest(TimingProfile profile, {bool replace = false});
+  Future<void> armLockOff(TimingProfile profile);
+  Future<void> confirmLockOff(TimingProfile profile, {bool replace = false});
+  Future<void> cancelLockOff(TimingProfile profile);
+}
