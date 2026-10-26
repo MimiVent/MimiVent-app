@@ -28,11 +28,15 @@ class RunningLogoGlow extends StatefulWidget {
     required this.isRunning,
     required this.size,
     required this.radius,
+    this.glowEnabled = true,
   });
 
   final bool isRunning;
   final double size;
   final double radius;
+  final bool glowEnabled;
+
+  bool get shouldGlow => glowEnabled && isRunning;
 
   @override
   State<RunningLogoGlow> createState() => RunningLogoGlowState();
@@ -43,21 +47,21 @@ class RunningLogoGlowState extends State<RunningLogoGlow>
   late final AnimationController _pulse = AnimationController(
     vsync: this,
     duration: MimiVentMotion.logoPulse,
-    value: widget.isRunning ? .35 : 0,
+    value: widget.shouldGlow ? .35 : 0,
   );
 
   @override
   void initState() {
     super.initState();
-    if (widget.isRunning) _pulse.repeat(reverse: true);
+    if (widget.shouldGlow) _pulse.repeat(reverse: true);
   }
 
   @override
   void didUpdateWidget(covariant RunningLogoGlow oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (widget.isRunning && !_pulse.isAnimating) {
+    if (widget.shouldGlow && !_pulse.isAnimating) {
       _pulse.repeat(reverse: true);
-    } else if (!widget.isRunning && _pulse.isAnimating) {
+    } else if (!widget.shouldGlow && _pulse.isAnimating) {
       _pulse.animateTo(0, duration: const Duration(milliseconds: 260));
     }
   }
@@ -72,14 +76,14 @@ class RunningLogoGlowState extends State<RunningLogoGlow>
   Widget build(BuildContext context) => AnimatedBuilder(
         animation: _pulse,
         builder: (context, _) {
-          final glow = widget.isRunning ? _pulse.value : 0.0;
+          final glow = widget.shouldGlow ? _pulse.value : 0.0;
           return Container(
             width: widget.size,
             height: widget.size,
             decoration: BoxDecoration(
               color: const Color(0xFF203A32),
               borderRadius: BorderRadius.circular(widget.radius),
-              boxShadow: widget.isRunning
+              boxShadow: widget.shouldGlow
                   ? [
                       BoxShadow(
                         color:

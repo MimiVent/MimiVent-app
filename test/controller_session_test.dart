@@ -281,6 +281,14 @@ class _FakeRepository implements DeviceRepository {
   int setAutoCalls = 0;
 
   @override
+  Future<Map<String, dynamic>> getStatistics(
+          TimingProfile profile, String range) async =>
+      <String, dynamic>{};
+
+  @override
+  Future<void> syncClock(TimingProfile profile) async {}
+
+  @override
   Future<DeviceStatus> getStatus(TimingProfile profile) =>
       onGetStatus?.call(profile) ?? Future.value(_status('default'));
   @override

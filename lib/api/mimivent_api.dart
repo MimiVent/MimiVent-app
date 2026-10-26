@@ -115,6 +115,30 @@ class MimiVentApi {
     return status;
   }
 
+  /// 手机时间只负责校准设备日历，不影响风机状态机的 millis() 计时。
+  Future<void> syncClock(TimingProfile profile) async {
+    final now = DateTime.now();
+    final epochSeconds = now.millisecondsSinceEpoch ~/ 1000;
+    final utcOffsetMinutes = now.timeZoneOffset.inMinutes;
+    await _request(
+      method: 'POST',
+      path: '/api/time',
+      profile: profile,
+      body: 'unixTime=$epochSeconds&utcOffsetMinutes=$utcOffsetMinutes',
+    );
+    diagnostics?.info('设备时间', '已用手机时间校准设备时钟和本地时区');
+  }
+
+  Future<Map<String, dynamic>> getStatistics(
+      TimingProfile profile, String range) async {
+    return _request(
+      method: 'GET',
+      path: '/api/stats',
+      profile: profile,
+      query: {'mode': range},
+    );
+  }
+
   Future<TimingSettings> getSettings(TimingProfile profile) async {
     final json = await _request(
       method: 'GET',

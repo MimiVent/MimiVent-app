@@ -144,13 +144,6 @@ extension _DashboardStatusCards on _DashboardPageState {
           color: const Color(0xFF17231F),
           borderRadius: BorderRadius.circular(20),
           border: Border.all(color: MimiVentColors.amber.withOpacity(.32)),
-          boxShadow: [
-            BoxShadow(
-              color: MimiVentColors.amber.withOpacity(.06),
-              blurRadius: 24,
-              offset: const Offset(0, 8),
-            ),
-          ],
         ),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -295,68 +288,63 @@ extension _DashboardStatusCards on _DashboardPageState {
         border: Border.all(
             color: (isOn ? MimiVentColors.amber : MimiVentColors.mint)
                 .withOpacity(.12)),
-        boxShadow: isOn
-            ? _displayCardShadows(MimiVentColors.amber)
-            : [
-                BoxShadow(
-                  color: Colors.black.withOpacity(.4),
-                  blurRadius: 24,
-                  offset: const Offset(0, 9),
-                ),
-                BoxShadow(
-                  color: MimiVentColors.mint.withOpacity(.12),
-                  blurRadius: 18,
-                  spreadRadius: 1,
-                  offset: const Offset(0, 3),
-                ),
-              ],
+        boxShadow: const [],
       ),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Expanded(
-              child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                const Text('MIMIVENT · STATUS',
-                    style: TextStyle(
-                        color: MimiVentColors.muted,
-                        fontSize: 10,
-                        letterSpacing: 1.5)),
-                const SizedBox(height: 9),
-                Text(
-                    isOn
-                        ? '风机运行中'
-                        : status.mode == 'lock_off'
-                            ? '持续关闭'
-                            : '风机待机',
-                    style: const TextStyle(
-                        fontSize: 27,
-                        fontWeight: FontWeight.w800,
-                        letterSpacing: -.6)),
-                const SizedBox(height: 5),
-                Text(DeviceStatusPresenter.phaseDescription(status),
-                    style: const TextStyle(
-                        color: MimiVentColors.muted, fontSize: 13)),
-              ])),
-          AnimatedContainer(
-            duration: const Duration(milliseconds: 1800),
-            curve: Curves.easeInOutCubic,
-            width: 66,
-            height: 66,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: (isOn ? MimiVentColors.amber : MimiVentColors.mint)
-                  .withOpacity(.09),
-              border: Border.all(
-                  color: (isOn ? MimiVentColors.amber : MimiVentColors.mint)
-                      .withOpacity(.26)),
+        SizedBox(
+          height: 80,
+          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Expanded(
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                  const Text('MIMIVENT · STATUS',
+                      style: TextStyle(
+                          color: MimiVentColors.muted,
+                          fontSize: 10,
+                          height: 1,
+                          letterSpacing: 1.5)),
+                  const SizedBox(height: 9),
+                  Text(
+                      isOn
+                          ? '风机运行中'
+                          : status.mode == 'lock_off'
+                              ? '持续关闭'
+                              : '风机待机',
+                      style: const TextStyle(
+                          fontSize: 27,
+                          height: 1,
+                          fontWeight: FontWeight.w800,
+                          letterSpacing: -.6),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis),
+                  const SizedBox(height: 5),
+                  Text(DeviceStatusPresenter.phaseDescription(status),
+                      style: const TextStyle(
+                          color: MimiVentColors.muted, fontSize: 13, height: 1),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis),
+                ])),
+            AnimatedContainer(
+              duration: const Duration(milliseconds: 1800),
+              curve: Curves.easeInOutCubic,
+              width: 66,
+              height: 66,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: (isOn ? MimiVentColors.amber : MimiVentColors.mint)
+                    .withOpacity(.09),
+                border: Border.all(
+                    color: (isOn ? MimiVentColors.amber : MimiVentColors.mint)
+                        .withOpacity(.26)),
+              ),
+              child: FanStatusRotor(
+                isRunning: isOn,
+                size: 38,
+              ),
             ),
-            child: FanStatusRotor(
-              isRunning: isOn,
-              size: 38,
-            ),
-          ),
-        ]),
+          ]),
+        ),
         const SizedBox(height: 18),
         SizedBox(
           height: 26,
@@ -427,34 +415,37 @@ extension _DashboardStatusCards on _DashboardPageState {
           required String detail,
           required IconData icon,
           required Color accent}) =>
-      Container(
-        padding: const EdgeInsets.all(15),
-        decoration: BoxDecoration(
-            color: MimiVentColors.surface,
-            borderRadius: BorderRadius.circular(21),
-            border: Border.all(color: Colors.white.withOpacity(.055)),
-            boxShadow: _displayCardShadows(accent)),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Row(children: [
-            Icon(icon, color: accent, size: 17),
-            const SizedBox(width: 7),
-            Text(title,
-                style:
-                    const TextStyle(color: MimiVentColors.muted, fontSize: 12))
+      ConstrainedBox(
+        constraints: const BoxConstraints(minHeight: 104),
+        child: Container(
+          padding: const EdgeInsets.all(15),
+          decoration: BoxDecoration(
+              color: MimiVentColors.surface,
+              borderRadius: BorderRadius.circular(21),
+              border: Border.all(color: Colors.white.withOpacity(.055))),
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              Icon(icon, color: accent, size: 17),
+              const SizedBox(width: 7),
+              Text(title,
+                  style: const TextStyle(
+                      color: MimiVentColors.muted, fontSize: 12, height: 1))
+            ]),
+            const SizedBox(height: 15),
+            Text(value,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                    fontSize: 16, height: 1, fontWeight: FontWeight.w800)),
+            const SizedBox(height: 5),
+            Text(detail,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                    color: MimiVentColors.muted, fontSize: 10, height: 1)),
           ]),
-          const SizedBox(height: 15),
-          Text(value,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style:
-                  const TextStyle(fontSize: 16, fontWeight: FontWeight.w800)),
-          const SizedBox(height: 5),
-          Text(detail,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style:
-                  const TextStyle(color: MimiVentColors.muted, fontSize: 10)),
-        ]),
+        ),
       );
 
   Widget _runtimeCard(DeviceStatus status) {
@@ -464,8 +455,7 @@ extension _DashboardStatusCards on _DashboardPageState {
       decoration: BoxDecoration(
           color: const Color(0xFF10201D),
           borderRadius: BorderRadius.circular(20),
-          border: Border.all(color: Colors.white.withOpacity(.05)),
-          boxShadow: _displayCardShadows(MimiVentColors.mint)),
+          border: Border.all(color: Colors.white.withOpacity(.05))),
       child: Column(children: [
         Row(children: [
           const Text('当前运行配置',
@@ -489,39 +479,85 @@ extension _DashboardStatusCards on _DashboardPageState {
         const SizedBox(height: 8),
         Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
           Expanded(
+            child: SizedBox(
+              height: 44,
               child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                Text(config.$1,
-                    style: const TextStyle(
-                        fontWeight: FontWeight.w700, fontSize: 15)),
-                const SizedBox(height: 3),
-                Text(config.$2,
-                    style: const TextStyle(
-                        color: MimiVentColors.muted, fontSize: 11)),
-              ])),
-          Text(config.$3,
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(config.$1,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                          fontWeight: FontWeight.w700, fontSize: 15)),
+                  const SizedBox(height: 3),
+                  Text(config.$2,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                          color: MimiVentColors.muted, fontSize: 11)),
+                ],
+              ),
+            ),
+          ),
+          SizedBox(
+            width: 78,
+            child: Text(
+              config.$3,
+              textAlign: TextAlign.right,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
               style: const TextStyle(
                   color: MimiVentColors.mint,
                   fontSize: 17,
-                  fontWeight: FontWeight.w800)),
+                  fontWeight: FontWeight.w800),
+            ),
+          ),
         ]),
         const SizedBox(height: 9),
         Divider(height: 1, color: Colors.white.withOpacity(.07)),
         const SizedBox(height: 9),
-        Wrap(spacing: 6, runSpacing: 6, children: [
-          _miniConfig('离开确认', status.leaveConfirmMs),
-          _miniConfig('自动排风', status.autoExhaustMs),
-          _miniConfig('临时排风', status.manualExhaustMs),
-          _miniConfig('临时暂停', status.pauseMs),
-          _miniConfig('启动冷静期', status.startupCooldownMs),
-        ]),
+        LayoutBuilder(
+          builder: (context, constraints) {
+            // 两列等宽并固定为三行，避免窄屏或较长时间文本把卡片撑宽。
+            final chipWidth = (constraints.maxWidth - 6) / 2;
+            final items = [
+              _miniConfig('离开确认', status.leaveConfirmMs),
+              _miniConfig('自动排风', status.autoExhaustMs),
+              _miniConfig('临时排风', status.manualExhaustMs),
+              _miniConfig('临时暂停', status.pauseMs),
+              _miniConfig('启动冷静期', status.startupCooldownMs),
+            ];
+            return Column(
+              children: [
+                for (var index = 0; index < items.length; index += 2) ...[
+                  if (index > 0) const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      SizedBox(width: chipWidth, child: items[index]),
+                      const SizedBox(width: 6),
+                      SizedBox(
+                        width: chipWidth,
+                        child: index + 1 < items.length
+                            ? items[index + 1]
+                            : const SizedBox.shrink(),
+                      ),
+                    ],
+                  ),
+                ],
+              ],
+            );
+          },
+        ),
       ]),
     );
   }
 
   Widget _miniConfig(String label, int time) => _tagShell(
         RichText(
+          maxLines: 1,
+          softWrap: false,
+          overflow: TextOverflow.ellipsis,
           text: TextSpan(
             style: const TextStyle(fontSize: 9, color: MimiVentColors.muted),
             children: [
@@ -549,50 +585,6 @@ extension _DashboardStatusCards on _DashboardPageState {
             style: const TextStyle(fontSize: 10, color: MimiVentColors.muted)),
       ]);
 
-  Widget _autoButton(DeviceStatus status, bool mismatch) {
-    final selected = status.mode == 'auto';
-    return Material(
-      color: selected ? const Color(0xFF9BE8CC) : MimiVentColors.surfaceRaised,
-      borderRadius: BorderRadius.circular(20),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(20),
-        onTap: _canOperate(status, mismatch, allowCooldown: false)
-            ? () => _runAction(ControlOperation.automatic)
-            : null,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(17, 15, 17, 15),
-          child: Row(children: [
-            Icon(selected ? Icons.check_circle : Icons.autorenew_rounded,
-                color:
-                    selected ? const Color(0xFF12251E) : MimiVentColors.mint),
-            const SizedBox(width: 12),
-            Expanded(
-                child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                  Text(selected ? '已启用自动感应' : '切换到自动感应',
-                      style: TextStyle(
-                          color:
-                              selected ? const Color(0xFF12251E) : Colors.white,
-                          fontWeight: FontWeight.w800,
-                          fontSize: 15)),
-                  const SizedBox(height: 3),
-                  Text(selected ? '活动时立即停风；离开确认后排风' : '立即停止当前操作并恢复自动流程',
-                      style: TextStyle(
-                          color: selected
-                              ? const Color(0xFF315C4A)
-                              : MimiVentColors.muted,
-                          fontSize: 11)),
-                ])),
-            Icon(Icons.arrow_forward_rounded,
-                color:
-                    selected ? const Color(0xFF12251E) : MimiVentColors.mint),
-          ]),
-        ),
-      ),
-    );
-  }
-
   Widget _actionCard(
           {required Widget icon,
           required String title,
@@ -608,7 +600,7 @@ extension _DashboardStatusCards on _DashboardPageState {
           borderRadius: BorderRadius.circular(19),
           onTap: enabled ? onTap : null,
           child: Container(
-            constraints: const BoxConstraints(minHeight: 104),
+            height: 104,
             padding: const EdgeInsets.all(14),
             decoration: BoxDecoration(
                 borderRadius: BorderRadius.circular(19),
@@ -616,7 +608,7 @@ extension _DashboardStatusCards on _DashboardPageState {
                     color: selected
                         ? accent.withOpacity(.55)
                         : Colors.white.withOpacity(.06),
-                    width: selected ? 1.4 : 1)),
+                    width: 1.2)),
             child: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -629,12 +621,16 @@ extension _DashboardStatusCards on _DashboardPageState {
                   ]),
                   const SizedBox(height: 12),
                   Text(title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                           color: enabled ? Colors.white : MimiVentColors.muted,
                           fontWeight: FontWeight.w700,
                           fontSize: 13)),
                   const SizedBox(height: 3),
                   Text(detail,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                           color: selected ? accent : MimiVentColors.muted,
                           fontSize: 11)),

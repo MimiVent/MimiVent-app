@@ -63,7 +63,7 @@ flutter build apk --release
 
 生成文件：`build/app/outputs/flutter-apk/app-release.apk`。
 
-当前 Release 变体使用 Debug 签名，适合个人设备安装和验证。正式公开分发或应用商店上架前，需要配置长期保管的 Release keystore；私钥与密码不得提交到 Git。首次发布版本为 `0.1.0+1`，后续更新需递增构建号。
+当前 Release 变体使用 Debug 签名，适合个人设备安装和验证。正式公开分发或应用商店上架前，需要配置长期保管的 Release keystore；私钥与密码不得提交到 Git。当前正式版本为 `0.2.0+2`；后续更新需递增构建号。
 
 用 USB 数据线安装到 Android 真机：先在手机开启“开发者选项 / USB 调试”，连接电脑并在手机上允许此电脑调试，然后确认设备已授权：
 
@@ -137,4 +137,4 @@ flutter build apk --debug
 
 ### 首次 APK 分发说明
 
-当前 `android/app/build.gradle` 的 Release 变体仍使用 Debug 签名，适合个人设备安装和验证。正式公开分发或应用商店上架前，需要配置长期保管的 Release keystore；私钥与密码不得提交到 Git。首次发布版本为 `0.1.0+1`，后续更新需递增构建号。
+当前 `android/app/build.gradle` 的 Release 变体仍使用 Debug 签名，适合个人设备安装和验证。正式公开分发或应用商店上架前，需要配置长期保管的 Release keystore；私钥与密码不得提交到 Git。当前正式版本为 `0.2.0+2`；后续更新需递增构建号。

@@ -32,6 +32,11 @@ class MimiVentController extends ChangeNotifier {
   final AppDiagnosticsLog? diagnostics;
   late DeviceRepository repository;
   DeviceStatus? status;
+  Map<String, dynamic>? statistics;
+  final Map<String, Map<String, dynamic>> _statisticsByRange = {};
+  final Set<String> _statisticsLoadingRanges = {};
+  final Set<String> _statisticsFailedRanges = {};
+  final Set<String> _statisticsRequests = {};
   TimingSettings? settings;
   SettingsDraft? _settingsDraft;
   TimingSettings? get draftSettings => _settingsDraft?.value;
@@ -54,6 +59,13 @@ class MimiVentController extends ChangeNotifier {
   bool get hasUnsavedSettings => _settingsDraft?.isDirty ?? false;
   bool get hasInterruptibleTask => hasInterruptibleOperation(status);
 
+  Map<String, dynamic>? statisticsFor(String range) =>
+      _statisticsByRange[range];
+  bool statisticsLoadingFor(String range) =>
+      _statisticsLoadingRanges.contains(range);
+  bool statisticsFailedFor(String range) =>
+      _statisticsFailedRanges.contains(range);
+
   /// 清除当前设备会话的错误提示，例如用户主动发起重新连接时。
   void clearError() {
     if (lastError == null) return;
@@ -70,6 +82,11 @@ class MimiVentController extends ChangeNotifier {
       // 让断开前正在进行的状态读取失效，避免异步结果重新写入旧会话。
       _sessionGeneration++;
       status = null;
+      statistics = null;
+      _statisticsByRange.clear();
+      _statisticsLoadingRanges.clear();
+      _statisticsFailedRanges.clear();
+      _statisticsRequests.clear();
       _statusInvalid = false;
       settings = null;
       _settingsDraft = null;
@@ -146,6 +163,13 @@ class MimiVentController extends ChangeNotifier {
       final generation = _sessionGeneration;
       sessionGeneration = generation;
       final selectedProfile = profile;
+      try {
+        await repository.syncClock(selectedProfile);
+      } catch (error) {
+        diagnostics?.warning('设备时间', '手机时间同步失败，统计日期暂不可用：$error');
+      }
+      if (!_isCurrentSession(generation, selectedProfile) ||
+          attempt != _connectAttempt) return;
       // 状态先确认设备真实环境，再读取对应页面环境的时序，避免并发读取错配。
       final loadedStatus = await repository.getStatus(selectedProfile);
       if (!_isCurrentSession(generation, selectedProfile) ||
@@ -218,6 +242,37 @@ class MimiVentController extends ChangeNotifier {
       }
     } finally {
       _polling = false;
+      _notifyIfAlive();
+    }
+  }
+
+  Future<void> refreshStatistics(String range,
+      {int? expectedGeneration}) async {
+    if (!ble.isConnected) return;
+    final generation = expectedGeneration ?? _sessionGeneration;
+    if (generation != _sessionGeneration) return;
+    if (!_statisticsRequests.add(range)) return;
+    final selectedProfile = profile;
+    _statisticsLoadingRanges.add(range);
+    _statisticsFailedRanges.remove(range);
+    _notifyIfAlive();
+    try {
+      final loaded = await repository.getStatistics(selectedProfile, range);
+      if (_disposed ||
+          !ble.isConnected ||
+          generation != _sessionGeneration ||
+          selectedProfile != profile) return;
+      statistics = loaded;
+      _statisticsByRange[range] = loaded;
+      lastError = null;
+    } catch (error) {
+      if (!_disposed && generation == _sessionGeneration) {
+        _statisticsFailedRanges.add(range);
+        diagnostics?.warning('设备统计', '读取统计失败：$error');
+      }
+    } finally {
+      _statisticsRequests.remove(range);
+      _statisticsLoadingRanges.remove(range);
       _notifyIfAlive();
     }
   }

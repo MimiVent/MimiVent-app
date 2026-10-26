@@ -211,7 +211,9 @@ class MimiVentBleManager extends ChangeNotifier {
           '已启用响应通知；command=${_command!.uuid.str}, response=${_response!.uuid.str}');
       _notificationSubscription = _response!.onValueReceived.listen((bytes) {
         try {
-          if (_pendingResponse != null) _responseChunks.add(List.of(bytes));
+          // 只把当前请求期间的通知交给解码器；完成响应后到达的冗余尾包不属于下一请求。
+          if (_pendingResponse == null) return;
+          _responseChunks.add(List.of(bytes));
           final result = _decoder.add(bytes);
           if (result != null && _pendingResponse?.isCompleted == false) {
             _pendingResponse!.complete(result);
@@ -355,6 +357,8 @@ class MimiVentBleManager extends ChangeNotifier {
         !identical(command, _command)) {
       throw Exception('请先连接 ${AppIdentity.productName}');
     }
+    // 固件会为降低尾包丢失而重复发送最后通知。等待通知队列排空，避免旧响应串入下一条请求。
+    await Future<void>.delayed(const Duration(milliseconds: 150));
     final packet = BleProtocol.encodeRequest(
       method: method,
       path: path,

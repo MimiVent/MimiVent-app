@@ -24,6 +24,12 @@ extension _DashboardMainSections on _DashboardPageState {
                 (color) => Icon(Icons.tune_rounded, size: 14, color: color),
                 '时间设置',
               ),
+              _navItem(
+                2,
+                (color) =>
+                    Icon(Icons.bar_chart_rounded, size: 15, color: color),
+                '统计',
+              ),
             ],
           ),
         ),
@@ -123,6 +129,7 @@ extension _DashboardMainSections on _DashboardPageState {
       children: [
         _controlPage(status, settings),
         _settingsPage(status, settings),
+        StatisticsPage(controller: c, active: _activeTab == 2),
       ],
     );
   }
@@ -190,8 +197,6 @@ extension _DashboardMainSections on _DashboardPageState {
         const SizedBox(height: 12),
         _runtimeCard(status),
         const SizedBox(height: 14),
-        _autoButton(status, !c.profileMatches),
-        const SizedBox(height: 10),
         _quickActionsRow(status, settings),
         const SizedBox(height: 8),
         Center(child: _deviceMetaRow(status)),
@@ -203,6 +208,25 @@ extension _DashboardMainSections on _DashboardPageState {
       scrollDirection: Axis.horizontal,
       physics: const BouncingScrollPhysics(),
       child: Row(children: [
+        SizedBox(
+          width: 154,
+          child: _actionCard(
+            icon: Icon(
+              Icons.sensors_rounded,
+              size: 16,
+              color: status.mode == 'auto'
+                  ? MimiVentColors.mint
+                  : MimiVentColors.muted,
+            ),
+            title: '自动感应',
+            detail: '活动停风 · 离开后排风',
+            selected: status.mode == 'auto',
+            accent: MimiVentColors.mint,
+            enabled: _canOperate(status, mismatch, allowCooldown: false),
+            onTap: () => _runAction(ControlOperation.automatic),
+          ),
+        ),
+        const SizedBox(width: 10),
         SizedBox(
             width: 154,
             child: _actionCard(

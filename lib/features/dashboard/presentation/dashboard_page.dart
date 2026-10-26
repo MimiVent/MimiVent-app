@@ -19,9 +19,11 @@ import '../../../app/theme/mimivent_theme.dart';
 import '../../../shared/presentation/mimi_vent_dialogs.dart';
 import '../../../shared/presentation/modal_coordinator.dart';
 import '../../../shared/widgets/device_animations.dart';
+import '../../../shared/widgets/ble_signal_indicator.dart';
 import '../../connection/connection_presentation.dart';
 import '../../control/control_operation.dart';
 import '../../diagnostics/diagnostics_page.dart';
+import '../../statistics/presentation/statistics_page.dart';
 
 part 'dashboard_connection.part.dart';
 part 'dashboard_actions.part.dart';
@@ -48,7 +50,7 @@ class _DashboardPageState extends State<DashboardPage> {
   final ModalCoordinator _modalCoordinator = ModalCoordinator();
   MimiVentController get c => widget.controller;
   int _selectedTab = 0;
-  int get _activeTab => _selectedTab < 2 ? _selectedTab : 0;
+  int get _activeTab => _selectedTab < 3 ? _selectedTab : 0;
   double _headerCollapse = 0;
   bool _scanSheetOpen = false;
   bool _scanSheetDismissedDuringScan = false;
@@ -171,6 +173,7 @@ class _DashboardPageState extends State<DashboardPage> {
           isRunning: isRunning,
           size: logoSize,
           radius: 14 - 2 * collapse,
+          glowEnabled: false,
         ),
         const SizedBox(width: 10),
         Expanded(

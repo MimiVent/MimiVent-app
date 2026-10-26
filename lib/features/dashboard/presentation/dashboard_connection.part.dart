@@ -328,8 +328,9 @@ extension _DashboardConnectionSection on _DashboardPageState {
                                                   size: 22),
                                             ),
                                             title: Text(name),
-                                            subtitle:
-                                                Text('信号强度 ${result.rssi} dBm'),
+                                            subtitle: BleSignalIndicator(
+                                                rssi: result.rssi,
+                                                fontSize: 11),
                                             trailing: const Text(
                                               '点击连接',
                                               style: TextStyle(
@@ -435,9 +436,7 @@ extension _DashboardConnectionSection on _DashboardPageState {
                           style: const TextStyle(
                               fontSize: 17, fontWeight: FontWeight.w700)),
                       const SizedBox(height: 4),
-                      Text('信号强度  ${result.rssi} dBm',
-                          style: const TextStyle(
-                              color: MimiVentColors.muted, fontSize: 13)),
+                      BleSignalIndicator(rssi: result.rssi),
                     ],
                   ),
                 ),

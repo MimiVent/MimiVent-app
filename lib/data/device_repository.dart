@@ -4,6 +4,9 @@ import 'models.dart';
 abstract interface class DeviceRepository {
   Future<DeviceStatus> getStatus(TimingProfile profile);
   Future<TimingSettings> getSettings(TimingProfile profile);
+  Future<void> syncClock(TimingProfile profile);
+  Future<Map<String, dynamic>> getStatistics(
+      TimingProfile profile, String range);
   Future<void> saveSettings(TimingProfile profile, TimingSettings settings);
   Future<void> resetSettings(TimingProfile profile);
   Future<void> setAuto(TimingProfile profile,
