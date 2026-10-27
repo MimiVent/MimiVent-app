@@ -24,6 +24,7 @@ import '../../connection/connection_presentation.dart';
 import '../../control/control_operation.dart';
 import '../../diagnostics/diagnostics_page.dart';
 import '../../statistics/presentation/statistics_page.dart';
+import '../../../shared/widgets/version_compatibility_notice.dart';
 
 part 'dashboard_connection.part.dart';
 part 'dashboard_actions.part.dart';

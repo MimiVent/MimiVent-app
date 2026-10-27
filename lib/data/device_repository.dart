@@ -6,7 +6,12 @@ abstract interface class DeviceRepository {
   Future<TimingSettings> getSettings(TimingProfile profile);
   Future<void> syncClock(TimingProfile profile);
   Future<Map<String, dynamic>> getStatistics(
-      TimingProfile profile, String range);
+    TimingProfile profile,
+    String range, {
+    int offset = 0,
+  });
+  Future<DeviceEventPage> queryEvents(
+      TimingProfile profile, DeviceEventQuery query);
   Future<void> saveSettings(TimingProfile profile, TimingSettings settings);
   Future<void> resetSettings(TimingProfile profile);
   Future<void> setAuto(TimingProfile profile,

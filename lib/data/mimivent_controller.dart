@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -37,6 +38,8 @@ class MimiVentController extends ChangeNotifier {
   final Set<String> _statisticsLoadingRanges = {};
   final Set<String> _statisticsFailedRanges = {};
   final Set<String> _statisticsRequests = {};
+  final Set<String> _statisticsCachedRanges = {};
+  final Map<String, DateTime> _statisticsCacheUpdatedAt = {};
   TimingSettings? settings;
   SettingsDraft? _settingsDraft;
   TimingSettings? get draftSettings => _settingsDraft?.value;
@@ -46,11 +49,13 @@ class MimiVentController extends ChangeNotifier {
   bool _polling = false;
   bool _statusInvalid = false;
   bool _initialized = false;
+  bool _statisticsCacheLoaded = false;
   bool _disposed = false;
   int _sessionGeneration = 0;
   int _connectAttempt = 0;
   Future<void>? _closingBluetoothSession;
   static const _profileKey = 'mimivent.selected_profile';
+  static const _statisticsCacheKeyPrefix = 'mimivent.statistics.cache.';
   String? lastError;
 
   bool get connected => ble.isConnected;
@@ -61,10 +66,43 @@ class MimiVentController extends ChangeNotifier {
 
   Map<String, dynamic>? statisticsFor(String range) =>
       _statisticsByRange[range];
+  bool statisticsIsCachedFor(String range) =>
+      _statisticsCachedRanges.contains(range);
+  DateTime? statisticsCacheUpdatedAtFor(String range) =>
+      _statisticsCacheUpdatedAt[range];
   bool statisticsLoadingFor(String range) =>
       _statisticsLoadingRanges.contains(range);
   bool statisticsFailedFor(String range) =>
       _statisticsFailedRanges.contains(range);
+  bool statisticsHasMoreEventsFor(String range) =>
+      _statisticsByRange[range]?['eventsHasMore'] == true;
+  int statisticsNextEventOffsetFor(String range) {
+    final value = _statisticsByRange[range]?['eventsNextOffset'];
+    if (value is num) return value.toInt();
+    final events = _statisticsByRange[range]?['events'];
+    return events is List ? events.length : 0;
+  }
+
+  Future<void> loadMoreStatisticsEvents(String range) async {
+    if (!statisticsHasMoreEventsFor(range)) return;
+    await refreshStatistics(range,
+        eventOffset: statisticsNextEventOffsetFor(range));
+  }
+
+  /// 通用原始事件查询入口；页面可传入自然日、自定义时间段和事件筛选条件。
+  Future<DeviceEventPage> queryDeviceEvents(DeviceEventQuery query) async {
+    if (!ble.isConnected) throw StateError('请先连接 MimiVent 设备');
+    final selectedProfile = profile;
+    final generation = _sessionGeneration;
+    final result = await repository.queryEvents(selectedProfile, query);
+    if (_disposed ||
+        !ble.isConnected ||
+        generation != _sessionGeneration ||
+        selectedProfile != profile) {
+      throw StateError('蓝牙会话已变化，事件查询结果已丢弃');
+    }
+    return result;
+  }
 
   /// 清除当前设备会话的错误提示，例如用户主动发起重新连接时。
   void clearError() {
@@ -83,7 +121,14 @@ class MimiVentController extends ChangeNotifier {
       _sessionGeneration++;
       status = null;
       statistics = null;
-      _statisticsByRange.clear();
+      for (final range in _statisticsByRange.keys) {
+        _statisticsCachedRanges.add(range);
+        final updatedAt = _statisticsCacheUpdatedAt[range];
+        if (updatedAt != null) {
+          _statisticsByRange[range]!['_cacheUpdatedAt'] =
+              updatedAt.millisecondsSinceEpoch;
+        }
+      }
       _statisticsLoadingRanges.clear();
       _statisticsFailedRanges.clear();
       _statisticsRequests.clear();
@@ -111,7 +156,63 @@ class MimiVentController extends ChangeNotifier {
       _initialized = true;
       _notifyIfAlive();
     }
+    if (!_statisticsCacheLoaded) await _restoreStatisticsCache();
     if (!ble.isConnected && !ble.isScanning) await scan();
+  }
+
+  /// 从本地恢复各时间范围最近一次成功的统计，供首屏先显示缓存再做 BLE 刷新。
+  Future<void> _restoreStatisticsCache() async {
+    _statisticsCacheLoaded = true;
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      for (final range in const [
+        'today',
+        'yesterday',
+        'threeDays',
+        'sevenDays'
+      ]) {
+        if (_statisticsByRange.containsKey(range)) continue;
+        final raw = preferences.getString('$_statisticsCacheKeyPrefix$range');
+        if (raw == null) continue;
+        final decoded = jsonDecode(raw);
+        if (decoded is! Map<String, dynamic>) continue;
+        final payload = decoded['data'];
+        if (payload is! Map) continue;
+        final data = Map<String, dynamic>.from(payload);
+        final updatedAtMs = decoded['updatedAt'];
+        if (updatedAtMs is int && updatedAtMs > 0) {
+          final updatedAt = DateTime.fromMillisecondsSinceEpoch(updatedAtMs);
+          data['_cacheUpdatedAt'] = updatedAtMs;
+          _statisticsCacheUpdatedAt[range] = updatedAt;
+        }
+        _statisticsByRange[range] = data;
+        _statisticsCachedRanges.add(range);
+      }
+      _notifyIfAlive();
+    } catch (error) {
+      _statisticsCacheLoaded = false;
+      diagnostics?.warning('统计缓存', '恢复本地统计缓存失败：$error');
+    }
+  }
+
+  Future<void> _persistStatisticsCache(
+    String range,
+    Map<String, dynamic> data,
+  ) async {
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      final updatedAt = DateTime.now();
+      await preferences.setString(
+        '$_statisticsCacheKeyPrefix$range',
+        jsonEncode({
+          'updatedAt': updatedAt.millisecondsSinceEpoch,
+          'data': data,
+        }),
+      );
+      _statisticsCacheUpdatedAt[range] = updatedAt;
+    } catch (error) {
+      diagnostics?.warning('统计缓存', '保存本地统计缓存失败：$error');
+    }
   }
 
   /// App 退到后台时释放 BLE，避免占用设备连接。
@@ -247,7 +348,7 @@ class MimiVentController extends ChangeNotifier {
   }
 
   Future<void> refreshStatistics(String range,
-      {int? expectedGeneration}) async {
+      {int? expectedGeneration, int eventOffset = 0}) async {
     if (!ble.isConnected) return;
     final generation = expectedGeneration ?? _sessionGeneration;
     if (generation != _sessionGeneration) return;
@@ -257,13 +358,35 @@ class MimiVentController extends ChangeNotifier {
     _statisticsFailedRanges.remove(range);
     _notifyIfAlive();
     try {
-      final loaded = await repository.getStatistics(selectedProfile, range);
+      final Map<String, dynamic> loaded;
+      if (eventOffset == 0) {
+        loaded = await repository.getStatistics(selectedProfile, range);
+      } else {
+        // 统计汇总只在首屏读取；继续翻页时走通用原始事件接口，减少 BLE 传输。
+        final page = await repository.queryEvents(
+          selectedProfile,
+          _eventQueryForRange(range, offset: eventOffset),
+        );
+        loaded = {
+          'events': page.events.map((event) => event.toJson()).toList(),
+          'eventsOffset': page.offset,
+          'eventsNextOffset': page.nextOffset,
+          'eventsTotal': page.total,
+          'eventsHasMore': page.hasMore,
+        };
+      }
       if (_disposed ||
           !ble.isConnected ||
           generation != _sessionGeneration ||
           selectedProfile != profile) return;
-      statistics = loaded;
-      _statisticsByRange[range] = loaded;
+      final previous = _statisticsByRange[range];
+      final merged = _mergeStatisticsPage(previous, loaded, eventOffset);
+      statistics = merged;
+      _statisticsByRange[range] = merged;
+      _statisticsCachedRanges.remove(range);
+      merged.remove('_cacheUpdatedAt');
+      _statisticsCacheUpdatedAt[range] = DateTime.now();
+      unawaited(_persistStatisticsCache(range, merged));
       lastError = null;
     } catch (error) {
       if (!_disposed && generation == _sessionGeneration) {
@@ -275,6 +398,72 @@ class MimiVentController extends ChangeNotifier {
       _statisticsLoadingRanges.remove(range);
       _notifyIfAlive();
     }
+  }
+
+  /// 固件按新到旧返回原始事件。分页时拼接原始记录，刷新首屏时保留已加载的旧页。
+  /// 分组展示留给 App UI，这里不改变固件事件的语义或顺序。
+  Map<String, dynamic> _mergeStatisticsPage(
+    Map<String, dynamic>? previous,
+    Map<String, dynamic> page,
+    int offset,
+  ) {
+    final next = Map<String, dynamic>.from(page);
+    final freshEvents = _rawEventList(page['events']);
+    final oldEvents = _rawEventList(previous?['events']);
+    List<Map<String, dynamic>> mergedEvents;
+
+    if (offset > 0 && previous != null) {
+      mergedEvents = [...oldEvents, ...freshEvents];
+    } else if (oldEvents.isEmpty) {
+      mergedEvents = freshEvents;
+    } else {
+      // 找到新首屏与旧列表的重叠点，避免每分钟刷新时重复显示已有原始事件。
+      final oldFirstKey = _eventKey(oldEvents.first);
+      final overlapIndex =
+          freshEvents.indexWhere((event) => _eventKey(event) == oldFirstKey);
+      mergedEvents = overlapIndex >= 0
+          ? [...freshEvents, ...oldEvents.skip(1)]
+          : [...freshEvents, ...oldEvents];
+    }
+
+    final totalValue = page['eventsTotal'];
+    final total = totalValue is num ? totalValue.toInt() : mergedEvents.length;
+    final hasMore =
+        mergedEvents.length < total && page['eventsHasMore'] == true;
+    next['events'] = mergedEvents;
+    next['eventsOffset'] = 0;
+    next['eventsNextOffset'] = mergedEvents.length;
+    next['eventsTotal'] = total;
+    next['eventsHasMore'] = hasMore;
+    return next;
+  }
+
+  List<Map<String, dynamic>> _rawEventList(Object? value) => value is List
+      ? value
+          .whereType<Map>()
+          .map((event) => Map<String, dynamic>.from(event))
+          .toList()
+      : <Map<String, dynamic>>[];
+
+  String _eventKey(Map<String, dynamic> event) =>
+      '${event['time']}|${event['kind']}|${event['state']}|${event['durationSeconds']}';
+
+  DeviceEventQuery _eventQueryForRange(String range, {required int offset}) {
+    final now = DateTime.now();
+    if (range == 'today') {
+      return DeviceEventQuery(
+        start: now.subtract(const Duration(hours: 24)),
+        end: now,
+        offset: offset,
+      );
+    }
+    if (range == 'yesterday') {
+      return DeviceEventQuery.forLocalDay(
+        now.subtract(const Duration(days: 1)),
+        offset: offset,
+      );
+    }
+    throw ArgumentError.value(range, 'range', '该区间不展示原始事件列表');
   }
 
   Future<void> loadSettings({int? expectedGeneration}) async {

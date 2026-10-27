@@ -130,13 +130,42 @@ class MimiVentApi {
   }
 
   Future<Map<String, dynamic>> getStatistics(
-      TimingProfile profile, String range) async {
+    TimingProfile profile,
+    String range, {
+    int offset = 0,
+  }) async {
     return _request(
       method: 'GET',
       path: '/api/stats',
       profile: profile,
-      query: {'mode': range},
+      query: {'mode': range, 'offset': '$offset'},
+      // BLE 协议将附加查询参数放在表单体中；HTTP 页面仍走标准 URL query。
+      body: 'offset=$offset',
     );
+  }
+
+  /// 按任意时间段、事件类型和页码读取原始事件，不在固件侧合并事件。
+  Future<DeviceEventPage> queryEvents(
+    TimingProfile profile,
+    DeviceEventQuery query,
+  ) async {
+    final parameters = query.toQueryParameters();
+    final response = await _request(
+      method: 'GET',
+      path: '/api/events',
+      profile: profile,
+      query: parameters,
+      // BLE 协议通过请求体传递查询条件；HTTP 控制台对应 URL query 参数。
+      body: parameters.entries
+          .map((entry) => '${entry.key}=${entry.value}')
+          .join('&'),
+    );
+    try {
+      return DeviceEventPage.fromJson(response);
+    } catch (error) {
+      diagnostics?.error('设备事件', '响应数据校验失败：$error');
+      rethrow;
+    }
   }
 
   Future<TimingSettings> getSettings(TimingProfile profile) async {

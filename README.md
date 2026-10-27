@@ -9,6 +9,7 @@ MimiVent 的 Android 蓝牙控制端。App 通过 BLE 连接 ESP32-C3，不需�
 - 使用网站同款猫咪图标作为 App 图标和页面标识。
 - 查看风机、PIR、运行阶段、剩余时间、固件版本和当前时序。
 - 顶部显示 App 版本、构建号和连接设备上报的固件版本；页面使用深色渐变背景。
+- 控制页与统计页检查 App/固件兼容性：固件低于 `v0.2.0` 时提示不满足控制接口最低要求；低于 `v0.3.1` 时提示完整统计功能需要更新固件；设备通过状态接口声明最低 App 版本时，也会提示升级 App。提示不自动刷写固件，也不会拦截兼容范围内的控制。
 - 在正式运行与 DEV 联调环境之间切换。App 会记住上次选择；每次连接后将 App 环境与设备实际环境分别展示。
 - 环境不一致时，控制和设置保持锁定。可以选择“切换设备环境”（确认后立即停止旧流程并进入 App 当前选择环境的自动感应），或“App 跟随设备”（只改变 App 选择，不发送设备切换指令）。
 - 控制自动感应、限时临时排风、临时暂停、限时强制排风和持续关闭。
@@ -63,7 +64,7 @@ flutter build apk --release
 
 生成文件：`build/app/outputs/flutter-apk/app-release.apk`。
 
-当前 Release 变体使用 Debug 签名，适合个人设备安装和验证。正式公开分发或应用商店上架前，需要配置长期保管的 Release keystore；私钥与密码不得提交到 Git。当前正式版本为 `0.2.0+2`；后续更新需递增构建号。
+当前正式版本为 `0.2.1+4`。当前完整统计功能建议配合固件 `v0.3.1`。Release 变体仍使用 Debug 签名，适合个人设备安装和验证；正式公开分发或应用商店上架前，需要配置长期保管的 Release keystore，私钥与密码不得提交到 Git。后续更新需递增构建号。
 
 用 USB 数据线安装到 Android 真机：先在手机开启“开发者选项 / USB 调试”，连接电脑并在手机上允许此电脑调试，然后确认设备已授权：
 
@@ -105,6 +106,8 @@ BLE GATT UUID 与固件保持一致：
 
 请求按固件协议使用换行分隔：`method / path / profile / mode / stage / replace / switch / body`。响应是 `HTTP状态码\n响应体\n`，固件可能把响应拆成多个 BLE 通知；App 会按 UTF-8 字节重组后再解析，并串行发送请求。
 
+事件查询由 `DeviceEventQuery`、`DeviceEventPage` 和 `DeviceRepository.queryEvents` 封装。查询使用本地时间转换后的 Unix 秒数，时间区间为左闭右开 `[start,end)`，支持 `DeviceEventKind` 筛选及 `offset/limit` 分页；`DeviceEventQuery.forLocalDay` 可直接创建某个本地自然日的查询。App 收到原始事件后再决定如何合并和展示，固件不负责 UI 分组。临时暂停被提前恢复和持续关闭恢复自动感应时，固件会补写恢复事件，App 通过相邻控制事件的时间差还原实际持续时长。
+
 Wi-Fi SSID 和密码不会通过 BLE 下发，避免把家庭网络凭证暴露在蓝牙控制通道。当前 App 只实现蓝牙控制；局域网 Wi-Fi 控制后续可以作为另一个传输适配器加入。
 
 ## 代码结构
@@ -137,4 +140,4 @@ flutter build apk --debug
 
 ### 首次 APK 分发说明
 
-当前 `android/app/build.gradle` 的 Release 变体仍使用 Debug 签名，适合个人设备安装和验证。正式公开分发或应用商店上架前，需要配置长期保管的 Release keystore；私钥与密码不得提交到 Git。当前正式版本为 `0.2.0+2`；后续更新需递增构建号。
+当前正式版本为 `0.2.1+4`；完整统计功能建议配合固件 `v0.3.1`。`android/app/build.gradle` 的 Release 变体仍使用 Debug 签名，适合个人设备安装和验证。正式公开分发或应用商店上架前，需要配置长期保管的 Release keystore，私钥与密码不得提交到 Git；后续更新需递增构建号。

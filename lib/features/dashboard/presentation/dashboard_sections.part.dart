@@ -129,7 +129,11 @@ extension _DashboardMainSections on _DashboardPageState {
       children: [
         _controlPage(status, settings),
         _settingsPage(status, settings),
-        StatisticsPage(controller: c, active: _activeTab == 2),
+        StatisticsPage(
+          controller: c,
+          active: _activeTab == 2,
+          appVersion: _appVersion,
+        ),
       ],
     );
   }
@@ -158,42 +162,38 @@ extension _DashboardMainSections on _DashboardPageState {
 
   Widget _controlPage(DeviceStatus status, TimingSettings settings) =>
       _scrollPage('control-page', [
+        VersionCompatibilityNotice(
+          appVersion: _appVersion,
+          firmwareVersion: status.firmware,
+          minimumAppVersion: status.minimumAppVersion,
+        ),
         if (!c.profileMatches) ...[
           _mismatchPanel(status),
           const SizedBox(height: 14),
         ],
         _statusHero(status),
         const SizedBox(height: 12),
-        LayoutBuilder(
-          builder: (context, constraints) {
-            // 大字体时优先堆叠状态卡，避免数值和说明挤压或裁切。
-            final compact =
-                constraints.maxWidth < 340 || AppLayout.usesLargeText(context);
-            final sensor = _metricCard(
+        Row(children: [
+          Expanded(
+            child: _metricCard(
               title: '空间感应',
               value: status.pir ? '检测到活动' : '环境稳定',
               detail: 'PIR · GPIO 4 · ${status.pir ? 'HIGH' : 'LOW'}',
               icon: Icons.radar_rounded,
               accent: status.pir ? MimiVentColors.amber : MimiVentColors.mint,
-            );
-            final fan = _metricCard(
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: _metricCard(
               title: '风机运行',
               value: DurationFormatter.clock(status.fanRunMs),
               detail: DeviceStatusPresenter.phaseDescription(status),
               icon: Icons.schedule_rounded,
               accent: status.fan ? MimiVentColors.amber : MimiVentColors.mint,
-            );
-            if (compact) {
-              return Column(
-                  children: [sensor, const SizedBox(height: 10), fan]);
-            }
-            return Row(children: [
-              Expanded(child: sensor),
-              const SizedBox(width: 10),
-              Expanded(child: fan),
-            ]);
-          },
-        ),
+            ),
+          ),
+        ]),
         const SizedBox(height: 12),
         _runtimeCard(status),
         const SizedBox(height: 14),

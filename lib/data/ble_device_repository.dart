@@ -18,8 +18,15 @@ class BleDeviceRepository implements DeviceRepository {
   Future<void> syncClock(TimingProfile profile) => _api.syncClock(profile);
   @override
   Future<Map<String, dynamic>> getStatistics(
-          TimingProfile profile, String range) =>
-      _api.getStatistics(profile, range);
+    TimingProfile profile,
+    String range, {
+    int offset = 0,
+  }) =>
+      _api.getStatistics(profile, range, offset: offset);
+  @override
+  Future<DeviceEventPage> queryEvents(
+          TimingProfile profile, DeviceEventQuery query) =>
+      _api.queryEvents(profile, query);
   @override
   Future<void> saveSettings(TimingProfile profile, TimingSettings settings) =>
       _api.saveSettings(profile, settings);

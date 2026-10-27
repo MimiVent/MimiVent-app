@@ -1,9 +1,12 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
 import '../../../app/theme/mimivent_theme.dart';
 import '../../../data/mimivent_controller.dart';
+import '../../../shared/widgets/version_compatibility_notice.dart';
+import '../../../shared/widgets/device_animations.dart';
 
 /// 统计页的时间范围。第一版提供常用预设，避免日期选择器占用空间。
 enum _StatisticsRange { today, yesterday, threeDays, sevenDays }
@@ -19,18 +22,24 @@ extension on _StatisticsRange {
 
 class StatisticsPage extends StatefulWidget {
   const StatisticsPage(
-      {required this.controller, required this.active, super.key});
+      {required this.controller,
+      required this.active,
+      required this.appVersion,
+      super.key});
 
   final MimiVentController controller;
   final bool active;
+  final String appVersion;
 
   @override
   State<StatisticsPage> createState() => _StatisticsPageState();
 }
 
 class _StatisticsPageState extends State<StatisticsPage> {
-  _StatisticsRange _range = _StatisticsRange.sevenDays;
+  _StatisticsRange _range = _StatisticsRange.today;
+  int? _selectedChartIndex;
   Timer? _refreshTimer;
+  bool _loadingMoreEvents = false;
 
   @override
   void initState() {
@@ -62,6 +71,28 @@ class _StatisticsPageState extends State<StatisticsPage> {
   Future<void> _loadStatistics() =>
       widget.controller.refreshStatistics(_range.wireValue);
 
+  bool _onScrollNotification(ScrollNotification notification) {
+    final supportsEventPages = _range == _StatisticsRange.today ||
+        _range == _StatisticsRange.yesterday;
+    if (supportsEventPages &&
+        notification.metrics.extentAfter < 180 &&
+        !_loadingMoreEvents &&
+        widget.controller.statisticsHasMoreEventsFor(_range.wireValue)) {
+      _loadMoreEvents();
+    }
+    // 继续向外冒泡，避免影响 Dashboard 的滚动标题行为。
+    return false;
+  }
+
+  Future<void> _loadMoreEvents() async {
+    setState(() => _loadingMoreEvents = true);
+    try {
+      await widget.controller.loadMoreStatisticsEvents(_range.wireValue);
+    } finally {
+      if (mounted) setState(() => _loadingMoreEvents = false);
+    }
+  }
+
   void _onControllerChanged() {
     if (mounted) setState(() {});
   }
@@ -78,57 +109,77 @@ class _StatisticsPageState extends State<StatisticsPage> {
     final data = widget.controller.statisticsFor(_range.wireValue);
     final view = data == null
         ? _StatisticsPreview.emptyForRange(_range)
-        : _StatisticsPreview.fromDevice(_range, data);
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final width = constraints.maxWidth.clamp(0.0, 860.0);
-        return ListView(
-          key: const PageStorageKey('statistics-page'),
-          primary: false,
-          padding: const EdgeInsets.fromLTRB(18, 14, 18, 28),
-          children: [
-            Center(
-              child: ConstrainedBox(
-                constraints: BoxConstraints(maxWidth: width),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    _pageHeading(),
-                    const SizedBox(height: 8),
-                    _syncStatus(data),
-                    const SizedBox(height: 8),
-                    _rangePicker(),
-                    const SizedBox(height: 14),
-                    _summaryCard(view),
-                    const SizedBox(height: 12),
-                    _metricRow(view),
-                    const SizedBox(height: 16),
-                    _runtimeChart(view),
-                    const SizedBox(height: 16),
-                    if (_range == _StatisticsRange.today)
-                      _eventList(view.events)
-                    else
-                      _dailyBreakdown(view.days),
-                    const SizedBox(height: 4),
-                    const Center(
-                      child: Text(
-                        '感应活动仅代表 PIR 检测到移动，不等同于如厕次数',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          color: MimiVentColors.muted,
-                          fontSize: 10,
-                          height: 1.4,
+        : _StatisticsPreview.fromDevice(_range, data,
+            currentMode: widget.controller.status?.mode);
+    return NotificationListener<ScrollNotification>(
+        onNotification: _onScrollNotification,
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final width = constraints.maxWidth.clamp(0.0, 860.0);
+            return ListView(
+              key: const PageStorageKey('statistics-page'),
+              primary: false,
+              padding: const EdgeInsets.fromLTRB(18, 14, 18, 28),
+              children: [
+                Center(
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(maxWidth: width),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        if (widget.controller.status != null)
+                          VersionCompatibilityNotice(
+                            appVersion: widget.appVersion,
+                            firmwareVersion: widget.controller.status!.firmware,
+                            minimumAppVersion:
+                                widget.controller.status!.minimumAppVersion,
+                          ),
+                        _pageHeading(),
+                        const SizedBox(height: 8),
+                        _syncStatus(data),
+                        const SizedBox(height: 8),
+                        _rangePicker(),
+                        const SizedBox(height: 14),
+                        _summaryCard(view),
+                        const SizedBox(height: 12),
+                        _metricRow(view),
+                        const SizedBox(height: 16),
+                        _runtimeChart(view),
+                        const SizedBox(height: 16),
+                        if (_range == _StatisticsRange.today ||
+                            _range == _StatisticsRange.yesterday)
+                          _eventList(
+                            view.events,
+                            title: _range == _StatisticsRange.today
+                                ? '最近 24 小时事件'
+                                : '昨日事件',
+                            rawCount: view.rawEventCount,
+                            totalCount: view.eventTotal,
+                            hasMore: view.eventsHasMore,
+                            loadingMore: _loadingMoreEvents,
+                          )
+                        else
+                          _dailyBreakdown(view.days),
+                        const SizedBox(height: 4),
+                        const Center(
+                          child: Text(
+                            '感应活动仅代表 PIR 检测到移动，不等同于如厕次数',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              color: MimiVentColors.muted,
+                              fontSize: 10,
+                              height: 1.4,
+                            ),
+                          ),
                         ),
-                      ),
+                      ],
                     ),
-                  ],
+                  ),
                 ),
-              ),
-            ),
-          ],
-        );
-      },
-    );
+              ],
+            );
+          },
+        ));
   }
 
   Widget _pageHeading() => const Row(
@@ -162,10 +213,20 @@ class _StatisticsPageState extends State<StatisticsPage> {
   Widget _syncStatus(Map<String, dynamic>? data) {
     final loading = widget.controller.statisticsLoadingFor(_range.wireValue);
     final failed = widget.controller.statisticsFailedFor(_range.wireValue);
+    final cached = widget.controller.statisticsIsCachedFor(_range.wireValue);
+    final cachedAt =
+        widget.controller.statisticsCacheUpdatedAtFor(_range.wireValue);
+    final cachedAtLabel = cachedAt == null
+        ? ''
+        : ' · ${cachedAt.month}/${cachedAt.day} ${cachedAt.hour.toString().padLeft(2, '0')}:${cachedAt.minute.toString().padLeft(2, '0')}';
     final label = failed
-        ? '同步暂不可用 · 将自动重试'
+        ? cached
+            ? '同步失败 · 显示上次数据$cachedAtLabel'
+            : '同步暂不可用 · 将自动重试'
         : loading
-            ? '正在同步设备数据'
+            ? cached
+                ? '显示本地缓存 · 正在更新$cachedAtLabel'
+                : '正在同步设备数据'
             : data == null
                 ? '等待首次同步'
                 : '设备数据已同步 · 每分钟更新';
@@ -222,7 +283,11 @@ class _StatisticsPageState extends State<StatisticsPage> {
                 child: InkWell(
                   borderRadius: BorderRadius.circular(11),
                   onTap: () {
-                    setState(() => _range = range);
+                    setState(() {
+                      _range = range;
+                      _selectedChartIndex = null;
+                      _loadingMoreEvents = false;
+                    });
                     unawaited(_loadStatistics());
                   },
                   child: AnimatedContainer(
@@ -400,122 +465,106 @@ class _StatisticsPageState extends State<StatisticsPage> {
         ),
       );
 
-  Widget _runtimeChart(_StatisticsPreview view) => Container(
-        padding: const EdgeInsets.fromLTRB(15, 14, 15, 12),
-        decoration: _cardDecoration(),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Expanded(
-                  child: Text(view.chartTitle,
-                      style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 13,
-                          fontWeight: FontWeight.w700)),
-                ),
-                Container(
-                  width: 7,
-                  height: 7,
-                  decoration: const BoxDecoration(
-                      color: MimiVentColors.mint, shape: BoxShape.circle),
-                ),
-                const SizedBox(width: 5),
-                const Text('风机运行',
-                    style: TextStyle(color: MimiVentColors.muted, fontSize: 9)),
-              ],
-            ),
-            const SizedBox(height: 16),
-            SizedBox(
-              height: 142,
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: view.chart.map((point) {
-                  final fraction = view.maxChartValue == 0
-                      ? 0.0
-                      : point.minutes / view.maxChartValue;
-                  return Expanded(
-                    child: Padding(
-                      padding: EdgeInsets.symmetric(
-                          horizontal: view.chart.length > 18
-                              ? .5
-                              : view.chart.length > 9
-                                  ? 1
-                                  : 3),
-                      child: Column(
-                        children: [
-                          SizedBox(
-                            height: 16,
-                            child: Text(
-                              point.minutes > 0 ? '${point.minutes}m' : '',
-                              maxLines: 1,
-                              style: const TextStyle(
-                                  color: MimiVentColors.muted,
-                                  fontSize: 8,
-                                  height: 1),
-                            ),
-                          ),
-                          Expanded(
-                            child: Align(
-                              alignment: Alignment.bottomCenter,
-                              child: FractionallySizedBox(
-                                heightFactor: fraction == 0
-                                    ? 0
-                                    : fraction.clamp(.035, 1.0).toDouble(),
-                                child: Container(
-                                  width: view.chart.length > 18
-                                      ? 7
-                                      : view.chart.length > 9
-                                          ? 12
-                                          : 18,
-                                  decoration: BoxDecoration(
-                                    gradient: LinearGradient(
-                                      begin: Alignment.topCenter,
-                                      end: Alignment.bottomCenter,
-                                      colors: [
-                                        MimiVentColors.mint,
-                                        MimiVentColors.mint.withOpacity(.32),
-                                      ],
-                                    ),
-                                    borderRadius: BorderRadius.circular(7),
-                                    boxShadow: fraction > .62
-                                        ? [
-                                            BoxShadow(
-                                              color: MimiVentColors.mint
-                                                  .withOpacity(.13),
-                                              blurRadius: 10,
-                                            )
-                                          ]
-                                        : null,
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 6),
-                          Text(point.label,
-                              maxLines: 2,
-                              textAlign: TextAlign.center,
-                              overflow: TextOverflow.clip,
-                              style: const TextStyle(
-                                  color: MimiVentColors.muted,
-                                  fontSize: 7,
-                                  height: 1.05)),
-                        ],
-                      ),
-                    ),
-                  );
-                }).toList(),
+  Widget _runtimeChart(_StatisticsPreview view) {
+    final selectedIndex =
+        _selectedChartIndex != null && _selectedChartIndex! < view.chart.length
+            ? _selectedChartIndex!
+            : null;
+    final selectedPoint =
+        selectedIndex == null ? null : view.chart[selectedIndex];
+    return Container(
+      padding: const EdgeInsets.fromLTRB(15, 14, 15, 12),
+      decoration: _cardDecoration(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(view.chartTitle,
+                    style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w700)),
               ),
+              Container(
+                width: 7,
+                height: 7,
+                decoration: const BoxDecoration(
+                    color: MimiVentColors.mint, shape: BoxShape.circle),
+              ),
+              const SizedBox(width: 5),
+              const Text('风机运行',
+                  style: TextStyle(color: MimiVentColors.muted, fontSize: 9)),
+            ],
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 30,
+            child: selectedPoint == null
+                ? const Text(
+                    '点击图表查看该时段排风时长',
+                    style: TextStyle(
+                        color: MimiVentColors.muted, fontSize: 10, height: 1.4),
+                  )
+                : Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          selectedPoint.intervalLabel,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                              color: MimiVentColors.muted, fontSize: 10),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        '${_formatMinutes(selectedPoint.minutes)} 分钟',
+                        style: const TextStyle(
+                            color: MimiVentColors.mint,
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700),
+                      ),
+                    ],
+                  ),
+          ),
+          SizedBox(
+            height: 168,
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final chartSize = Size(constraints.maxWidth, 168);
+                return GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTapDown: (details) {
+                    const leftInset = _StatisticsChartPainter.leftInset;
+                    final plotWidth = chartSize.width - leftInset - 5;
+                    final x = details.localPosition.dx - leftInset;
+                    if (plotWidth <= 0 || x < 0 || x > plotWidth) return;
+                    final index = (x / plotWidth * view.chart.length)
+                        .floor()
+                        .clamp(0, view.chart.length - 1);
+                    setState(() => _selectedChartIndex = index);
+                  },
+                  child: CustomPaint(
+                    size: chartSize,
+                    painter: _StatisticsChartPainter(
+                      points: view.chart,
+                      maxValue: view.maxChartValue,
+                      selectedIndex: selectedIndex,
+                    ),
+                  ),
+                );
+              },
             ),
-            const SizedBox(height: 8),
-            Text(view.chartCaption,
-                style:
-                    const TextStyle(color: MimiVentColors.muted, fontSize: 9)),
-          ],
-        ),
-      );
+          ),
+          const SizedBox(height: 4),
+          Text(view.chartCaption,
+              style: const TextStyle(color: MimiVentColors.muted, fontSize: 9)),
+        ],
+      ),
+    );
+  }
 
   Widget _dailyBreakdown(List<_DailySummary> days) => Container(
         padding: const EdgeInsets.fromLTRB(15, 14, 15, 5),
@@ -580,7 +629,15 @@ class _StatisticsPageState extends State<StatisticsPage> {
         ),
       );
 
-  Widget _eventList(List<_PreviewEvent> events) => Container(
+  Widget _eventList(
+    List<_PreviewEvent> events, {
+    required String title,
+    required int rawCount,
+    required int totalCount,
+    required bool hasMore,
+    required bool loadingMore,
+  }) =>
+      Container(
         padding: const EdgeInsets.fromLTRB(15, 14, 15, 5),
         decoration: _cardDecoration(),
         child: Column(
@@ -588,14 +645,14 @@ class _StatisticsPageState extends State<StatisticsPage> {
           children: [
             Row(
               children: [
-                const Expanded(
-                  child: Text('最近事件',
-                      style: TextStyle(
+                Expanded(
+                  child: Text(title,
+                      style: const TextStyle(
                           color: Colors.white,
                           fontSize: 13,
                           fontWeight: FontWeight.w700)),
                 ),
-                Text('${events.length} 条',
+                Text('${events.length} 组 · $rawCount/$totalCount 条',
                     style: const TextStyle(
                         color: MimiVentColors.muted, fontSize: 9)),
               ],
@@ -606,6 +663,12 @@ class _StatisticsPageState extends State<StatisticsPage> {
               if (i != events.length - 1)
                 Divider(height: 1, color: Colors.white.withOpacity(.055)),
             ],
+            if (loadingMore)
+              const _EventPaginationHint(label: '正在加载更多原始事件…', loading: true)
+            else if (hasMore)
+              const _EventPaginationHint(label: '继续上滑加载更早事件')
+            else if (rawCount > 0)
+              const _EventPaginationHint(label: '已显示全部可用事件'),
           ],
         ),
       );
@@ -614,14 +677,12 @@ class _StatisticsPageState extends State<StatisticsPage> {
         padding: const EdgeInsets.symmetric(vertical: 11),
         child: Row(
           children: [
-            Container(
-              width: 31,
-              height: 31,
-              decoration: BoxDecoration(
-                color: event.color.withOpacity(.11),
-                shape: BoxShape.circle,
+            SizedBox(
+              width: 24,
+              height: 24,
+              child: Center(
+                child: SizedBox.square(dimension: 16, child: event.icon),
               ),
-              child: Icon(event.icon, size: 14, color: event.color),
             ),
             const SizedBox(width: 10),
             Expanded(
@@ -703,6 +764,9 @@ class _StatisticsPreview {
     required this.chartTitle,
     required this.chartCaption,
     required this.events,
+    required this.rawEventCount,
+    required this.eventTotal,
+    required this.eventsHasMore,
     required this.days,
   });
 
@@ -717,6 +781,9 @@ class _StatisticsPreview {
   final String chartTitle;
   final String chartCaption;
   final List<_PreviewEvent> events;
+  final int rawEventCount;
+  final int eventTotal;
+  final bool eventsHasMore;
   final List<_DailySummary> days;
 
   factory _StatisticsPreview.emptyForRange(_StatisticsRange range) {
@@ -736,21 +803,24 @@ class _StatisticsPreview {
     };
     final chart = switch (range) {
       _StatisticsRange.today => List.generate(
-          24, (index) => _ChartPoint(index.toString().padLeft(2, '0'), 0)),
-      _StatisticsRange.yesterday => List.generate(12,
-          (index) => _ChartPoint((index * 2).toString().padLeft(2, '0'), 0)),
+          24,
+          (index) => _ChartPoint(index.toString().padLeft(2, '0'), 0,
+              intervalLabel: _hourInterval(index, 1))),
+      _StatisticsRange.yesterday => List.generate(
+          12,
+          (index) => _ChartPoint((index * 2).toString().padLeft(2, '0'), 0,
+              intervalLabel: _hourInterval(index * 2, 2))),
       _StatisticsRange.threeDays => List.generate(9, (index) {
           final day = start.add(Duration(days: index ~/ 3));
           final hour = (index % 3) * 8;
-          return _ChartPoint(
-              index % 3 == 0
-                  ? '${day.day}\\n${hour.toString().padLeft(2, '0')}'
-                  : hour.toString().padLeft(2, '0'),
-              0);
+          return _ChartPoint(hour.toString().padLeft(2, '0'), 0,
+              intervalLabel: '${_date(day)} ${_hourInterval(hour, 8)}',
+              groupLabel: _date(day));
         }),
       _StatisticsRange.sevenDays => List.generate(7, (index) {
           final date = start.add(Duration(days: index));
-          return _ChartPoint('${date.month}/${date.day}', 0);
+          return _ChartPoint('${date.month}/${date.day}', 0,
+              intervalLabel: '${_date(date)} 00:00–24:00');
         }),
     };
     final days = List.generate(dayCount, (index) {
@@ -787,15 +857,20 @@ class _StatisticsPreview {
         _StatisticsRange.sevenDays => '每柱代表 1 天 · 单位：分钟',
       },
       events: const [],
+      rawEventCount: 0,
+      eventTotal: 0,
+      eventsHasMore: false,
       days: days,
     );
   }
 
   factory _StatisticsPreview.fromDevice(
-    _StatisticsRange range,
-    Map<String, dynamic> json,
-  ) {
-    final now = DateTime.now();
+      _StatisticsRange range, Map<String, dynamic> json,
+      {String? currentMode}) {
+    final cachedAtMs = _intValue(json['_cacheUpdatedAt']);
+    final now = cachedAtMs > 0
+        ? DateTime.fromMillisecondsSinceEpoch(cachedAtMs)
+        : DateTime.now();
     final today = DateTime(now.year, now.month, now.day);
     final runtimeSeconds = _intValue(json['runtimeSeconds']);
     final runtimeMain = runtimeSeconds >= 3600
@@ -828,6 +903,7 @@ class _StatisticsPreview {
           (index) => _ChartPoint(
                 index.toString().padLeft(2, '0'),
                 (index < bucketSeconds.length ? bucketSeconds[index] : 0) / 60,
+                intervalLabel: _hourInterval(index, 1),
               ));
     } else if (range == _StatisticsRange.yesterday) {
       chart = List.generate(
@@ -835,17 +911,17 @@ class _StatisticsPreview {
           (index) => _ChartPoint(
                 (index * 2).toString().padLeft(2, '0'),
                 (index < bucketSeconds.length ? bucketSeconds[index] : 0) / 60,
+                intervalLabel: _hourInterval(index * 2, 2),
               ));
     } else if (range == _StatisticsRange.threeDays) {
       final firstDate = today.subtract(const Duration(days: 2));
       chart = List.generate(9, (index) {
         final day = firstDate.add(Duration(days: index ~/ 3));
         final hour = (index % 3) * 8;
-        final label = index % 3 == 0
-            ? '${day.day}\n${hour.toString().padLeft(2, '0')}'
-            : hour.toString().padLeft(2, '0');
-        return _ChartPoint(label,
-            (index < bucketSeconds.length ? bucketSeconds[index] : 0) / 60);
+        return _ChartPoint(hour.toString().padLeft(2, '0'),
+            (index < bucketSeconds.length ? bucketSeconds[index] : 0) / 60,
+            intervalLabel: '${_date(day)} ${_hourInterval(hour, 8)}',
+            groupLabel: _date(day));
       });
     } else {
       final firstDate = today.subtract(const Duration(days: 6));
@@ -854,48 +930,127 @@ class _StatisticsPreview {
             ? _dateFromKey(_intValue(dayRows[index]['date']))
             : firstDate.add(Duration(days: index));
         return _ChartPoint('${date.month}/${date.day}',
-            (index < bucketSeconds.length ? bucketSeconds[index] : 0) / 60);
+            (index < bucketSeconds.length ? bucketSeconds[index] : 0) / 60,
+            intervalLabel: '${_date(date)} 00:00–24:00');
       });
     }
 
-    final events = <_PreviewEvent>[];
+    final chronologicalEvents = <_PreviewEvent>[];
     final rawEvents = json['events'];
     if (rawEvents is List) {
-      for (final item in rawEvents.whereType<Map>()) {
-        final event = item.cast<String, dynamic>();
-        final timestamp = DateTime.fromMillisecondsSinceEpoch(
-          _intValue(event['time']) * 1000,
-          isUtc: true,
-        ).toLocal();
+      // 设备接口按最新到最旧返回；先反转，以事件相邻关系合并连续感应段。
+      final ordered = rawEvents.whereType<Map>().toList().reversed.toList();
+      DateTime? nextControlEventTime(int fromIndex) {
+        for (var next = fromIndex + 1; next < ordered.length; next++) {
+          final nextEvent = ordered[next].cast<String, dynamic>();
+          // PIR 活动不会结束暂停或持续关闭，只有后续控制操作才作为结束边界。
+          if (nextEvent['kind'] == 'activity') continue;
+          return _eventTimestamp(nextEvent);
+        }
+        return null;
+      }
+
+      var index = 0;
+      while (index < ordered.length) {
+        final event = ordered[index].cast<String, dynamic>();
         final kind = event['kind']?.toString() ?? 'automatic';
+        final timestamp = _eventTimestamp(event);
+        if (kind == 'activity') {
+          var lastTimestamp = timestamp;
+          var next = index + 1;
+          while (next < ordered.length) {
+            final nextEvent = ordered[next].cast<String, dynamic>();
+            if (nextEvent['kind'] != 'activity') break;
+            lastTimestamp = _eventTimestamp(nextEvent);
+            next++;
+          }
+          final count = next - index;
+          final span = lastTimestamp.difference(timestamp);
+          final timeRange = _activityTimeRange(timestamp, lastTimestamp);
+          chronologicalEvents.add(_PreviewEvent(
+            // 右侧时间始终显示这一组合并段的首次触发时间。
+            time: _clockTime(timestamp),
+            title: count == 1 ? '检测到活动' : '连续感应 · $count 次',
+            detail: count == 1
+                ? '$timeRange · 单次触发'
+                : '$timeRange · 活动跨度 ${_activitySpanLabel(span)}',
+            icon: const Icon(Icons.sensors_rounded,
+                size: 16, color: MimiVentColors.mint),
+          ));
+          index = next;
+          continue;
+        }
+
         final state = event['state']?.toString() ?? 'complete';
-        final duration = _intValue(event['durationSeconds']);
+        final configuredDuration = _intValue(event['durationSeconds']);
+        final nextControlTime = nextControlEventTime(index);
+        final elapsedToNextControl = nextControlTime == null
+            ? null
+            : math.max(0, nextControlTime.difference(timestamp).inSeconds);
         final title = switch (kind) {
-          'activity' => '检测到活动',
           'manual' => '临时排风',
           'force' => '强制排风',
+          'pause' => '临时暂停',
+          'locked_off' => '持续关闭',
+          'resume' => '恢复自动感应',
           _ => '自动排风',
         };
-        final detail = state == 'active'
-            ? '正在运行 · ${_durationLabel(duration)}'
-            : state == 'interrupted'
-                ? '设备重启时中断'
-                : kind == 'activity'
-                    ? 'PIR 检测到活动'
-                    : '运行 ${_durationLabel(duration)}';
-        events.add(_PreviewEvent(
-          time:
-              '${timestamp.hour.toString().padLeft(2, '0')}:${timestamp.minute.toString().padLeft(2, '0')}',
+        final pauseDuration = elapsedToNextControl == null
+            ? configuredDuration
+            : math.min(configuredDuration, elapsedToNextControl);
+        final lockedOffDuration = elapsedToNextControl ??
+            (currentMode == 'lock_off'
+                ? math.max(0, DateTime.now().difference(timestamp).inSeconds)
+                : null);
+        final detail = switch (kind) {
+          'pause' => currentMode == 'timed_off' && nextControlTime == null
+              ? '暂停中 · 已 ${_durationLabel(math.max(0, DateTime.now().difference(timestamp).inSeconds))}'
+              : '暂停 ${_durationLabel(pauseDuration)}',
+          'locked_off' => lockedOffDuration == null
+              ? '持续关闭 · 结束时间未记录'
+              : currentMode == 'lock_off' && nextControlTime == null
+                  ? '持续关闭中 · 已 ${_durationLabel(lockedOffDuration)}'
+                  : '持续关闭 ${_durationLabel(lockedOffDuration)}',
+          'resume' => '持续关闭结束 · 自动感应已恢复',
+          _ => state == 'active'
+              ? '正在运行 · ${_durationLabel(configuredDuration)}'
+              : state == 'interrupted'
+                  ? '设备重启时中断'
+                  : '运行 ${_durationLabel(configuredDuration)}',
+        };
+        final color = switch (kind) {
+          'automatic' => MimiVentColors.amber,
+          'force' => MimiVentColors.amber,
+          'pause' => const Color(0xFF9AC8FF),
+          'locked_off' => MimiVentColors.red,
+          _ => MimiVentColors.mint,
+        };
+        final icon = switch (kind) {
+          'activity' => const Icon(Icons.sensors_rounded,
+              size: 16, color: MimiVentColors.mint),
+          // 自定义扇叶线稿视觉面积比 Material 图标大，因此缩小到 10px。
+          'manual' => const FanRotorGlyph(color: MimiVentColors.mint, size: 10),
+          'automatic' =>
+            const FanRotorGlyph(color: MimiVentColors.amber, size: 10),
+          'resume' => const Icon(Icons.sensors_rounded,
+              size: 16, color: MimiVentColors.mint),
+          'force' => Icon(Icons.science_outlined, size: 16, color: color),
+          'pause' =>
+            Icon(Icons.pause_circle_outline_rounded, size: 16, color: color),
+          'locked_off' =>
+            Icon(Icons.power_settings_new_rounded, size: 16, color: color),
+          _ => Icon(Icons.air_rounded, size: 16, color: color),
+        };
+        chronologicalEvents.add(_PreviewEvent(
+          time: _clockTime(timestamp),
           title: title,
           detail: detail,
-          icon: kind == 'activity'
-              ? Icons.motion_photos_on_rounded
-              : Icons.air_rounded,
-          color:
-              kind == 'activity' ? MimiVentColors.amber : MimiVentColors.mint,
+          icon: icon,
         ));
+        index++;
       }
     }
+    final events = chronologicalEvents.reversed.toList();
 
     final days = <_DailySummary>[];
     for (final day in dayRows) {
@@ -927,7 +1082,7 @@ class _StatisticsPreview {
       activityCount: _intValue(json['activityCount']),
       autoExhaustCount: _intValue(json['automaticCount']),
       chart: chart,
-      maxChartValue: maxValue,
+      maxChartValue: _niceAxisMaximum(maxValue),
       chartTitle: range == _StatisticsRange.sevenDays ? '每日排风时长' : '分时排风时长',
       chartCaption: switch (range) {
         _StatisticsRange.today => '每柱代表 1 小时 · 单位：分钟',
@@ -936,11 +1091,53 @@ class _StatisticsPreview {
         _StatisticsRange.sevenDays => '每柱代表 1 天 · 单位：分钟',
       },
       events: events,
+      rawEventCount: rawEvents is List ? rawEvents.length : 0,
+      eventTotal: _intValue(json['eventsTotal']) > 0
+          ? _intValue(json['eventsTotal'])
+          : rawEvents is List
+              ? rawEvents.length
+              : 0,
+      eventsHasMore: json['eventsHasMore'] == true,
       days: days,
     );
   }
 
   static int _intValue(Object? value) => value is num ? value.toInt() : 0;
+
+  static DateTime _eventTimestamp(Map<String, dynamic> event) =>
+      DateTime.fromMillisecondsSinceEpoch(
+        _intValue(event['time']) * 1000,
+        isUtc: true,
+      ).toLocal();
+
+  static String _twoDigits(int value) => value.toString().padLeft(2, '0');
+
+  static String _clockTime(DateTime value) =>
+      '${_twoDigits(value.hour)}:${_twoDigits(value.minute)}:${_twoDigits(value.second)}';
+
+  static String _activityTimeRange(DateTime start, DateTime end) {
+    final startText = _clockTime(start);
+    final endText = _clockTime(end);
+    final sameDay = start.year == end.year &&
+        start.month == end.month &&
+        start.day == end.day;
+    return sameDay
+        ? '$startText–$endText'
+        : '${_date(start)} $startText–${_date(end)} $endText';
+  }
+
+  static String _activitySpanLabel(Duration span) {
+    final seconds = math.max(0, span.inSeconds);
+    if (seconds < 60) return '$seconds 秒';
+    final minutes = seconds ~/ 60;
+    final remainder = seconds % 60;
+    return remainder == 0 ? '$minutes 分钟' : '$minutes 分 $remainder 秒';
+  }
+
+  static String _hourInterval(int startHour, int spanHours) {
+    final endHour = startHour + spanHours;
+    return '${_twoDigits(startHour)}:00–${_twoDigits(endHour)}:00';
+  }
 
   static DateTime _dateFromKey(int key) =>
       DateTime(key ~/ 10000, (key ~/ 100) % 100, key % 100);
@@ -969,10 +1166,228 @@ class _StatisticsPreview {
 }
 
 class _ChartPoint {
-  const _ChartPoint(this.label, this.minutes);
+  const _ChartPoint(this.label, this.minutes,
+      {this.intervalLabel = '', this.groupLabel = ''});
 
   final String label;
   final double minutes;
+  final String intervalLabel;
+  final String groupLabel;
+}
+
+class _StatisticsChartPainter extends CustomPainter {
+  const _StatisticsChartPainter({
+    required this.points,
+    required this.maxValue,
+    required this.selectedIndex,
+  });
+
+  static const double leftInset = 38;
+  final List<_ChartPoint> points;
+  final double maxValue;
+  final int? selectedIndex;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (points.isEmpty || size.width <= leftInset + 8) return;
+    const top = 7.0;
+    const bottomInset = 37.0;
+    const rightInset = 4.0;
+    final baseline = size.height - bottomInset;
+    final plotHeight = baseline - top;
+    final plotWidth = size.width - leftInset - rightInset;
+    final axisMaximum = maxValue > 0 ? maxValue : 1.0;
+    final tickStep = _niceStep(axisMaximum / 4);
+    final gridPaint = Paint()
+      ..color = Colors.white.withOpacity(.09)
+      ..strokeWidth = 1;
+    final axisPaint = Paint()
+      ..color = Colors.white.withOpacity(.2)
+      ..strokeWidth = 1;
+
+    for (var value = 0.0;
+        value <= axisMaximum + tickStep * .01;
+        value += tickStep) {
+      final y = baseline - (value / axisMaximum) * plotHeight;
+      canvas.drawLine(Offset(leftInset, y), Offset(size.width - rightInset, y),
+          value == 0 ? axisPaint : gridPaint);
+      _drawText(
+        canvas,
+        _formatMinutes(value),
+        Offset(0, y - 6),
+        maxWidth: leftInset - 6,
+        align: TextAlign.right,
+        color: MimiVentColors.muted,
+        fontSize: 9,
+      );
+    }
+    canvas.drawLine(
+        const Offset(leftInset, top), Offset(leftInset, baseline), axisPaint);
+
+    final slotWidth = plotWidth / points.length;
+    for (var index = 0; index < points.length; index++) {
+      final point = points[index];
+      final centerX = leftInset + slotWidth * (index + .5);
+      final value = point.minutes.clamp(0.0, axisMaximum);
+      final barHeight = (value / axisMaximum) * plotHeight;
+      if (index == selectedIndex) {
+        final highlight = Paint()..color = MimiVentColors.mint.withOpacity(.07);
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromLTWH(
+                leftInset + index * slotWidth, top, slotWidth, baseline - top),
+            const Radius.circular(4),
+          ),
+          highlight,
+        );
+      }
+      final barWidth = math.min(16.0, math.max(3.0, slotWidth * .52));
+      final barPaint = Paint()
+        ..color = index == selectedIndex
+            ? MimiVentColors.amber
+            : MimiVentColors.mint.withOpacity(.82);
+      if (barHeight > 0) {
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromLTWH(centerX - barWidth / 2, baseline - barHeight,
+                barWidth, barHeight),
+            const Radius.circular(4),
+          ),
+          barPaint,
+        );
+      }
+    }
+
+    final labelStep = points.length >= 20
+        ? 4
+        : points.length >= 12
+            ? 2
+            : 1;
+    for (var index = 0; index < points.length; index += labelStep) {
+      final point = points[index];
+      final centerX = leftInset + slotWidth * (index + .5);
+      _drawText(
+        canvas,
+        point.label,
+        Offset(centerX - slotWidth / 2, baseline + 7),
+        maxWidth: slotWidth,
+        align: TextAlign.center,
+        color: MimiVentColors.muted,
+        fontSize: points.length >= 20 ? 7 : 8,
+      );
+    }
+
+    var groupStart = 0;
+    while (groupStart < points.length) {
+      final group = points[groupStart].groupLabel;
+      if (group.isEmpty) break;
+      var groupEnd = groupStart;
+      while (groupEnd + 1 < points.length &&
+          points[groupEnd + 1].groupLabel == group) {
+        groupEnd++;
+      }
+      final centerX = leftInset + slotWidth * (groupStart + groupEnd + 1) / 2;
+      _drawText(
+        canvas,
+        group,
+        Offset(centerX - slotWidth * (groupEnd - groupStart + 1) / 2,
+            size.height - 11),
+        maxWidth: slotWidth * (groupEnd - groupStart + 1),
+        align: TextAlign.center,
+        color: MimiVentColors.muted,
+        fontSize: 8,
+      );
+      groupStart = groupEnd + 1;
+    }
+  }
+
+  static double _niceStep(double rawStep) {
+    if (!rawStep.isFinite || rawStep <= 0) return 1;
+    final magnitude = math.pow(10, (math.log(rawStep) / math.ln10).floor());
+    final fraction = rawStep / magnitude;
+    final niceFraction = fraction <= 1
+        ? 1.0
+        : fraction <= 2
+            ? 2.0
+            : fraction <= 2.5
+                ? 2.5
+                : fraction <= 5
+                    ? 5.0
+                    : 10.0;
+    return niceFraction * magnitude;
+  }
+
+  static void _drawText(
+    Canvas canvas,
+    String value,
+    Offset offset, {
+    required double maxWidth,
+    required TextAlign align,
+    required Color color,
+    required double fontSize,
+  }) {
+    final painter = TextPainter(
+      text: TextSpan(
+          text: value,
+          style: TextStyle(color: color, fontSize: fontSize, height: 1)),
+      textAlign: align,
+      maxLines: 1,
+      ellipsis: '…',
+      textDirection: TextDirection.ltr,
+    )..layout(maxWidth: math.max(1, maxWidth));
+    painter.paint(canvas, offset);
+  }
+
+  @override
+  bool shouldRepaint(covariant _StatisticsChartPainter oldDelegate) =>
+      oldDelegate.points != points ||
+      oldDelegate.maxValue != maxValue ||
+      oldDelegate.selectedIndex != selectedIndex;
+}
+
+String _formatMinutes(double value) {
+  if (!value.isFinite || value <= 0) return '0';
+  final rounded = (value * 10).round() / 10;
+  return rounded == rounded.roundToDouble()
+      ? rounded.toInt().toString()
+      : rounded.toStringAsFixed(1);
+}
+
+double _niceAxisMaximum(double maximum) {
+  if (!maximum.isFinite || maximum <= 0) return 1;
+  final step = _StatisticsChartPainter._niceStep(maximum / 4);
+  return (maximum / step).ceil() * step;
+}
+
+class _EventPaginationHint extends StatelessWidget {
+  const _EventPaginationHint({required this.label, this.loading = false});
+
+  final String label;
+  final bool loading;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 12),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            if (loading) ...[
+              const SizedBox(
+                width: 11,
+                height: 11,
+                child: CircularProgressIndicator(
+                  strokeWidth: 1.5,
+                  valueColor: AlwaysStoppedAnimation(MimiVentColors.muted),
+                ),
+              ),
+              const SizedBox(width: 7),
+            ],
+            Text(label,
+                style:
+                    const TextStyle(color: MimiVentColors.muted, fontSize: 9)),
+          ],
+        ),
+      );
 }
 
 class _PreviewEvent {
@@ -981,14 +1396,12 @@ class _PreviewEvent {
     required this.title,
     required this.detail,
     required this.icon,
-    required this.color,
   });
 
   final String time;
   final String title;
   final String detail;
-  final IconData icon;
-  final Color color;
+  final Widget icon;
 }
 
 class _DailySummary {

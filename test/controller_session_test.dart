@@ -282,8 +282,22 @@ class _FakeRepository implements DeviceRepository {
 
   @override
   Future<Map<String, dynamic>> getStatistics(
-          TimingProfile profile, String range) async =>
+    TimingProfile profile,
+    String range, {
+    int offset = 0,
+  }) async =>
       <String, dynamic>{};
+
+  @override
+  Future<DeviceEventPage> queryEvents(
+          TimingProfile profile, DeviceEventQuery query) async =>
+      const DeviceEventPage(
+        events: [],
+        offset: 0,
+        nextOffset: 0,
+        total: 0,
+        hasMore: false,
+      );
 
   @override
   Future<void> syncClock(TimingProfile profile) async {}
