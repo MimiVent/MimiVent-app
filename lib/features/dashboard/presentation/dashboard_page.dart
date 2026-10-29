@@ -24,6 +24,7 @@ import '../../connection/connection_presentation.dart';
 import '../../control/control_operation.dart';
 import '../../diagnostics/diagnostics_page.dart';
 import '../../statistics/presentation/statistics_page.dart';
+import '../../firmware_update/firmware_update_page.dart';
 import '../../../shared/widgets/version_compatibility_notice.dart';
 
 part 'dashboard_connection.part.dart';
@@ -31,7 +32,13 @@ part 'dashboard_actions.part.dart';
 part 'dashboard_sections.part.dart';
 part 'dashboard_status_cards.part.dart';
 
-enum _TopBarMenuAction { diagnostics, closeApp }
+enum _TopBarMenuAction {
+  diagnostics,
+  firmwareUpdate,
+  connectDevice,
+  offline,
+  closeApp
+}
 
 class DashboardPage extends StatefulWidget {
   const DashboardPage({
@@ -50,6 +57,13 @@ class DashboardPage extends StatefulWidget {
 class _DashboardPageState extends State<DashboardPage> {
   final ModalCoordinator _modalCoordinator = ModalCoordinator();
   MimiVentController get c => widget.controller;
+  bool get _deviceReady =>
+      c.connected &&
+      !c.offlineViewing &&
+      !c.deviceOtaBusy &&
+      c.appVersionCompatible &&
+      c.status != null &&
+      c.settings != null;
   int _selectedTab = 0;
   int get _activeTab => _selectedTab < 3 ? _selectedTab : 0;
   double _headerCollapse = 0;
@@ -129,7 +143,14 @@ class _DashboardPageState extends State<DashboardPage> {
                               18, 5, 18, 5 + (1 - _headerCollapse) * 4),
                           child: _topBar(_headerCollapse),
                         ),
-                        if (c.lastError != null)
+                        if (c.offlineViewing || !c.connected)
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(18, 4, 18, 0),
+                            child: _connectionStatusBanner(),
+                          ),
+                        if (c.lastError != null &&
+                            c.connected &&
+                            !c.offlineViewing)
                           Padding(
                             padding: const EdgeInsets.fromLTRB(18, 4, 18, 0),
                             child: _connectionErrorBanner(),
@@ -146,7 +167,7 @@ class _DashboardPageState extends State<DashboardPage> {
                 ),
               ]),
             ),
-            bottomNavigationBar: c.connected ? _bottomBar() : null,
+            bottomNavigationBar: _bottomBar(),
           );
           return TweenAnimationBuilder<double>(
             tween: Tween<double>(end: _connectionRevealActive ? 3.2 : 0),
@@ -165,7 +186,7 @@ class _DashboardPageState extends State<DashboardPage> {
 
   Widget _topBar(double collapse) {
     final online = c.connected;
-    final isRunning = c.status?.fan ?? false;
+    final isRunning = !c.offlineViewing && (c.status?.fan ?? false);
     final logoSize = 42 - 14 * collapse;
     return SizedBox(
       height: 54 - 10 * collapse,
@@ -265,11 +286,37 @@ class _DashboardPageState extends State<DashboardPage> {
             switch (action) {
               case _TopBarMenuAction.diagnostics:
                 _openDiagnostics();
+              case _TopBarMenuAction.firmwareUpdate:
+                _openFirmwareUpdate();
+              case _TopBarMenuAction.connectDevice:
+                _leaveOfflineAndConnect();
+              case _TopBarMenuAction.offline:
+                _enterOfflineViewing();
               case _TopBarMenuAction.closeApp:
                 _disconnectAndExit();
             }
           },
           itemBuilder: (context) => [
+            if (c.offlineViewing)
+              const PopupMenuItem(
+                value: _TopBarMenuAction.connectDevice,
+                child: Row(children: [
+                  Icon(Icons.bluetooth_rounded,
+                      color: MimiVentColors.mint, size: 19),
+                  SizedBox(width: 11),
+                  Text('连接设备'),
+                ]),
+              )
+            else
+              const PopupMenuItem(
+                value: _TopBarMenuAction.offline,
+                child: Row(children: [
+                  Icon(Icons.offline_bolt_outlined,
+                      color: MimiVentColors.mint, size: 19),
+                  SizedBox(width: 11),
+                  Text('离线查看统计'),
+                ]),
+              ),
             const PopupMenuItem(
               value: _TopBarMenuAction.diagnostics,
               child: Row(children: [
@@ -277,6 +324,19 @@ class _DashboardPageState extends State<DashboardPage> {
                     color: MimiVentColors.mint, size: 19),
                 SizedBox(width: 11),
                 Text('设备诊断'),
+              ]),
+            ),
+            PopupMenuItem(
+              value: _TopBarMenuAction.firmwareUpdate,
+              enabled: c.connected && !c.offlineViewing,
+              child: Row(children: [
+                Icon(Icons.system_update_alt_rounded,
+                    color: c.connected
+                        ? MimiVentColors.mint
+                        : MimiVentColors.muted,
+                    size: 19),
+                const SizedBox(width: 11),
+                const Text('固件升级'),
               ]),
             ),
             PopupMenuItem(
@@ -311,8 +371,15 @@ class _DashboardPageState extends State<DashboardPage> {
                     width: 8,
                     height: 8,
                     decoration: BoxDecoration(
-                      color:
-                          online ? MimiVentColors.mint : MimiVentColors.amber,
+                      color: c.offlineViewing
+                          ? MimiVentColors.muted
+                          : online
+                              ? MimiVentColors.mint
+                              : c.ble.isScanning ||
+                                      c.ble.connectionStatus ==
+                                          BleConnectionStatus.connecting
+                                  ? MimiVentColors.amber
+                                  : MimiVentColors.red,
                       shape: BoxShape.circle,
                       border: Border.all(color: const Color(0xFF1A2D28)),
                     ),
@@ -325,146 +392,4 @@ class _DashboardPageState extends State<DashboardPage> {
       ]),
     );
   }
-
-  Widget _disconnectedPanel() => Container(
-        padding: const EdgeInsets.fromLTRB(24, 26, 24, 22),
-        decoration: BoxDecoration(
-          gradient: const LinearGradient(
-            colors: [Color(0xFF1C3930), Color(0xFF142720), Color(0xFF11201D)],
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-          ),
-          borderRadius: BorderRadius.circular(30),
-          border: Border.all(color: MimiVentColors.mint.withOpacity(.14)),
-          boxShadow: _displayCardShadows(MimiVentColors.mint),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Container(
-                  width: 62,
-                  height: 62,
-                  padding: const EdgeInsets.all(4),
-                  decoration: BoxDecoration(
-                    color: Colors.white.withOpacity(.08),
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(color: Colors.white.withOpacity(.08)),
-                  ),
-                  child: ClipRRect(
-                    borderRadius: BorderRadius.circular(16),
-                    child: Image.asset('assets/images/mimivent_logo.png',
-                        fit: BoxFit.cover),
-                  ),
-                ),
-                const SizedBox(width: 16),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text('${AppIdentity.productName} · App v$_appVersion',
-                          style: const TextStyle(
-                              fontSize: 11,
-                              color: MimiVentColors.mint,
-                              fontWeight: FontWeight.w700,
-                              letterSpacing: .2)),
-                      const SizedBox(height: 5),
-                      const Text('连接你的设备',
-                          style: TextStyle(
-                              fontSize: 24,
-                              height: 1.1,
-                              fontWeight: FontWeight.w800)),
-                    ],
-                  ),
-                ),
-                Icon(Icons.bluetooth_searching,
-                    size: 25, color: MimiVentColors.mint.withOpacity(.9)),
-              ],
-            ),
-            const SizedBox(height: 18),
-            const Text('首次使用请授权附近设备/蓝牙权限，并打开手机蓝牙。连接后即可查看传感器状态、控制风机和设置排风时间。',
-                style: TextStyle(color: MimiVentColors.muted, height: 1.55)),
-            const SizedBox(height: 18),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                _featureChip(Icons.tune_rounded, '时间配置'),
-                _featureChip(Icons.science_outlined, '风机测试'),
-              ],
-            ),
-            const SizedBox(height: 22),
-            SizedBox(
-              width: double.infinity,
-              height: 54,
-              child: FilledButton.icon(
-                onPressed: _scanAndConnect,
-                icon: c.ble.isScanning
-                    ? const SizedBox.square(
-                        dimension: 17,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: Color(0xFF10211B),
-                        ),
-                      )
-                    : const Icon(Icons.bluetooth),
-                label: Text(c.ble.isScanning
-                    ? '发现 ${c.ble.scanResults.length} 个设备'
-                    : '扫描并连接 ${AppIdentity.productName}'),
-                style: FilledButton.styleFrom(
-                  backgroundColor: MimiVentColors.mint,
-                  foregroundColor: const Color(0xFF10211B),
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(18)),
-                  textStyle: const TextStyle(
-                      fontSize: 15, fontWeight: FontWeight.w700),
-                ),
-              ),
-            ),
-            const SizedBox(height: 12),
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Icon(Icons.info_outline,
-                    size: 16, color: MimiVentColors.muted.withOpacity(.8)),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    c.ble.isScanning
-                        ? '正在扫描附近设备。请确认 ${AppIdentity.productName} 已通电，并且没有被其他手机或网页占用。'
-                        : '扫描结束后可再次搜索。刚断开连接时，设备可能需要片刻恢复广播。',
-                    style: const TextStyle(
-                        color: Color(0xFF8FA39A), fontSize: 11, height: 1.45),
-                  ),
-                ),
-              ],
-            ),
-            if (c.ble.lastError != null && c.lastError == null) ...[
-              const SizedBox(height: 10),
-              Text(c.ble.lastError!,
-                  style:
-                      const TextStyle(color: MimiVentColors.red, fontSize: 12)),
-            ],
-          ],
-        ),
-      );
-
-  Widget _featureChip(IconData icon, String label) => Container(
-        padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
-        decoration: BoxDecoration(
-          color: Colors.white.withOpacity(.045),
-          borderRadius: BorderRadius.circular(30),
-          border: Border.all(color: Colors.white.withOpacity(.07)),
-        ),
-        child: Row(mainAxisSize: MainAxisSize.min, children: [
-          Icon(icon, size: 15, color: MimiVentColors.mint),
-          const SizedBox(width: 6),
-          Text(label,
-              style: const TextStyle(
-                  color: MimiVentColors.muted,
-                  fontSize: 11,
-                  fontWeight: FontWeight.w600)),
-        ]),
-      );
 }

@@ -16,6 +16,11 @@ class AppLayout {
   static double connectionSheetHeightFactor(BuildContext context) =>
       isShortScreen(context) ? .88 : .55;
 
-  static double connectionAnimationSize(BuildContext context) =>
-      sizeOf(context).height < 500 ? 72 : 112;
+  static double connectionAnimationSize(BuildContext context) {
+    // 连接面板底部保留重新扫描和离线入口，矮窗口优先缩小装饰动画。
+    final sheetHeight =
+        sizeOf(context).height * connectionSheetHeightFactor(context);
+    final reservedHeight = usesLargeText(context) ? 340 : 300;
+    return (sheetHeight - reservedHeight).clamp(32.0, 112.0).toDouble();
+  }
 }

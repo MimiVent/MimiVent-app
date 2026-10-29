@@ -3,6 +3,7 @@ import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../api/mimivent_api.dart';
@@ -13,11 +14,14 @@ import 'ble_device_repository.dart';
 import 'device_repository.dart';
 import 'settings_draft.dart';
 import 'models.dart';
+import 'statistics_event_cache.dart';
+import '../transport/device_transport.dart';
 
 class MimiVentController extends ChangeNotifier {
   MimiVentController(
       {MimiVentBleManager? bleManager,
       DeviceRepository? deviceRepository,
+      this.appVersionOverride,
       this.diagnostics})
       : ble = bleManager ?? MimiVentBleManager(diagnostics: diagnostics) {
     // 默认 Repository 与扫描/连接共用同一个 BLE 实例；测试可注入替身。
@@ -25,12 +29,20 @@ class MimiVentController extends ChangeNotifier {
         BleDeviceRepository(MimiVentApi(ble, diagnostics: diagnostics));
     ble.addListener(_onBleChanged);
     _pollTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (ble.isConnected && !busy && !_polling) refresh();
+      if (ble.isConnected &&
+          !_offlineViewing &&
+          !ble.isOtaUploading &&
+          !ble.isOtaVerifying &&
+          !busy &&
+          !_polling) {
+        refresh();
+      }
     });
   }
 
   final MimiVentBleManager ble;
   final AppDiagnosticsLog? diagnostics;
+  final String? appVersionOverride;
   late DeviceRepository repository;
   DeviceStatus? status;
   Map<String, dynamic>? statistics;
@@ -50,15 +62,25 @@ class MimiVentController extends ChangeNotifier {
   bool _statusInvalid = false;
   bool _initialized = false;
   bool _statisticsCacheLoaded = false;
+  Future<void>? _statisticsCacheRestoring;
+  Future<void>? _preferencesLoading;
+  bool _offlineViewing = false;
   bool _disposed = false;
   int _sessionGeneration = 0;
   int _connectAttempt = 0;
   Future<void>? _closingBluetoothSession;
+  String? _appVersionCache;
   static const _profileKey = 'mimivent.selected_profile';
+  static const _offlineViewingKey = 'mimivent.offline_viewing';
   static const _statisticsCacheKeyPrefix = 'mimivent.statistics.cache.';
   String? lastError;
 
   bool get connected => ble.isConnected;
+  bool get deviceOtaBusy => ble.deviceOtaBusy;
+  bool get appVersionCompatible => ble.appVersionCompatible;
+
+  /// 离线只读是独立的页面模式，不能由一次短暂断连自动开启控制能力。
+  bool get offlineViewing => _offlineViewing;
   bool get statusInvalid => _statusInvalid;
   bool get profileMatches => status != null && status!.activeProfile == profile;
   bool get hasUnsavedSettings => _settingsDraft?.isDirty ?? false;
@@ -83,14 +105,24 @@ class MimiVentController extends ChangeNotifier {
     return events is List ? events.length : 0;
   }
 
+  int? statisticsNextEventCursorFor(String range) {
+    final value = _statisticsByRange[range]?['eventsNextCursor'];
+    return value is num && value.toInt() > 0 ? value.toInt() : null;
+  }
+
   Future<void> loadMoreStatisticsEvents(String range) async {
     if (!statisticsHasMoreEventsFor(range)) return;
-    await refreshStatistics(range,
-        eventOffset: statisticsNextEventOffsetFor(range));
+    final cursor = statisticsNextEventCursorFor(range);
+    await refreshStatistics(
+      range,
+      eventOffset: cursor == null ? statisticsNextEventOffsetFor(range) : 0,
+      eventBeforeId: cursor,
+    );
   }
 
   /// 通用原始事件查询入口；页面可传入自然日、自定义时间段和事件筛选条件。
   Future<DeviceEventPage> queryDeviceEvents(DeviceEventQuery query) async {
+    if (_offlineViewing) throw StateError('离线模式仅支持查看缓存');
     if (!ble.isConnected) throw StateError('请先连接 MimiVent 设备');
     final selectedProfile = profile;
     final generation = _sessionGeneration;
@@ -147,24 +179,59 @@ class MimiVentController extends ChangeNotifier {
 
   /// 恢复用户上次选择的页面环境，再开始扫描，避免重开 App 时错用正式环境。
   Future<void> openApp() async {
-    if (!_initialized) {
+    await _loadSelectedProfile();
+    await _ensureStatisticsCache();
+    if (_disposed || _offlineViewing) return;
+    if (!ble.isConnected && !ble.isScanning) await scan();
+  }
+
+  /// 取消扫描和旧连接尝试，再读取缓存；离线操作不会排队留待下次连接执行。
+  Future<void> enterOfflineViewing() async {
+    await _loadSelectedProfile();
+    if (_disposed) return;
+    _offlineViewing = true;
+    lastError = null;
+    _notifyIfAlive();
+    await closeBluetoothSession();
+    await _ensureStatisticsCache();
+    await _persistOfflineViewing();
+    _notifyIfAlive();
+  }
+
+  /// 返回连接页；扫描只由用户明确的连接动作或在线启动流程发起。
+  Future<void> leaveOfflineViewing() async {
+    _offlineViewing = false;
+    await _persistOfflineViewing();
+    _notifyIfAlive();
+  }
+
+  Future<void> _persistOfflineViewing() async {
+    try {
       final preferences = await SharedPreferences.getInstance();
       if (_disposed) return;
-      profile = preferences.getString(_profileKey) == 'dev'
-          ? TimingProfile.dev
-          : TimingProfile.production;
-      _initialized = true;
-      _notifyIfAlive();
+      await preferences.setBool(_offlineViewingKey, _offlineViewing);
+    } catch (error) {
+      diagnostics?.warning('离线模式', '保存查看模式失败：$error');
     }
-    if (!_statisticsCacheLoaded) await _restoreStatisticsCache();
-    if (!ble.isConnected && !ble.isScanning) await scan();
+  }
+
+  /// 启动恢复与用户点击离线入口可能并发，合并为同一次缓存读取。
+  Future<void> _ensureStatisticsCache() {
+    final pending = _statisticsCacheRestoring;
+    if (pending != null) return pending;
+    if (_statisticsCacheLoaded || _disposed) return Future.value();
+    final restoring = _restoreStatisticsCache().whenComplete(() {
+      _statisticsCacheRestoring = null;
+    });
+    _statisticsCacheRestoring = restoring;
+    return restoring;
   }
 
   /// 从本地恢复各时间范围最近一次成功的统计，供首屏先显示缓存再做 BLE 刷新。
   Future<void> _restoreStatisticsCache() async {
-    _statisticsCacheLoaded = true;
     try {
       final preferences = await SharedPreferences.getInstance();
+      if (_disposed) return;
       for (final range in const [
         'today',
         'yesterday',
@@ -174,20 +241,36 @@ class MimiVentController extends ChangeNotifier {
         if (_statisticsByRange.containsKey(range)) continue;
         final raw = preferences.getString('$_statisticsCacheKeyPrefix$range');
         if (raw == null) continue;
-        final decoded = jsonDecode(raw);
-        if (decoded is! Map<String, dynamic>) continue;
-        final payload = decoded['data'];
-        if (payload is! Map) continue;
-        final data = Map<String, dynamic>.from(payload);
-        final updatedAtMs = decoded['updatedAt'];
-        if (updatedAtMs is int && updatedAtMs > 0) {
+        try {
+          final decoded = jsonDecode(raw);
+          if (decoded is! Map<String, dynamic>) continue;
+          final payload = decoded['data'];
+          if (payload is! Map) continue;
+          final data = StatisticsEventCache.keepCompatibleSnapshot(
+            Map<String, dynamic>.from(payload),
+          );
+          final updatedAtMs = decoded['updatedAt'];
+          // 没有可用时间或汇总字段的快照不能伪装成“今天为 0”。
+          if (updatedAtMs is! int ||
+              updatedAtMs <= 0 ||
+              data['runtimeSeconds'] is! num ||
+              data['activityCount'] is! num ||
+              data['automaticCount'] is! num ||
+              data['bucketSeconds'] is! List ||
+              !_validNonNegativeNumbers(data['bucketSeconds'] as List)) {
+            continue;
+          }
           final updatedAt = DateTime.fromMillisecondsSinceEpoch(updatedAtMs);
           data['_cacheUpdatedAt'] = updatedAtMs;
           _statisticsCacheUpdatedAt[range] = updatedAt;
+          _statisticsByRange[range] = data;
+          _statisticsCachedRanges.add(range);
+        } catch (error) {
+          // 一个范围损坏不能阻止其余范围离线展示。
+          diagnostics?.warning('统计缓存', '忽略 $range 无效快照：$error');
         }
-        _statisticsByRange[range] = data;
-        _statisticsCachedRanges.add(range);
       }
+      _statisticsCacheLoaded = true;
       _notifyIfAlive();
     } catch (error) {
       _statisticsCacheLoaded = false;
@@ -206,7 +289,10 @@ class MimiVentController extends ChangeNotifier {
         '$_statisticsCacheKeyPrefix$range',
         jsonEncode({
           'updatedAt': updatedAt.millisecondsSinceEpoch,
-          'data': data,
+          'data': {
+            ...data,
+            'eventsIdentityVersion': StatisticsEventCache.schemaVersion
+          },
         }),
       );
       _statisticsCacheUpdatedAt[range] = updatedAt;
@@ -264,6 +350,39 @@ class MimiVentController extends ChangeNotifier {
       final generation = _sessionGeneration;
       sessionGeneration = generation;
       final selectedProfile = profile;
+      DeviceStatus loadedStatus;
+      try {
+        loadedStatus = await repository.getStatus(selectedProfile);
+        ble.setDeviceOtaBusy(false);
+      } on DeviceBusyException catch (error) {
+        ble.setDeviceOtaBusy(true);
+        status = null;
+        settings = null;
+        _settingsDraft = null;
+        _offlineViewing = false;
+        lastError = '已连接设备；设备正在升级，普通控制暂不可用。$error';
+        _notifyIfAlive();
+        return;
+      }
+      if (!_isCurrentSession(generation, selectedProfile) ||
+          attempt != _connectAttempt) {
+        return;
+      }
+      final minimumApp = loadedStatus.minimumAppVersion;
+      final appVersion = await _resolveAppVersion();
+      final compatible = minimumApp == null ||
+          (appVersion != null && _compareVersions(appVersion, minimumApp) >= 0);
+      ble.setFirmwareAppCompatible(compatible);
+      if (!compatible) {
+        status = loadedStatus;
+        settings = null;
+        _settingsDraft = null;
+        lastError = appVersion == null
+            ? '无法读取 App 版本，设备要求 MimiVent App v$minimumApp 或更新版本。'
+            : '当前 App v$appVersion 低于设备要求 v$minimumApp，请更新 App。';
+        _notifyIfAlive();
+        return;
+      }
       try {
         await repository.syncClock(selectedProfile);
       } catch (error) {
@@ -271,12 +390,6 @@ class MimiVentController extends ChangeNotifier {
       }
       if (!_isCurrentSession(generation, selectedProfile) ||
           attempt != _connectAttempt) return;
-      // 状态先确认设备真实环境，再读取对应页面环境的时序，避免并发读取错配。
-      final loadedStatus = await repository.getStatus(selectedProfile);
-      if (!_isCurrentSession(generation, selectedProfile) ||
-          attempt != _connectAttempt) {
-        return;
-      }
       final loadedSettings = await repository.getSettings(selectedProfile);
       if (!_isCurrentSession(generation, selectedProfile) ||
           attempt != _connectAttempt) {
@@ -287,6 +400,8 @@ class MimiVentController extends ChangeNotifier {
       settings = loadedSettings;
       _settingsDraft =
           SettingsDraft(saved: loadedSettings, value: loadedSettings);
+      _offlineViewing = false;
+      unawaited(_persistOfflineViewing());
       lastError = null;
       _notifyIfAlive();
     } catch (error) {
@@ -297,12 +412,50 @@ class MimiVentController extends ChangeNotifier {
         return;
       }
       if (attempt == _connectAttempt) {
+        if (error is DeviceBusyException) {
+          ble.setDeviceOtaBusy(true);
+          status = null;
+          settings = null;
+          _settingsDraft = null;
+          lastError = '设备正在升级，普通控制暂不可用。';
+          _notifyIfAlive();
+          return;
+        }
         if (error is FormatException) _statusInvalid = true;
         lastError = error.toString();
         _notifyIfAlive();
       }
       rethrow;
     }
+  }
+
+  Future<String?> _resolveAppVersion() async {
+    final override = appVersionOverride;
+    if (override != null && override.isNotEmpty) return override;
+    final cached = _appVersionCache;
+    if (cached != null) return cached;
+    try {
+      final version = (await PackageInfo.fromPlatform()).version;
+      _appVersionCache = version;
+      return version;
+    } catch (error) {
+      diagnostics?.warning('版本兼容', '读取 App 版本失败：$error');
+      return null;
+    }
+  }
+
+  int _compareVersions(String left, String right) {
+    final a = left.split('.').map(int.tryParse).toList();
+    final b = right.split('.').map(int.tryParse).toList();
+    if (a.any((part) => part == null) || b.any((part) => part == null)) {
+      return -1;
+    }
+    for (var i = 0; i < 3; i++) {
+      final av = i < a.length ? a[i]! : 0;
+      final bv = i < b.length ? b[i]! : 0;
+      if (av != bv) return av.compareTo(bv);
+    }
+    return 0;
   }
 
   Future<void> disconnect() async {
@@ -317,7 +470,13 @@ class MimiVentController extends ChangeNotifier {
       profile == this.profile;
 
   Future<void> refresh({int? expectedGeneration}) async {
-    if (!ble.isConnected || _polling) return;
+    if (_offlineViewing ||
+        !ble.isConnected ||
+        ble.isOtaUploading ||
+        ble.isOtaVerifying ||
+        _polling) {
+      return;
+    }
     _polling = true;
     final generation = expectedGeneration ?? _sessionGeneration;
     final selectedProfile = profile;
@@ -333,10 +492,56 @@ class MimiVentController extends ChangeNotifier {
           selectedProfile != profile) {
         return;
       }
+      final minimumApp = loaded.minimumAppVersion;
+      final appVersion = await _resolveAppVersion();
+      final compatible = minimumApp == null ||
+          (appVersion != null && _compareVersions(appVersion, minimumApp) >= 0);
+      ble.setFirmwareAppCompatible(compatible);
       status = loaded;
+      ble.setDeviceOtaBusy(false);
       _statusInvalid = false;
+      if (!compatible) {
+        settings = null;
+        _settingsDraft = null;
+        lastError = appVersion == null
+            ? '无法读取 App 版本，设备要求 MimiVent App v$minimumApp 或更新版本。'
+            : '当前 App v$appVersion 低于设备要求 v$minimumApp，请更新 App。';
+        return;
+      }
+      if (settings == null) {
+        // OTA 自动重连由传输层建立会话，首轮恢复配置时补做校时。
+        try {
+          await repository.syncClock(selectedProfile);
+        } catch (error) {
+          diagnostics?.warning('设备时间', '重连后校时失败：$error');
+        }
+        if (_disposed ||
+            !ble.isConnected ||
+            generation != _sessionGeneration ||
+            selectedProfile != profile) {
+          return;
+        }
+        final loadedSettings = await repository.getSettings(selectedProfile);
+        if (_disposed ||
+            !ble.isConnected ||
+            generation != _sessionGeneration ||
+            selectedProfile != profile) {
+          return;
+        }
+        settings = loadedSettings;
+        _settingsDraft =
+            SettingsDraft(saved: loadedSettings, value: loadedSettings);
+      }
       lastError = null;
     } catch (error) {
+      if (error is DeviceBusyException) {
+        ble.setDeviceOtaBusy(true);
+        status = null;
+        settings = null;
+        _settingsDraft = null;
+        lastError = '设备正在升级，普通控制暂不可用。';
+        return;
+      }
       if (!_disposed && generation == _sessionGeneration) {
         if (error is FormatException) _statusInvalid = true;
         lastError = error.toString();
@@ -348,39 +553,86 @@ class MimiVentController extends ChangeNotifier {
   }
 
   Future<void> refreshStatistics(String range,
-      {int? expectedGeneration, int eventOffset = 0}) async {
-    if (!ble.isConnected) return;
+      {int? expectedGeneration,
+      int eventOffset = 0,
+      int? eventBeforeId}) async {
+    if (_offlineViewing || !ble.isConnected) return;
     final generation = expectedGeneration ?? _sessionGeneration;
     if (generation != _sessionGeneration) return;
     if (!_statisticsRequests.add(range)) return;
     final selectedProfile = profile;
+    var restartAfterDatasetChange = false;
     _statisticsLoadingRanges.add(range);
     _statisticsFailedRanges.remove(range);
     _notifyIfAlive();
     try {
       final Map<String, dynamic> loaded;
-      if (eventOffset == 0) {
+      if (eventOffset == 0 && eventBeforeId == null) {
         loaded = await repository.getStatistics(selectedProfile, range);
+        _validateStatisticsSnapshot(range, loaded);
+        if (range == 'today' || range == 'yesterday') {
+          // 统一用自然日原始事件查询，兼容旧固件的滚动 24 小时统计事件列表。
+          final eventPage = await repository.queryEvents(
+            selectedProfile,
+            _eventQueryForRange(
+              range,
+              offset: 0,
+              previous: null,
+            ),
+          );
+          loaded.addAll({
+            'events': eventPage.events.map((event) => event.toJson()).toList(),
+            'eventsOffset': eventPage.offset,
+            'eventsNextOffset': eventPage.nextOffset,
+            'eventsNextCursor': eventPage.nextCursor ?? 0,
+            'eventsTotal': eventPage.total,
+            'eventsHasMore': eventPage.hasMore,
+            'eventsTruncated': eventPage.eventsTruncated,
+            'eventsStart': eventPage.start,
+            'eventsEnd': eventPage.end,
+            'eventsDeviceId': eventPage.deviceId,
+            'eventsDataEpoch': eventPage.dataEpoch,
+          });
+        }
       } else {
         // 统计汇总只在首屏读取；继续翻页时走通用原始事件接口，减少 BLE 传输。
         final page = await repository.queryEvents(
           selectedProfile,
-          _eventQueryForRange(range, offset: eventOffset),
+          _eventQueryForRange(
+            range,
+            offset: eventOffset,
+            previous: _statisticsByRange[range],
+            beforeId: eventBeforeId,
+          ),
         );
         loaded = {
           'events': page.events.map((event) => event.toJson()).toList(),
           'eventsOffset': page.offset,
           'eventsNextOffset': page.nextOffset,
+          'eventsNextCursor': page.nextCursor ?? 0,
           'eventsTotal': page.total,
           'eventsHasMore': page.hasMore,
+          'eventsTruncated': page.eventsTruncated,
+          'eventsStart': page.start,
+          'eventsEnd': page.end,
+          'eventsDeviceId': page.deviceId,
+          'eventsDataEpoch': page.dataEpoch,
         };
       }
       if (_disposed ||
           !ble.isConnected ||
           generation != _sessionGeneration ||
           selectedProfile != profile) return;
+      await _invalidateOlderStatisticsDatasets(
+          loaded, generation, selectedProfile);
+      if (!_isCurrentSession(generation, selectedProfile)) return;
       final previous = _statisticsByRange[range];
-      final merged = _mergeStatisticsPage(previous, loaded, eventOffset);
+      final merged = _mergeStatisticsPage(
+        previous,
+        loaded,
+        offset: eventOffset,
+        beforeId: eventBeforeId,
+      );
       statistics = merged;
       _statisticsByRange[range] = merged;
       _statisticsCachedRanges.remove(range);
@@ -390,6 +642,20 @@ class MimiVentController extends ChangeNotifier {
       lastError = null;
     } catch (error) {
       if (!_disposed && generation == _sessionGeneration) {
+        if (error.toString().contains('DATASET_CHANGED')) {
+          final previous = _statisticsByRange[range];
+          if (previous != null) {
+            final cleared = Map<String, dynamic>.from(previous)
+              ..remove('events')
+              ..['eventsTotal'] = 0
+              ..['eventsNextOffset'] = 0
+              ..['eventsNextCursor'] = 0
+              ..['eventsHasMore'] = false;
+            _statisticsByRange[range] = cleared;
+            statistics = cleared;
+          }
+          restartAfterDatasetChange = true;
+        }
         _statisticsFailedRanges.add(range);
         diagnostics?.warning('设备统计', '读取统计失败：$error');
       }
@@ -398,32 +664,115 @@ class MimiVentController extends ChangeNotifier {
       _statisticsLoadingRanges.remove(range);
       _notifyIfAlive();
     }
+    if (restartAfterDatasetChange && !_disposed && ble.isConnected) {
+      // 旧游标属于已清除的数据批次；从当前数据集首屏重新开始。
+      unawaited(refreshStatistics(range, expectedGeneration: generation));
+    }
+  }
+
+  /// 新数据批次到达后，其余日期的旧快照也失效，避免切换 Tab 复活旧统计。
+  Future<void> _invalidateOlderStatisticsDatasets(Map<String, dynamic> incoming,
+      int generation, TimingProfile selectedProfile) async {
+    final epoch = incoming['dataEpoch'] ?? incoming['eventsDataEpoch'];
+    final device = incoming['deviceId'] ?? incoming['eventsDeviceId'];
+    if (epoch is! String || epoch.isEmpty) return;
+    final stale = _statisticsByRange.entries.where((entry) {
+      final old = entry.value;
+      final oldEpoch = old['dataEpoch'] ?? old['eventsDataEpoch'];
+      final oldDevice = old['deviceId'] ?? old['eventsDeviceId'];
+      if (oldEpoch is! String || oldEpoch.isEmpty) {
+        return incoming['statisticsSchema'] == 4;
+      }
+      return oldEpoch != epoch ||
+          (device is String && oldDevice is String && device != oldDevice);
+    }).toList();
+    if (stale.isEmpty) return;
+    final preferences = await SharedPreferences.getInstance();
+    for (final entry in stale) {
+      if (!_isCurrentSession(generation, selectedProfile)) return;
+      // 等待持久化期间，同一范围可能已被另一响应替换。
+      if (!identical(_statisticsByRange[entry.key], entry.value)) continue;
+      _statisticsByRange.remove(entry.key);
+      _statisticsCachedRanges.remove(entry.key);
+      _statisticsCacheUpdatedAt.remove(entry.key);
+      await preferences.remove('$_statisticsCacheKeyPrefix${entry.key}');
+    }
   }
 
   /// 固件按新到旧返回原始事件。分页时拼接原始记录，刷新首屏时保留已加载的旧页。
   /// 分组展示留给 App UI，这里不改变固件事件的语义或顺序。
   Map<String, dynamic> _mergeStatisticsPage(
-    Map<String, dynamic>? previous,
-    Map<String, dynamic> page,
-    int offset,
-  ) {
-    final next = Map<String, dynamic>.from(page);
+      Map<String, dynamic>? previous, Map<String, dynamic> page,
+      {required int offset, int? beforeId}) {
+    // 翻页响应只有事件数据；先继承汇总字段，再用本页字段覆盖。
+    final next = <String, dynamic>{...?previous, ...page};
     final freshEvents = _rawEventList(page['events']);
     final oldEvents = _rawEventList(previous?['events']);
     List<Map<String, dynamic>> mergedEvents;
 
-    if (offset > 0 && previous != null) {
-      mergedEvents = [...oldEvents, ...freshEvents];
+    final pageStart = _intValue(page['eventsStart']);
+    final oldStart = _intValue(previous?['eventsStart']);
+    final sameWindow = pageStart == 0 || oldStart == 0 || pageStart == oldStart;
+    final incomingTotalValue = page['eventsTotal'];
+    final incomingTotal =
+        incomingTotalValue is num ? incomingTotalValue.toInt() : -1;
+    final discardPrevious = StatisticsEventCache.shouldDiscardPrevious(
+      previous: oldEvents,
+      incoming: freshEvents,
+      incomingTotal: incomingTotal,
+      sameWindow: sameWindow,
+      firstPage: offset == 0 && beforeId == null,
+      previousDataEpoch: previous?['eventsDataEpoch'] is String
+          ? previous!['eventsDataEpoch'] as String
+          : null,
+      incomingDataEpoch: page['eventsDataEpoch'] is String
+          ? page['eventsDataEpoch'] as String
+          : null,
+      previousDeviceId: previous?['eventsDeviceId'] is String
+          ? previous!['eventsDeviceId'] as String
+          : null,
+      incomingDeviceId: page['eventsDeviceId'] is String
+          ? page['eventsDeviceId'] as String
+          : null,
+    );
+    final retainedOldEvents =
+        sameWindow && !discardPrevious ? oldEvents : <Map<String, dynamic>>[];
+    if ((offset > 0 || beforeId != null) && previous != null) {
+      if (retainedOldEvents.every((event) => event['id'] is num) &&
+          freshEvents.every((event) => event['id'] is num)) {
+        mergedEvents = _mergeUniqueEvents(retainedOldEvents, freshEvents);
+      } else {
+        mergedEvents =
+            _dedupeLegacyEvents([...retainedOldEvents, ...freshEvents]);
+        mergedEvents.sort(
+            (a, b) => _intValue(b['time']).compareTo(_intValue(a['time'])));
+      }
+    } else if (discardPrevious) {
+      // 新 dataEpoch、ID 回退或总量收缩意味着设备已经重建数据集；
+      // 首屏只使用新响应，不能在后续分支把旧缓存重新拼回来。
+      mergedEvents = StatisticsEventCache.mergeFirstPage(
+        previous: retainedOldEvents,
+        incoming: freshEvents,
+        discardPrevious: true,
+      );
     } else if (oldEvents.isEmpty) {
       mergedEvents = freshEvents;
+    } else if (!sameWindow) {
+      mergedEvents = freshEvents;
+    } else if (freshEvents.every((event) => event['id'] is num) &&
+        oldEvents.every((event) => event['id'] is num)) {
+      mergedEvents = _mergeUniqueEvents(oldEvents, freshEvents);
     } else {
-      // 找到新首屏与旧列表的重叠点，避免每分钟刷新时重复显示已有原始事件。
+      // 旧固件没有事件 ID 时，用重叠记录切开新旧页，避免整页重叠重复拼接。
       final oldFirstKey = _eventKey(oldEvents.first);
       final overlapIndex =
           freshEvents.indexWhere((event) => _eventKey(event) == oldFirstKey);
       mergedEvents = overlapIndex >= 0
-          ? [...freshEvents, ...oldEvents.skip(1)]
+          ? [...freshEvents.take(overlapIndex + 1), ...oldEvents.skip(1)]
           : [...freshEvents, ...oldEvents];
+      mergedEvents = _dedupeLegacyEvents(mergedEvents);
+      mergedEvents
+          .sort((a, b) => _intValue(b['time']).compareTo(_intValue(a['time'])));
     }
 
     final totalValue = page['eventsTotal'];
@@ -431,11 +780,44 @@ class MimiVentController extends ChangeNotifier {
     final hasMore =
         mergedEvents.length < total && page['eventsHasMore'] == true;
     next['events'] = mergedEvents;
+    next['eventsIdentityVersion'] = StatisticsEventCache.schemaVersion;
     next['eventsOffset'] = 0;
     next['eventsNextOffset'] = mergedEvents.length;
+    final ids = mergedEvents
+        .map((event) => event['id'])
+        .whereType<num>()
+        .map((id) => id.toInt())
+        .toList();
+    next['eventsNextCursor'] =
+        hasMore && ids.isNotEmpty ? ids.reduce((a, b) => a < b ? a : b) : 0;
     next['eventsTotal'] = total;
     next['eventsHasMore'] = hasMore;
     return next;
+  }
+
+  List<Map<String, dynamic>> _mergeUniqueEvents(
+    List<Map<String, dynamic>> existing,
+    List<Map<String, dynamic>> incoming,
+  ) {
+    final byId = <int, Map<String, dynamic>>{};
+    for (final event in existing) {
+      final id = event['id'];
+      if (id is num) byId[id.toInt()] = event;
+    }
+    // 新响应优先，活动中的事件时长可随刷新更新。
+    for (final event in incoming) {
+      final id = event['id'];
+      if (id is num) byId[id.toInt()] = event;
+    }
+    final ids = byId.keys.toList()..sort((a, b) => b.compareTo(a));
+    return ids.map((id) => byId[id]!).toList();
+  }
+
+  List<Map<String, dynamic>> _dedupeLegacyEvents(
+    List<Map<String, dynamic>> events,
+  ) {
+    final seen = <String>{};
+    return events.where((event) => seen.add(_eventKey(event))).toList();
   }
 
   List<Map<String, dynamic>> _rawEventList(Object? value) => value is List
@@ -445,29 +827,96 @@ class MimiVentController extends ChangeNotifier {
           .toList()
       : <Map<String, dynamic>>[];
 
+  void _validateStatisticsSnapshot(
+    String range,
+    Map<String, dynamic> snapshot,
+  ) {
+    for (final key in const [
+      'runtimeSeconds',
+      'activityCount',
+      'automaticCount',
+    ]) {
+      final value = snapshot[key];
+      if (value is! num || value < 0 || value != value.toInt()) {
+        throw FormatException('统计响应字段 $key 缺失或无效');
+      }
+    }
+    final buckets = snapshot['bucketSeconds'];
+    final expectedBucketCount = switch (range) {
+      'today' => 24,
+      'yesterday' => 12,
+      'threeDays' => 9,
+      'sevenDays' => 7,
+      _ => 0,
+    };
+    if (buckets is! List ||
+        buckets.length != expectedBucketCount ||
+        !_validNonNegativeNumbers(buckets)) {
+      throw const FormatException('统计响应的分桶数据缺失或无效');
+    }
+    final days = snapshot['days'];
+    if (days != null &&
+        (days is! List ||
+            days.any((day) =>
+                day is! Map ||
+                day['date'] is! num ||
+                day['runtimeSeconds'] is! num ||
+                day['activityCount'] is! num ||
+                day['automaticCount'] is! num))) {
+      throw const FormatException('统计响应的每日汇总数据无效');
+    }
+  }
+
+  bool _validNonNegativeNumbers(List values) => values.every(
+        (value) => value is num && value >= 0 && value == value.toInt(),
+      );
+
   String _eventKey(Map<String, dynamic> event) =>
       '${event['time']}|${event['kind']}|${event['state']}|${event['durationSeconds']}';
 
-  DeviceEventQuery _eventQueryForRange(String range, {required int offset}) {
+  int _intValue(Object? value) => value is num ? value.toInt() : 0;
+
+  DeviceEventQuery _eventQueryForRange(
+    String range, {
+    required int offset,
+    required Map<String, dynamic>? previous,
+    int? beforeId,
+  }) {
     final now = DateTime.now();
+    final storedStart = _intValue(previous?['eventsStart']);
+    final storedEnd = _intValue(previous?['eventsEnd']);
+    if (storedStart > 0 && storedEnd > storedStart) {
+      return DeviceEventQuery(
+        start:
+            DateTime.fromMillisecondsSinceEpoch(storedStart * 1000).toLocal(),
+        end: DateTime.fromMillisecondsSinceEpoch(storedEnd * 1000).toLocal(),
+        offset: offset,
+        beforeId: beforeId,
+        dataEpoch: previous?['eventsDataEpoch'] as String?,
+      );
+    }
     if (range == 'today') {
       return DeviceEventQuery(
-        start: now.subtract(const Duration(hours: 24)),
-        end: now,
+        start: DateTime(now.year, now.month, now.day),
+        end: now.add(const Duration(seconds: 1)),
         offset: offset,
+        beforeId: beforeId,
+        dataEpoch: previous?['eventsDataEpoch'] as String?,
       );
     }
     if (range == 'yesterday') {
       return DeviceEventQuery.forLocalDay(
         now.subtract(const Duration(days: 1)),
         offset: offset,
+        beforeId: beforeId,
+        dataEpoch: previous?['eventsDataEpoch'] as String?,
       );
     }
     throw ArgumentError.value(range, 'range', '该区间不展示原始事件列表');
   }
 
   Future<void> loadSettings({int? expectedGeneration}) async {
-    if (!ble.isConnected) return;
+    if (_offlineViewing || !ble.isConnected) return;
     final generation = expectedGeneration ?? _sessionGeneration;
     if (generation != _sessionGeneration) return;
     final selectedProfile = profile;
@@ -615,10 +1064,16 @@ class MimiVentController extends ChangeNotifier {
     });
   }
 
-  Future<void> cancelLockOff() => repository.cancelLockOff(profile);
+  Future<void> cancelLockOff() async {
+    if (_offlineViewing || !connected) {
+      throw StateError('离线模式无法操作设备，请先连接蓝牙');
+    }
+    await repository.cancelLockOff(profile);
+  }
 
   /// 页面选择跟随设备当前环境，不向设备发送切换命令。
   Future<void> followDeviceProfile() async {
+    if (_offlineViewing) return;
     final active = status?.activeProfile;
     if (active == null) return;
     final generation = _sessionGeneration;
@@ -629,13 +1084,22 @@ class MimiVentController extends ChangeNotifier {
     await refresh(expectedGeneration: generation);
   }
 
-  Future<void> _loadSelectedProfile() async {
-    if (_initialized) return;
+  Future<void> _loadSelectedProfile() {
+    if (_initialized || _disposed) return Future.value();
+    return _preferencesLoading ??= _restoreAppPreferences().whenComplete(() {
+      _preferencesLoading = null;
+    });
+  }
+
+  Future<void> _restoreAppPreferences() async {
     final preferences = await SharedPreferences.getInstance();
+    if (_disposed) return;
     profile = preferences.getString(_profileKey) == 'dev'
         ? TimingProfile.dev
         : TimingProfile.production;
+    _offlineViewing = preferences.getBool(_offlineViewingKey) ?? false;
     _initialized = true;
+    _notifyIfAlive();
   }
 
   Future<void> _persistSelectedProfile() async {
@@ -644,6 +1108,7 @@ class MimiVentController extends ChangeNotifier {
   }
 
   Future<void> updateSetting(String key, int value) async {
+    if (_offlineViewing || !connected) return;
     final current = _settingsDraft;
     if (current == null) return;
     _settingsDraft = current.update(key, value);
@@ -677,6 +1142,7 @@ class MimiVentController extends ChangeNotifier {
   Future<void> _perform(Future<void> Function(int generation) action,
       {bool allowMismatch = false}) async {
     if (_disposed) throw StateError('控制器已关闭');
+    if (_offlineViewing) throw StateError('离线模式无法操作设备，请先连接蓝牙');
     if (busy) throw StateError('操作正在执行，请稍后重试');
     if (!ble.isConnected) throw StateError('蓝牙未连接，请先连接设备');
     if (_statusInvalid) {

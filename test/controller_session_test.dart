@@ -14,6 +14,48 @@ void main() {
 
   setUp(() => SharedPreferences.setMockInitialValues({}));
 
+  test('OTA 传输层重连后先校时再恢复配置，后续轮询不重复校时', () async {
+    final ble = _FakeBleManager();
+    final repository = _FakeRepository();
+    final order = <String>[];
+    repository.onSyncClock = (_) async {
+      order.add('clock');
+    };
+    repository.onGetSettings = (_) async {
+      order.add('settings');
+      return _settings(300000);
+    };
+    final controller = MimiVentController(
+      bleManager: ble,
+      deviceRepository: repository,
+    );
+    // 模拟 OTA 管理器直接恢复 BLE，会绕过 controller.connect。
+    ble.setConnected(true);
+    await controller.refresh();
+    expect(order, ['clock', 'settings']);
+    await controller.refresh();
+    expect(order, ['clock', 'settings']);
+    await controller.closeBluetoothSession();
+    controller.dispose();
+  });
+
+  test('重连校时期间断开后不再读取旧会话配置', () async {
+    final ble = _FakeBleManager();
+    final repository = _FakeRepository();
+    repository.onSyncClock = (_) async {
+      ble.setConnected(false);
+    };
+    final controller = MimiVentController(
+      bleManager: ble,
+      deviceRepository: repository,
+    );
+    ble.setConnected(true);
+    await controller.refresh();
+    expect(repository.settingsCalls, 0);
+    expect(controller.settings, isNull);
+    controller.dispose();
+  });
+
   test('断开并快速重连时，旧会话不继续读配置或覆盖新状态', () async {
     final ble = _FakeBleManager();
     final repository = _FakeRepository();
@@ -276,6 +318,7 @@ class _FakeRepository implements DeviceRepository {
   Future<DeviceStatus> Function(TimingProfile profile)? onGetStatus;
   Future<TimingSettings> Function(TimingProfile profile)? onGetSettings;
   Future<void> Function(TimingProfile profile)? onArmLockOff;
+  Future<void> Function(TimingProfile profile)? onSyncClock;
   int settingsCalls = 0;
   int confirmLockOffCalls = 0;
   int setAutoCalls = 0;
@@ -300,7 +343,9 @@ class _FakeRepository implements DeviceRepository {
       );
 
   @override
-  Future<void> syncClock(TimingProfile profile) async {}
+  Future<void> syncClock(TimingProfile profile) async {
+    await onSyncClock?.call(profile);
+  }
 
   @override
   Future<DeviceStatus> getStatus(TimingProfile profile) =>

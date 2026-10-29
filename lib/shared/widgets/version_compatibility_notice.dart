@@ -11,7 +11,7 @@ class VersionCompatibilityNotice extends StatelessWidget {
     super.key,
   });
 
-  static const recommendedFirmwareVersion = '0.3.1';
+  static const recommendedFirmwareVersion = '0.4.0';
 
   final String appVersion;
   final String firmwareVersion;

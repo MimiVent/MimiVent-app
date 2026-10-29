@@ -1,15 +1,15 @@
 import 'package:flutter/foundation.dart';
 
 import '../app/app_identity.dart';
-import '../ble/mimivent_ble_manager.dart';
 import '../core/diagnostics/app_diagnostics_log.dart';
 import '../data/models.dart';
+import '../transport/device_transport.dart';
 
 /// 把应用内操作映射到固件已有的 /api/* 控制接口。
 class MimiVentApi {
-  MimiVentApi(this._ble, {this.diagnostics});
+  MimiVentApi(this._transport, {this.diagnostics});
 
-  final MimiVentBleManager _ble;
+  final DeviceTransport _transport;
   final AppDiagnosticsLog? diagnostics;
   String? _lastLoggedFirmware;
   final Map<String, DateTime> _lastReadFailureAt = {};
@@ -24,16 +24,19 @@ class MimiVentApi {
     String body = '',
   }) async {
     try {
-      final response = await _ble.request(
+      final response = await _transport.send(DeviceRequest(
         method: method,
         path: path,
         query: {'profile': profile.wireValue, ...query},
         body: body,
-      );
+      ));
       final json = decodeJsonObject(response.body);
       if (response.statusCode < 200 || response.statusCode >= 300) {
         final raw = json['error']?.toString() ?? 'HTTP ${response.statusCode}';
         final message = _friendlyError(raw);
+        if (response.statusCode == 423) {
+          throw DeviceBusyException(message.isEmpty ? '设备正在执行 OTA' : message);
+        }
         if (method == 'GET') {
           _logReadFailure(path, message);
         } else {
@@ -72,6 +75,8 @@ class MimiVentApi {
 
   String _friendlyError(String raw) {
     switch (raw) {
+      case 'APP_UPDATE_REQUIRED':
+        return '此设备已升级 BLE 控制协议，请更新 MimiVent App 后重新连接。';
       case 'PROFILE_MISMATCH':
         return '设备环境已变化，请先同步或切换环境';
       case 'PIR_HIGH':
@@ -161,7 +166,11 @@ class MimiVentApi {
           .join('&'),
     );
     try {
-      return DeviceEventPage.fromJson(response);
+      return DeviceEventPage.fromJson(
+        response,
+        requestedStart: query.start.millisecondsSinceEpoch ~/ 1000,
+        requestedEnd: query.end.millisecondsSinceEpoch ~/ 1000,
+      );
     } catch (error) {
       diagnostics?.error('设备事件', '响应数据校验失败：$error');
       rethrow;

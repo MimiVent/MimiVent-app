@@ -36,10 +36,19 @@ class StatisticsPage extends StatefulWidget {
 }
 
 class _StatisticsPageState extends State<StatisticsPage> {
+  bool get _readOnly =>
+      widget.controller.offlineViewing || !widget.controller.connected;
+  bool get _canSynchronize =>
+      widget.active &&
+      !_readOnly &&
+      widget.controller.status != null &&
+      widget.controller.settings != null;
+
   _StatisticsRange _range = _StatisticsRange.today;
   int? _selectedChartIndex;
   Timer? _refreshTimer;
   bool _loadingMoreEvents = false;
+  bool _refreshEnabled = false;
 
   @override
   void initState() {
@@ -61,8 +70,12 @@ class _StatisticsPageState extends State<StatisticsPage> {
   void _updateRefreshTimer() {
     _refreshTimer?.cancel();
     _refreshTimer = null;
-    if (!widget.active) return;
-    unawaited(_loadStatistics());
+    _refreshEnabled = _canSynchronize;
+    if (!_refreshEnabled) return;
+    // 切换 Tab 或重连可能发生于父级构建期间，延后到帧末再通知加载状态。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _canSynchronize) unawaited(_loadStatistics());
+    });
     _refreshTimer = Timer.periodic(const Duration(minutes: 1), (_) {
       unawaited(_loadStatistics());
     });
@@ -74,7 +87,9 @@ class _StatisticsPageState extends State<StatisticsPage> {
   bool _onScrollNotification(ScrollNotification notification) {
     final supportsEventPages = _range == _StatisticsRange.today ||
         _range == _StatisticsRange.yesterday;
-    if (supportsEventPages &&
+    if (widget.controller.connected &&
+        !widget.controller.offlineViewing &&
+        supportsEventPages &&
         notification.metrics.extentAfter < 180 &&
         !_loadingMoreEvents &&
         widget.controller.statisticsHasMoreEventsFor(_range.wireValue)) {
@@ -94,6 +109,8 @@ class _StatisticsPageState extends State<StatisticsPage> {
   }
 
   void _onControllerChanged() {
+    final canRefresh = _canSynchronize;
+    if (canRefresh != _refreshEnabled) _updateRefreshTimer();
     if (mounted) setState(() {});
   }
 
@@ -110,7 +127,8 @@ class _StatisticsPageState extends State<StatisticsPage> {
     final view = data == null
         ? _StatisticsPreview.emptyForRange(_range)
         : _StatisticsPreview.fromDevice(_range, data,
-            currentMode: widget.controller.status?.mode);
+            currentMode: widget.controller.status?.mode,
+            snapshotOnly: _readOnly);
     return NotificationListener<ScrollNotification>(
         onNotification: _onScrollNotification,
         child: LayoutBuilder(
@@ -140,26 +158,33 @@ class _StatisticsPageState extends State<StatisticsPage> {
                         const SizedBox(height: 8),
                         _rangePicker(),
                         const SizedBox(height: 14),
-                        _summaryCard(view),
-                        const SizedBox(height: 12),
-                        _metricRow(view),
-                        const SizedBox(height: 16),
-                        _runtimeChart(view),
-                        const SizedBox(height: 16),
-                        if (_range == _StatisticsRange.today ||
-                            _range == _StatisticsRange.yesterday)
-                          _eventList(
-                            view.events,
-                            title: _range == _StatisticsRange.today
-                                ? '最近 24 小时事件'
-                                : '昨日事件',
-                            rawCount: view.rawEventCount,
-                            totalCount: view.eventTotal,
-                            hasMore: view.eventsHasMore,
-                            loadingMore: _loadingMoreEvents,
-                          )
-                        else
-                          _dailyBreakdown(view.days),
+                        if (_readOnly && data == null)
+                          _offlineEmptyState()
+                        else ...[
+                          _summaryCard(view),
+                          const SizedBox(height: 12),
+                          _metricRow(view),
+                          const SizedBox(height: 16),
+                          _runtimeChart(view),
+                          const SizedBox(height: 16),
+                          if (data?['eventsTruncated'] == true)
+                            const _EventPaginationHint(
+                                label: '部分历史明细已淘汰，图表与累计时长仍保留完整汇总'),
+                          if (_range == _StatisticsRange.today ||
+                              _range == _StatisticsRange.yesterday)
+                            _eventList(
+                              view.events,
+                              title: _range == _StatisticsRange.today
+                                  ? '今日事件'
+                                  : '昨日事件',
+                              rawCount: view.rawEventCount,
+                              totalCount: view.eventTotal,
+                              hasMore: view.eventsHasMore,
+                              loadingMore: _loadingMoreEvents,
+                            )
+                          else
+                            _dailyBreakdown(view.days),
+                        ],
                         const SizedBox(height: 4),
                         const Center(
                           child: Text(
@@ -182,14 +207,14 @@ class _StatisticsPageState extends State<StatisticsPage> {
         ));
   }
 
-  Widget _pageHeading() => const Row(
+  Widget _pageHeading() => Row(
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
+                const Text(
                   '使用统计',
                   style: TextStyle(
                     color: Colors.white,
@@ -198,16 +223,35 @@ class _StatisticsPageState extends State<StatisticsPage> {
                     letterSpacing: -.3,
                   ),
                 ),
-                SizedBox(height: 3),
+                const SizedBox(height: 3),
                 Text(
-                  '看看 MimiVent 最近的运行情况',
-                  style: TextStyle(color: MimiVentColors.muted, fontSize: 11),
+                  _readOnly ? '查看上次同步快照，日期以卡片显示为准' : '看看 MimiVent 最近的运行情况',
+                  style: const TextStyle(
+                      color: MimiVentColors.muted, fontSize: 11),
                 ),
               ],
             ),
           ),
-          Icon(Icons.insights_rounded, color: MimiVentColors.mint, size: 20),
+          const Icon(Icons.insights_rounded,
+              color: MimiVentColors.mint, size: 20),
         ],
+      );
+
+  Widget _offlineEmptyState() => Container(
+        key: const ValueKey('offline-statistics-empty'),
+        padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 36),
+        decoration: _cardDecoration(),
+        child: const Column(children: [
+          Icon(Icons.bar_chart_rounded, size: 32, color: MimiVentColors.muted),
+          SizedBox(height: 14),
+          Text('此范围暂无缓存',
+              style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
+          SizedBox(height: 8),
+          Text('连接设备并查看相应时间范围后，会自动保存统计快照。\n离线模式仅展示已下载的数据。',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                  color: MimiVentColors.muted, fontSize: 12, height: 1.6)),
+        ]),
       );
 
   Widget _syncStatus(Map<String, dynamic>? data) {
@@ -219,17 +263,24 @@ class _StatisticsPageState extends State<StatisticsPage> {
     final cachedAtLabel = cachedAt == null
         ? ''
         : ' · ${cachedAt.month}/${cachedAt.day} ${cachedAt.hour.toString().padLeft(2, '0')}:${cachedAt.minute.toString().padLeft(2, '0')}';
-    final label = failed
-        ? cached
-            ? '同步失败 · 显示上次数据$cachedAtLabel'
-            : '同步暂不可用 · 将自动重试'
-        : loading
+    final offline = _readOnly;
+    final label = offline
+        ? data == null
+            ? '离线只读 · 此范围尚未缓存'
+            : cachedAt == null
+                ? '离线缓存 · 更新时间未知'
+                : '离线缓存$cachedAtLabel'
+        : failed
             ? cached
-                ? '显示本地缓存 · 正在更新$cachedAtLabel'
-                : '正在同步设备数据'
-            : data == null
-                ? '等待首次同步'
-                : '设备数据已同步 · 每分钟更新';
+                ? '同步失败 · 显示上次数据$cachedAtLabel'
+                : '同步暂不可用 · 将自动重试'
+            : loading
+                ? cached
+                    ? '显示本地缓存 · 正在更新$cachedAtLabel'
+                    : '正在同步设备数据'
+                : data == null
+                    ? '等待首次同步'
+                    : '设备数据已同步 · 每分钟更新';
     final color = failed ? MimiVentColors.amber : MimiVentColors.mint;
     return SizedBox(
       height: 28,
@@ -244,22 +295,27 @@ class _StatisticsPageState extends State<StatisticsPage> {
                     valueColor: AlwaysStoppedAnimation<Color>(color),
                   )
                 : Icon(
-                    failed
-                        ? Icons.sync_problem_rounded
-                        : Icons.cloud_done_rounded,
+                    offline
+                        ? Icons.offline_bolt_outlined
+                        : failed
+                            ? Icons.sync_problem_rounded
+                            : Icons.cloud_done_rounded,
                     size: 14,
                     color: color.withOpacity(data == null ? .45 : .8),
                   ),
           ),
           const SizedBox(width: 7),
-          Text(
+          Expanded(
+              child: Text(
             label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
             style: const TextStyle(
               color: MimiVentColors.muted,
               fontSize: 10,
               height: 1,
             ),
-          ),
+          )),
         ],
       ),
     );
@@ -665,6 +721,8 @@ class _StatisticsPageState extends State<StatisticsPage> {
             ],
             if (loadingMore)
               const _EventPaginationHint(label: '正在加载更多原始事件…', loading: true)
+            else if (_readOnly && hasMore)
+              const _EventPaginationHint(label: '仅显示已缓存事件，连接设备可加载其余记录')
             else if (hasMore)
               const _EventPaginationHint(label: '继续上滑加载更早事件')
             else if (rawCount > 0)
@@ -866,7 +924,7 @@ class _StatisticsPreview {
 
   factory _StatisticsPreview.fromDevice(
       _StatisticsRange range, Map<String, dynamic> json,
-      {String? currentMode}) {
+      {String? currentMode, bool snapshotOnly = false}) {
     final cachedAtMs = _intValue(json['_cacheUpdatedAt']);
     final now = cachedAtMs > 0
         ? DateTime.fromMillisecondsSinceEpoch(cachedAtMs)
@@ -938,8 +996,25 @@ class _StatisticsPreview {
     final chronologicalEvents = <_PreviewEvent>[];
     final rawEvents = json['events'];
     if (rawEvents is List) {
-      // 设备接口按最新到最旧返回；先反转，以事件相邻关系合并连续感应段。
-      final ordered = rawEvents.whereType<Map>().toList().reversed.toList();
+      // 设备接口按事件 ID 从新到旧返回；按 ID 还原记录顺序后再合并感应段。
+      final source = rawEvents.whereType<Map>().toList().reversed.toList();
+      final ordered =
+          source.map((event) => Map<String, dynamic>.from(event)).toList();
+      if (ordered.every((event) => event['id'] is num)) {
+        ordered
+            .sort((a, b) => _intValue(a['id']).compareTo(_intValue(b['id'])));
+      } else {
+        // 兼容没有事件 ID 的旧固件；按时间排序，并保持同秒记录原有顺序。
+        final indexed = ordered.asMap().entries.toList();
+        indexed.sort((a, b) {
+          final byTime =
+              _intValue(a.value['time']).compareTo(_intValue(b.value['time']));
+          return byTime != 0 ? byTime : a.key.compareTo(b.key);
+        });
+        ordered
+          ..clear()
+          ..addAll(indexed.map((entry) => entry.value));
+      }
       DateTime? nextControlEventTime(int fromIndex) {
         for (var next = fromIndex + 1; next < ordered.length; next++) {
           final nextEvent = ordered[next].cast<String, dynamic>();
@@ -965,15 +1040,20 @@ class _StatisticsPreview {
             next++;
           }
           final count = next - index;
-          final span = lastTimestamp.difference(timestamp);
-          final timeRange = _activityTimeRange(timestamp, lastTimestamp);
+          final clockMovedBack = lastTimestamp.isBefore(timestamp);
+          final rangeStart = clockMovedBack ? lastTimestamp : timestamp;
+          final rangeEnd = clockMovedBack ? timestamp : lastTimestamp;
+          final span = rangeEnd.difference(rangeStart);
+          final timeRange = _activityTimeRange(rangeStart, rangeEnd);
           chronologicalEvents.add(_PreviewEvent(
             // 右侧时间始终显示这一组合并段的首次触发时间。
             time: _clockTime(timestamp),
             title: count == 1 ? '检测到活动' : '连续感应 · $count 次',
             detail: count == 1
                 ? '$timeRange · 单次触发'
-                : '$timeRange · 活动跨度 ${_activitySpanLabel(span)}',
+                : clockMovedBack
+                    ? '$timeRange · 设备时间回退，跨度暂不可用'
+                    : '$timeRange · 活动跨度 ${_activitySpanLabel(span)}',
             icon: const Icon(Icons.sensors_rounded,
                 size: 16, color: MimiVentColors.mint),
           ));
@@ -1003,17 +1083,19 @@ class _StatisticsPreview {
                 ? math.max(0, DateTime.now().difference(timestamp).inSeconds)
                 : null);
         final detail = switch (kind) {
-          'pause' => currentMode == 'timed_off' && nextControlTime == null
-              ? '暂停中 · 已 ${_durationLabel(math.max(0, DateTime.now().difference(timestamp).inSeconds))}'
-              : '暂停 ${_durationLabel(pauseDuration)}',
+          'pause' => snapshotOnly && nextControlTime == null
+              ? '暂停 · 设定 ${_durationLabel(configuredDuration)}'
+              : currentMode == 'timed_off' && nextControlTime == null
+                  ? '暂停中 · 已 ${_durationLabel(math.max(0, DateTime.now().difference(timestamp).inSeconds))}'
+                  : '暂停 ${_durationLabel(pauseDuration)}',
           'locked_off' => lockedOffDuration == null
               ? '持续关闭 · 结束时间未记录'
               : currentMode == 'lock_off' && nextControlTime == null
                   ? '持续关闭中 · 已 ${_durationLabel(lockedOffDuration)}'
                   : '持续关闭 ${_durationLabel(lockedOffDuration)}',
-          'resume' => '持续关闭结束 · 自动感应已恢复',
+          'resume' => '自动感应已恢复',
           _ => state == 'active'
-              ? '正在运行 · ${_durationLabel(configuredDuration)}'
+              ? '${snapshotOnly ? '同步时运行中' : '正在运行'} · ${_durationLabel(configuredDuration)}'
               : state == 'interrupted'
                   ? '设备重启时中断'
                   : '运行 ${_durationLabel(configuredDuration)}',
@@ -1028,10 +1110,10 @@ class _StatisticsPreview {
         final icon = switch (kind) {
           'activity' => const Icon(Icons.sensors_rounded,
               size: 16, color: MimiVentColors.mint),
-          // 自定义扇叶线稿视觉面积比 Material 图标大，因此缩小到 10px。
-          'manual' => const FanRotorGlyph(color: MimiVentColors.mint, size: 10),
+          // 自定义扇叶线稿视觉面积比 Material 图标大，事件列表中使用较小尺寸。
+          'manual' => const FanRotorGlyph(color: MimiVentColors.mint, size: 6),
           'automatic' =>
-            const FanRotorGlyph(color: MimiVentColors.amber, size: 10),
+            const FanRotorGlyph(color: MimiVentColors.amber, size: 6),
           'resume' => const Icon(Icons.sensors_rounded,
               size: 16, color: MimiVentColors.mint),
           'force' => Icon(Icons.science_outlined, size: 16, color: color),

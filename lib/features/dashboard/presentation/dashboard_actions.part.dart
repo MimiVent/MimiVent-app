@@ -3,9 +3,22 @@
 part of 'dashboard_page.dart';
 
 extension _DashboardActionSection on _DashboardPageState {
+  /// 只引导连接，不把刚点击的操作排队，也不在连接完成后自动补发。
+  Future<bool> _requireDeviceConnection() async {
+    if (_deviceReady) return true;
+    final accepted = await _confirm(
+      title: '需要连接蓝牙',
+      message: '连接 MimiVent 后才能控制风机和修改设置。',
+      detail: '连接后请重新选择操作，当前操作不会自动执行。',
+      confirm: '连接设备',
+    );
+    if (accepted && mounted) await _scanAndConnect();
+    return false;
+  }
+
   Future<void> _runAction(ControlOperation action,
       {bool replace = false}) async {
-    if (!c.connected) return;
+    if (!await _requireDeviceConnection() || !mounted) return;
     if (!c.profileMatches) {
       _toast('当前页面环境与设备不一致，请先切换环境');
       return;
@@ -122,7 +135,8 @@ extension _DashboardActionSection on _DashboardPageState {
   }
 
   Future<void> _switchProfile(TimingProfile next) async {
-    if (next == c.profile || !c.connected) return;
+    if (!await _requireDeviceConnection() || !mounted) return;
+    if (next == c.profile) return;
     final accepted = await _confirm(
       title: '切换到${next.label}？',
       message: '切换后会立即停止当前操作，并取消排风或暂停倒计时。',
@@ -246,12 +260,14 @@ extension _DashboardActionSection on _DashboardPageState {
 
   Future<void> _editSetting(String key, String title, int value,
       {bool allowZero = false}) async {
+    if (!await _requireDeviceConnection() || !mounted) return;
     final picked =
         await _pickTime(title: title, current: value, allowZero: allowZero);
     if (picked != null) await c.updateSetting(key, picked);
   }
 
   Future<void> _saveSettings() async {
+    if (!await _requireDeviceConnection() || !mounted) return;
     try {
       await c.saveSettings();
       _toast('时序设置已保存');
@@ -261,6 +277,7 @@ extension _DashboardActionSection on _DashboardPageState {
   }
 
   Future<void> _resetSettings() async {
+    if (!await _requireDeviceConnection() || !mounted) return;
     final accepted = await _confirm(
       title: '重置当前环境配置？',
       message: '五项时序将恢复到固件默认值并保存到设备。',

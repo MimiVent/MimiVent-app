@@ -2,6 +2,8 @@
 class BleRequestQueue {
   Future<void> _tail = Future<void>.value();
 
+  Future<void> get idle => _tail;
+
   Future<BleRequestResult<T>> enqueue<T>({
     required bool Function() isSessionCurrent,
     required Future<T> Function() send,

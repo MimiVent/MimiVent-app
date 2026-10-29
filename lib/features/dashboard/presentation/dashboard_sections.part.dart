@@ -45,10 +45,6 @@ extension _DashboardMainSections on _DashboardPageState {
         label: label,
         child: InkWell(
           onTap: () {
-            if (!c.connected) {
-              _toast('请先连接 ${AppIdentity.productName}，连接后即可使用全部功能');
-              return;
-            }
             setState(() => _selectedTab = index);
           },
           child: Center(
@@ -91,44 +87,20 @@ extension _DashboardMainSections on _DashboardPageState {
   }
 
   Widget _tabBody() {
-    if (!c.connected) {
-      return LayoutBuilder(
-        builder: (context, constraints) => SingleChildScrollView(
-          key: const PageStorageKey('connection-page'),
-          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 16),
-          child: ConstrainedBox(
-            constraints: BoxConstraints(
-              minHeight: (constraints.maxHeight - 32).clamp(0, double.infinity),
-            ),
-            child: Center(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 560),
-                child: _disconnectedPanel(),
-              ),
-            ),
-          ),
-        ),
-      );
-    }
     final status = c.status;
     final settings = c.settings;
-    if (status == null || settings == null) {
-      return ListView(
-        key: const PageStorageKey('loading-page'),
-        primary: false,
-        padding: const EdgeInsets.all(18),
-        children: [
-          _loadingPanel(),
-        ],
-      );
-    }
-
-    // 两个常驻页面各自保留滚动状态；轮询刷新状态时不重建单一长列表。
+    // 导航与统计页始终存在；没有实时数据时展示未知状态，不填入假状态或默认配置。
     return IndexedStack(
       index: _activeTab,
       children: [
-        _controlPage(status, settings),
-        _settingsPage(status, settings),
+        if (_deviceReady)
+          _controlPage(status!, settings!)
+        else
+          _unavailableControlPage(),
+        if (_deviceReady)
+          _settingsPage(status!, settings!)
+        else
+          _unavailableSettingsPage(),
         StatisticsPage(
           controller: c,
           active: _activeTab == 2,
@@ -137,6 +109,197 @@ extension _DashboardMainSections on _DashboardPageState {
       ],
     );
   }
+
+  Widget _connectionStatusBanner() {
+    final offline = c.offlineViewing;
+    final color = offline ? MimiVentColors.muted : MimiVentColors.red;
+    return Material(
+      color: MimiVentColors.surfaceRaised,
+      borderRadius: BorderRadius.circular(14),
+      child: InkWell(
+        onTap: _leaveOfflineAndConnect,
+        borderRadius: BorderRadius.circular(14),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
+          child: Row(children: [
+            Icon(
+                offline
+                    ? Icons.offline_bolt_outlined
+                    : Icons.bluetooth_disabled,
+                size: 17,
+                color: color),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                offline ? '离线模式 · 仅查看缓存数据' : '蓝牙未连接 · 可查看缓存数据',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(color: color, fontSize: 11),
+              ),
+            ),
+            const SizedBox(width: 6),
+            const Text('连接设备',
+                style: TextStyle(color: MimiVentColors.mint, fontSize: 11)),
+            const Icon(Icons.chevron_right_rounded,
+                size: 17, color: MimiVentColors.mint),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  Widget _unavailableControlPage() => _scrollPage('unavailable-control-page', [
+        Container(
+          padding: const EdgeInsets.all(22),
+          decoration: BoxDecoration(
+            color: MimiVentColors.surface,
+            borderRadius: BorderRadius.circular(27),
+            border: Border.all(color: Colors.white.withOpacity(.06)),
+          ),
+          child: Row(children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                      c.offlineViewing
+                          ? '离线查看'
+                          : c.connected && c.deviceOtaBusy
+                              ? '设备正在升级'
+                              : c.connected && !c.appVersionCompatible
+                                  ? '请更新 MimiVent App'
+                                  : c.connected
+                                      ? '正在同步'
+                                      : '等待连接',
+                      style: const TextStyle(
+                          fontSize: 27, fontWeight: FontWeight.w800)),
+                  const SizedBox(height: 9),
+                  const Text('风机与感应实时状态未知',
+                      style:
+                          TextStyle(color: MimiVentColors.muted, fontSize: 12)),
+                  const SizedBox(height: 5),
+                  Text(
+                      c.deviceOtaBusy
+                          ? 'OTA 正在执行，设备仍会独立运行；完成后重新连接即可核验'
+                          : (!c.appVersionCompatible && c.lastError != null
+                              ? c.lastError!
+                              : '连接蓝牙后同步，设备继续独立运行'),
+                      style: const TextStyle(
+                          color: MimiVentColors.muted, fontSize: 10)),
+                ],
+              ),
+            ),
+            const SizedBox(width: 12),
+            const FanRotorGlyph(color: MimiVentColors.muted, size: 60),
+          ]),
+        ),
+        const SizedBox(height: 12),
+        Row(children: [
+          Expanded(
+            child: _metricCard(
+              title: '空间感应',
+              value: '状态未知',
+              detail: '连接后同步 PIR',
+              icon: Icons.radar_rounded,
+              accent: MimiVentColors.muted,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: _metricCard(
+              title: '风机运行',
+              value: '--:--',
+              detail: '尚未获取实时数据',
+              icon: Icons.schedule_rounded,
+              accent: MimiVentColors.muted,
+            ),
+          ),
+        ]),
+        const SizedBox(height: 14),
+        _unavailableQuickActions(),
+        const SizedBox(height: 18),
+        Center(
+          child: Text('App v$_appVersion',
+              style:
+                  const TextStyle(color: MimiVentColors.muted, fontSize: 10)),
+        ),
+      ]);
+
+  Widget _unavailableQuickActions() {
+    const actions = <(ControlOperation, String, IconData)>[
+      (ControlOperation.automatic, '自动感应', Icons.sensors_rounded),
+      (ControlOperation.exhaust, '临时排风', Icons.air_rounded),
+      (ControlOperation.pause, '临时暂停', Icons.pause_circle_outline_rounded),
+      (ControlOperation.forceExhaust, '强制排风', Icons.science_outlined),
+      (
+        ControlOperation.persistentOff,
+        '持续关闭',
+        Icons.power_settings_new_rounded
+      ),
+    ];
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: Row(children: [
+        for (var index = 0; index < actions.length; index++) ...[
+          if (index > 0) const SizedBox(width: 10),
+          SizedBox(
+            width: 154,
+            child: _actionCard(
+              icon: actions[index].$1 == ControlOperation.exhaust
+                  ? const FanRotorGlyph(color: MimiVentColors.muted, size: 11)
+                  : Icon(actions[index].$3,
+                      size: 16, color: MimiVentColors.muted),
+              title: actions[index].$2,
+              detail: '需要连接蓝牙',
+              selected: false,
+              accent: MimiVentColors.mint,
+              enabled: true,
+              onTap: () => _runAction(actions[index].$1),
+            ),
+          ),
+        ],
+      ]),
+    );
+  }
+
+  Widget _unavailableSettingsPage() =>
+      _scrollPage('unavailable-settings-page', [
+        _sectionHeader('时间设置', '连接后读取设备配置'),
+        const SizedBox(height: 10),
+        const Text('当前环境和时序尚未同步。点击设置可连接设备。',
+            style: TextStyle(color: MimiVentColors.muted, fontSize: 12)),
+        const SizedBox(height: 14),
+        Container(
+          decoration: BoxDecoration(
+            color: MimiVentColors.surface,
+            borderRadius: BorderRadius.circular(21),
+            border: Border.all(color: Colors.white.withOpacity(.06)),
+          ),
+          child: Column(children: [
+            for (final title in const [
+              '运行环境',
+              '启动冷静期',
+              '离开确认时间',
+              '自动排风时长',
+              '临时排风时长',
+              '临时暂停时长',
+            ])
+              ListTile(
+                title: Text(title, style: const TextStyle(fontSize: 13)),
+                trailing: const Row(mainAxisSize: MainAxisSize.min, children: [
+                  Text('未同步',
+                      style:
+                          TextStyle(color: MimiVentColors.muted, fontSize: 11)),
+                  Icon(Icons.chevron_right_rounded,
+                      size: 18, color: MimiVentColors.muted),
+                ]),
+                onTap: _requireDeviceConnection,
+              ),
+          ]),
+        ),
+        const SizedBox(height: 14),
+        _diagnosticsEntry(),
+      ]);
 
   Widget _scrollPage(String key, List<Widget> children) => LayoutBuilder(
         builder: (context, constraints) {

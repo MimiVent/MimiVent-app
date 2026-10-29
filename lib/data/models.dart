@@ -36,6 +36,8 @@ class DeviceEventQuery {
     this.kind = DeviceEventKind.all,
     this.offset = 0,
     this.limit = 32,
+    this.beforeId,
+    this.dataEpoch,
   });
 
   final DateTime start;
@@ -43,6 +45,8 @@ class DeviceEventQuery {
   final DeviceEventKind kind;
   final int offset;
   final int limit;
+  final int? beforeId;
+  final String? dataEpoch;
 
   /// 为某个本地自然日创建查询，正确处理跨日及夏令时日长变化。
   factory DeviceEventQuery.forLocalDay(
@@ -50,6 +54,8 @@ class DeviceEventQuery {
     DeviceEventKind kind = DeviceEventKind.all,
     int offset = 0,
     int limit = 32,
+    int? beforeId,
+    String? dataEpoch,
   }) {
     final start = DateTime(day.year, day.month, day.day);
     final end = DateTime(day.year, day.month, day.day + 1);
@@ -59,6 +65,8 @@ class DeviceEventQuery {
       kind: kind,
       offset: offset,
       limit: limit,
+      beforeId: beforeId,
+      dataEpoch: dataEpoch,
     );
   }
 
@@ -66,18 +74,22 @@ class DeviceEventQuery {
     if (!end.isAfter(start)) {
       throw ArgumentError.value(end, 'end', '必须晚于 start');
     }
-    if (offset < 0 || offset > 512) {
+    if (beforeId == null && (offset < 0 || offset > 512)) {
       throw RangeError.range(offset, 0, 512, 'offset');
     }
     if (limit < 1 || limit > 32) {
       throw RangeError.range(limit, 1, 32, 'limit');
     }
+    if (beforeId != null && beforeId! <= 0) {
+      throw RangeError.value(beforeId!, 'beforeId', '必须大于 0');
+    }
     return {
       'start': '${start.millisecondsSinceEpoch ~/ 1000}',
       'end': '${end.millisecondsSinceEpoch ~/ 1000}',
       'kind': kind.wireValue,
-      'offset': '$offset',
       'limit': '$limit',
+      if (dataEpoch != null && dataEpoch!.isNotEmpty) 'dataEpoch': dataEpoch!,
+      if (beforeId != null) 'beforeId': '$beforeId' else 'offset': '$offset',
     };
   }
 }
@@ -88,8 +100,10 @@ class DeviceEvent {
     required this.kind,
     required this.state,
     required this.durationSeconds,
+    this.id,
   });
 
+  final int? id;
   final int time;
   final String kind;
   final String state;
@@ -100,13 +114,25 @@ class DeviceEvent {
     final kind = json['kind'];
     final state = json['state'];
     final duration = json['durationSeconds'];
+    final id = json['id'];
     if (time is! num ||
         kind is! String ||
         state is! String ||
-        duration is! num) {
+        duration is! num ||
+        (id != null && id is! num)) {
       throw const FormatException('设备事件字段缺失或类型无效');
     }
+    if (time < 0 ||
+        time > 0xFFFFFFFF ||
+        duration < 0 ||
+        duration > 0xFFFFFFFF ||
+        time != time.toInt() ||
+        duration != duration.toInt() ||
+        (id is num && (id < 1 || id > 0xFFFFFFFF || id != id.toInt()))) {
+      throw const FormatException('设备事件数值超出协议范围');
+    }
     return DeviceEvent(
+      id: id is num ? id.toInt() : null,
       time: time.toInt(),
       kind: kind,
       state: state,
@@ -115,6 +141,7 @@ class DeviceEvent {
   }
 
   Map<String, dynamic> toJson() => {
+        if (id != null) 'id': id,
         'time': time,
         'kind': kind,
         'state': state,
@@ -129,6 +156,12 @@ class DeviceEventPage {
     required this.nextOffset,
     required this.total,
     required this.hasMore,
+    this.eventsTruncated = false,
+    this.start = 0,
+    this.end = 0,
+    this.nextCursor,
+    this.deviceId,
+    this.dataEpoch,
   });
 
   final List<DeviceEvent> events;
@@ -136,8 +169,18 @@ class DeviceEventPage {
   final int nextOffset;
   final int total;
   final bool hasMore;
+  final bool eventsTruncated;
+  final int? nextCursor;
+  final int start;
+  final int end;
+  final String? deviceId;
+  final String? dataEpoch;
 
-  factory DeviceEventPage.fromJson(Map<String, dynamic> json) {
+  factory DeviceEventPage.fromJson(
+    Map<String, dynamic> json, {
+    required int requestedStart,
+    required int requestedEnd,
+  }) {
     final rawEvents = json['events'];
     if (rawEvents is! List) {
       throw const FormatException('设备事件响应缺少 events 列表');
@@ -146,11 +189,28 @@ class DeviceEventPage {
     final rawNextOffset = json['nextOffset'];
     final rawTotal = json['total'];
     final rawHasMore = json['hasMore'];
+    final rawNextCursor = json['nextCursor'];
+    final rawStart = json['start'] ?? requestedStart;
+    final rawEnd = json['end'] ?? requestedEnd;
     if (rawOffset is! num ||
         rawNextOffset is! num ||
         rawTotal is! num ||
-        rawHasMore is! bool) {
+        rawHasMore is! bool ||
+        rawStart is! num ||
+        rawEnd is! num ||
+        (rawNextCursor != null && rawNextCursor is! num)) {
       throw const FormatException('设备事件分页字段缺失或类型无效');
+    }
+    if (rawOffset < 0 ||
+        rawNextOffset < 0 ||
+        rawTotal < 0 ||
+        rawStart < 0 ||
+        rawEnd < rawStart ||
+        (rawNextCursor is num && rawNextCursor < 0)) {
+      throw const FormatException('设备事件分页数值无效');
+    }
+    if (rawEvents.any((event) => event is! Map)) {
+      throw const FormatException('设备事件列表包含无效记录');
     }
     return DeviceEventPage(
       events: rawEvents
@@ -162,6 +222,15 @@ class DeviceEventPage {
       nextOffset: rawNextOffset.toInt(),
       total: rawTotal.toInt(),
       hasMore: rawHasMore,
+      eventsTruncated: json['eventsTruncated'] == true,
+      start: rawStart.toInt(),
+      end: rawEnd.toInt(),
+      nextCursor: rawNextCursor is num && rawNextCursor > 0
+          ? rawNextCursor.toInt()
+          : null,
+      deviceId: json['deviceId'] is String ? json['deviceId'] as String : null,
+      dataEpoch:
+          json['dataEpoch'] is String ? json['dataEpoch'] as String : null,
     );
   }
 }

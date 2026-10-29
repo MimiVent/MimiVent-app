@@ -255,22 +255,6 @@ extension _DashboardStatusCards on _DashboardPageState {
         ),
       );
 
-  /// 纯展示卡片采用更明显的落影和轻微主题色外晕，与可点击的操作按钮区分。
-  List<BoxShadow> _displayCardShadows(Color accent) => [
-        BoxShadow(
-          color: Colors.black.withOpacity(.62),
-          blurRadius: 32,
-          spreadRadius: 1,
-          offset: const Offset(0, 14),
-        ),
-        BoxShadow(
-          color: accent.withOpacity(.24),
-          blurRadius: 28,
-          spreadRadius: 2,
-          offset: const Offset(0, 5),
-        ),
-      ];
-
   Widget _statusHero(DeviceStatus status) {
     final isOn = status.fan;
     return Container(
@@ -751,19 +735,6 @@ extension _DashboardStatusCards on _DashboardPageState {
       !mismatch &&
       !c.busy &&
       (allowCooldown || status.phase != 'startup_cooldown');
-
-  Widget _loadingPanel() => Container(
-        margin: const EdgeInsets.only(top: 12),
-        padding: const EdgeInsets.all(26),
-        decoration: BoxDecoration(
-            color: MimiVentColors.surface,
-            borderRadius: BorderRadius.circular(22)),
-        child: const Column(children: [
-          CircularProgressIndicator(color: MimiVentColors.mint),
-          SizedBox(height: 14),
-          Text('正在读取设备状态和时序配置', style: TextStyle(color: MimiVentColors.muted)),
-        ]),
-      );
 
   Widget _connectionErrorBanner() {
     final error = c.lastError?.toLowerCase() ?? '';

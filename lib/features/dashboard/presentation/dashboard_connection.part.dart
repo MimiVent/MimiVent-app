@@ -3,9 +3,54 @@
 part of 'dashboard_page.dart';
 
 extension _DashboardConnectionSection on _DashboardPageState {
+  Future<void> _enterOfflineViewing() async {
+    _scanSheetDismissedDuringScan = true;
+    try {
+      if (c.connected) {
+        final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            title: const Text('切换到离线查看？'),
+            content: const Text('切换后会断开当前蓝牙连接，只显示本机已缓存的统计数据。'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, false),
+                child: const Text('继续连接'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(dialogContext, true),
+                child: const Text('断开并离线查看'),
+              ),
+            ],
+          ),
+        );
+        if (confirmed != true || !mounted) return;
+      }
+      await c.enterOfflineViewing();
+      if (!mounted) return;
+      setState(() {
+        _headerCollapse = 0;
+      });
+    } catch (error) {
+      _toast('暂时无法打开离线统计：$error');
+    }
+  }
+
+  Future<void> _leaveOfflineAndConnect() async {
+    if (c.offlineViewing) await c.leaveOfflineViewing();
+    if (!mounted) return;
+    await _scanAndConnect();
+  }
+
   Future<void> _openDiagnostics() => Navigator.of(context).push<void>(
         MaterialPageRoute(
           builder: (_) => DiagnosticsPage(log: widget.diagnostics),
+        ),
+      );
+
+  Future<void> _openFirmwareUpdate() => Navigator.of(context).push<void>(
+        MaterialPageRoute(
+          builder: (_) => FirmwareUpdatePage(ble: c.ble),
         ),
       );
 
@@ -71,6 +116,7 @@ extension _DashboardConnectionSection on _DashboardPageState {
   }
 
   void _syncDeviceUi() {
+    if (c.offlineViewing) return;
     // App 启动时会自动开始扫描；检测到扫描状态后，首页自动打开搜索面板。
     if (!c.ble.isScanning) {
       // 一轮扫描结束后，后续新扫描可以再次自动打开搜索面板。
@@ -368,6 +414,22 @@ extension _DashboardConnectionSection on _DashboardPageState {
                                       : '重新扫描'),
                                 ),
                               ),
+                              SizedBox(
+                                width: double.infinity,
+                                child: TextButton(
+                                  key: const ValueKey(
+                                      'connection-sheet-offline'),
+                                  onPressed: _deviceConnectActionBusy ||
+                                          c.ble.connectionStatus ==
+                                              BleConnectionStatus.connecting
+                                      ? null
+                                      : () {
+                                          Navigator.pop(context);
+                                          unawaited(_enterOfflineViewing());
+                                        },
+                                  child: const Text('离线模式 · 查看缓存数据'),
+                                ),
+                              ),
                             ],
                           ),
                         ),
@@ -492,6 +554,9 @@ extension _DashboardConnectionSection on _DashboardPageState {
         });
       }
       await c.connect(result.device);
+      if (!c.connected) {
+        throw StateError(c.lastError ?? '设备连接已中断，请重新连接');
+      }
       if (!modalContext.mounted) return;
       final route = ModalRoute.of(modalContext);
       Navigator.pop(modalContext);
@@ -503,7 +568,7 @@ extension _DashboardConnectionSection on _DashboardPageState {
           _deviceConnectActionBusy = false;
         });
       }
-      _toast('${AppIdentity.productName} 已连接');
+      _toast(c.lastError ?? '${AppIdentity.productName} 已连接');
     } catch (error) {
       if (mounted) {
         setState(() {
