@@ -15,6 +15,9 @@ class BleProtocol {
   static const otaControlUuid = '6f9b0004-7d5a-4c3b-9a21-2f6d4d494d49';
   static const otaDataUuid = '6f9b0005-7d5a-4c3b-9a21-2f6d4d494d49';
   static const otaStatusUuid = '6f9b0006-7d5a-4c3b-9a21-2f6d4d494d49';
+  static const wifiServiceUuid = '6f9b0010-7d5a-4c3b-9a21-2f6d4d494d49';
+  static const wifiCommandUuid = '6f9b0011-7d5a-4c3b-9a21-2f6d4d494d49';
+  static const wifiResponseUuid = '6f9b0012-7d5a-4c3b-9a21-2f6d4d494d49';
   static const frameVersion = 2;
   static const maximumResponseBytes = 4096;
   static const maximumFragments = 1024;

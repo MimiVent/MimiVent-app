@@ -14,13 +14,13 @@ class AppLayout {
 
   /// 竖屏继续使用原有紧凑弹窗；横屏或短窗口给扫描结果留出空间。
   static double connectionSheetHeightFactor(BuildContext context) =>
-      isShortScreen(context) ? .88 : .55;
+      isShortScreen(context) ? .88 : .60;
 
   static double connectionAnimationSize(BuildContext context) {
     // 连接面板底部保留重新扫描和离线入口，矮窗口优先缩小装饰动画。
     final sheetHeight =
         sizeOf(context).height * connectionSheetHeightFactor(context);
     final reservedHeight = usesLargeText(context) ? 340 : 300;
-    return (sheetHeight - reservedHeight).clamp(32.0, 112.0).toDouble();
+    return (sheetHeight - reservedHeight).clamp(32.0, 96.0).toDouble();
   }
 }

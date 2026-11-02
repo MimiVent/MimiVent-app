@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 enum MimiVentDiagnosticLevel { info, warning, error }
@@ -46,6 +48,8 @@ class AppDiagnosticsLog extends ChangeNotifier {
   static const _storageKey = 'mimivent.diagnostics.entries.v1';
   static const maxEntries = 300;
   static const maxMessageLength = 2000;
+  static const maxFileBytes = 1024 * 1024;
+  static const maxLogFiles = 10;
   static const statusCaptureDuration = Duration(minutes: 5);
   static const _minimumPersistInterval = Duration(seconds: 5);
 
@@ -53,6 +57,11 @@ class AppDiagnosticsLog extends ChangeNotifier {
   SharedPreferences? _preferences;
   Future<void>? _initializeFuture;
   Future<void> _writeQueue = Future<void>.value();
+  Future<void> _fileWriteQueue = Future<void>.value();
+  Future<void>? _prepareFilesFuture;
+  Directory? _fileLogDirectory;
+  File? _activeLogFile;
+  String? _activeLogDay;
   Timer? _persistDebounce;
   Timer? _statusCaptureTimer;
   DateTime? _statusCaptureUntil;
@@ -84,6 +93,9 @@ class AppDiagnosticsLog extends ChangeNotifier {
 
   Future<void> initialize() => _initializeFuture ??= _loadFromStorage();
 
+  /// Android 日志保存在应用专属外部目录，可通过 ADB 直接读取，无需打开日志页。
+  String? get fileLogDirectoryPath => _fileLogDirectory?.path;
+
   Future<void> _loadFromStorage() async {
     try {
       _preferences = await SharedPreferences.getInstance();
@@ -109,6 +121,7 @@ class AppDiagnosticsLog extends ChangeNotifier {
       // 日志读取失败不能阻断 App 启动；下一条新记录仍会尝试重新取得存储实例。
       _entries.clear();
     }
+    await (_prepareFilesFuture ??= _prepareLogFiles());
     notifyListeners();
   }
 
@@ -118,8 +131,12 @@ class AppDiagnosticsLog extends ChangeNotifier {
   void warning(String category, String message) =>
       record(MimiVentDiagnosticLevel.warning, category, message);
 
-  void error(String category, String message) =>
-      record(MimiVentDiagnosticLevel.error, category, message);
+  void error(String category, String message, {StackTrace? stackTrace}) =>
+      record(
+        MimiVentDiagnosticLevel.error,
+        category,
+        stackTrace == null ? message : '$message\n$stackTrace',
+      );
 
   void record(MimiVentDiagnosticLevel level, String category, String message) {
     final entry = DiagnosticLogEntry(
@@ -134,12 +151,15 @@ class AppDiagnosticsLog extends ChangeNotifier {
     }
     notifyListeners();
     _persistSnapshot();
+    unawaited(_appendFileEntry(entry));
   }
 
   Future<void> clear() async {
     _entries.clear();
     notifyListeners();
     await _persistImmediately();
+    await _fileWriteQueue;
+    await _clearFileLogs();
   }
 
   String exportText() => _entries
@@ -190,6 +210,134 @@ class AppDiagnosticsLog extends ChangeNotifier {
     return _writeQueue;
   }
 
+  Future<void> _appendFileEntry(DiagnosticLogEntry entry) {
+    _fileWriteQueue = _fileWriteQueue.then((_) async {
+      try {
+        await (_prepareFilesFuture ??= _prepareLogFiles());
+        final directory = _fileLogDirectory;
+        if (directory == null) return;
+
+        final now = DateTime.now();
+        final day = '${now.year.toString().padLeft(4, '0')}'
+            '${now.month.toString().padLeft(2, '0')}'
+            '${now.day.toString().padLeft(2, '0')}';
+        final line = jsonEncode({
+              'occurredAt': _timestampWithOffset(entry.timestamp),
+              'writtenAt': _timestampWithOffset(now),
+              'level': entry.level.name,
+              'category': entry.category,
+              'message': entry.message,
+            }) +
+            '\n';
+        final byteLength = utf8.encode(line).length;
+        var active = _activeLogFile;
+        final currentLength =
+            active != null && await active.exists() ? await active.length() : 0;
+        if (active == null ||
+            day != _activeLogDay ||
+            currentLength + byteLength > maxFileBytes) {
+          active = await _createLogFile(directory, now);
+          _activeLogFile = active;
+          _activeLogDay = day;
+        }
+        await active.writeAsString(
+          line,
+          mode: FileMode.append,
+          encoding: utf8,
+          flush: entry.level == MimiVentDiagnosticLevel.error,
+        );
+        await _pruneLogFiles(directory);
+      } catch (error) {
+        // 磁盘写入失败不能影响控制流程；错误保留在 Android logcat 供诊断。
+        debugPrint('[MimiVent file log] 写入失败: $error');
+      }
+    });
+    return _fileWriteQueue;
+  }
+
+  Future<void> _prepareLogFiles() async {
+    try {
+      final base = await getExternalStorageDirectory() ??
+          await getApplicationSupportDirectory();
+      final directory = Directory('${base.path}/MimiVent/logs');
+      await directory.create(recursive: true);
+      _fileLogDirectory = directory;
+      final files = await _listLogFiles(directory);
+      if (files.isNotEmpty) {
+        final newest = files.last;
+        final stat = await newest.stat();
+        final now = DateTime.now();
+        final day = '${now.year.toString().padLeft(4, '0')}'
+            '${now.month.toString().padLeft(2, '0')}'
+            '${now.day.toString().padLeft(2, '0')}';
+        final modified = stat.modified;
+        final modifiedDay = '${modified.year.toString().padLeft(4, '0')}'
+            '${modified.month.toString().padLeft(2, '0')}'
+            '${modified.day.toString().padLeft(2, '0')}';
+        if (stat.size < maxFileBytes && modifiedDay == day) {
+          _activeLogFile = newest;
+          _activeLogDay = day;
+        }
+      }
+      await _pruneLogFiles(directory);
+    } catch (error) {
+      debugPrint('[MimiVent file log] 初始化失败: $error');
+    }
+  }
+
+  Future<File> _createLogFile(Directory directory, DateTime now) async {
+    final stamp = '${now.year.toString().padLeft(4, '0')}'
+        '${now.month.toString().padLeft(2, '0')}'
+        '${now.day.toString().padLeft(2, '0')}-'
+        '${now.hour.toString().padLeft(2, '0')}'
+        '${now.minute.toString().padLeft(2, '0')}'
+        '${now.second.toString().padLeft(2, '0')}-'
+        '${now.microsecondsSinceEpoch}';
+    final file = File('${directory.path}/mimivent-$stamp.jsonl');
+    await file.create(exclusive: true);
+    return file;
+  }
+
+  Future<List<File>> _listLogFiles(Directory directory) async {
+    final files = <File>[];
+    await for (final entity in directory.list(followLinks: false)) {
+      if (entity is File &&
+          entity.uri.pathSegments.last.startsWith('mimivent-') &&
+          entity.path.endsWith('.jsonl')) {
+        files.add(entity);
+      }
+    }
+    files.sort((a, b) => a.path.compareTo(b.path));
+    return files;
+  }
+
+  Future<void> _pruneLogFiles(Directory directory) async {
+    final files = await _listLogFiles(directory);
+    final excess = files.length - maxLogFiles;
+    for (var index = 0; index < excess; index++) {
+      await files[index].delete();
+      if (identical(files[index], _activeLogFile)) {
+        _activeLogFile = null;
+        _activeLogDay = null;
+      }
+    }
+  }
+
+  Future<void> _clearFileLogs() async {
+    try {
+      await (_prepareFilesFuture ??= _prepareLogFiles());
+      final directory = _fileLogDirectory;
+      if (directory == null) return;
+      for (final file in await _listLogFiles(directory)) {
+        await file.delete();
+      }
+      _activeLogFile = null;
+      _activeLogDay = null;
+    } catch (_) {
+      // 清理失败不影响 App 主流程。
+    }
+  }
+
   @override
   void dispose() {
     _persistDebounce?.cancel();
@@ -212,5 +360,14 @@ class AppDiagnosticsLog extends ChangeNotifier {
     final milliseconds = value.millisecond.toString().padLeft(3, '0');
     return '${value.year}-${two(value.month)}-${two(value.day)} '
         '${two(value.hour)}:${two(value.minute)}:${two(value.second)}.$milliseconds';
+  }
+
+  static String _timestampWithOffset(DateTime value) {
+    final local = value.toLocal();
+    final offset = local.timeZoneOffset;
+    final sign = offset.isNegative ? '-' : '+';
+    final hours = offset.inHours.abs().toString().padLeft(2, '0');
+    final minutes = (offset.inMinutes.abs() % 60).toString().padLeft(2, '0');
+    return '${local.toIso8601String()}$sign$hours:$minutes';
   }
 }

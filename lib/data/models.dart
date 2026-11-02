@@ -315,6 +315,8 @@ class DeviceStatus {
     required this.pauseMs,
     required this.firmware,
     this.minimumAppVersion,
+    this.capabilities = const {},
+    this.gattVersion,
   });
 
   final bool fan;
@@ -334,6 +336,51 @@ class DeviceStatus {
   final int pauseMs;
   final String firmware;
   final String? minimumAppVersion;
+  final Set<String> capabilities;
+  final int? gattVersion;
+
+  DeviceStatus copyWith({
+    bool? fan,
+    bool? pir,
+    String? mode,
+    String? phase,
+    TimingProfile? activeProfile,
+    TimingProfile? viewProfile,
+    int? fanRunMs,
+    int? remainingMs,
+    int? durationMs,
+    int? phaseDurationMs,
+    int? startupCooldownMs,
+    int? leaveConfirmMs,
+    int? autoExhaustMs,
+    int? manualExhaustMs,
+    int? pauseMs,
+    String? firmware,
+    String? minimumAppVersion,
+    Set<String>? capabilities,
+    int? gattVersion,
+  }) =>
+      DeviceStatus(
+        fan: fan ?? this.fan,
+        pir: pir ?? this.pir,
+        mode: mode ?? this.mode,
+        phase: phase ?? this.phase,
+        activeProfile: activeProfile ?? this.activeProfile,
+        viewProfile: viewProfile ?? this.viewProfile,
+        fanRunMs: fanRunMs ?? this.fanRunMs,
+        remainingMs: remainingMs ?? this.remainingMs,
+        durationMs: durationMs ?? this.durationMs,
+        phaseDurationMs: phaseDurationMs ?? this.phaseDurationMs,
+        startupCooldownMs: startupCooldownMs ?? this.startupCooldownMs,
+        leaveConfirmMs: leaveConfirmMs ?? this.leaveConfirmMs,
+        autoExhaustMs: autoExhaustMs ?? this.autoExhaustMs,
+        manualExhaustMs: manualExhaustMs ?? this.manualExhaustMs,
+        pauseMs: pauseMs ?? this.pauseMs,
+        firmware: firmware ?? this.firmware,
+        minimumAppVersion: minimumAppVersion ?? this.minimumAppVersion,
+        capabilities: capabilities ?? this.capabilities,
+        gattVersion: gattVersion ?? this.gattVersion,
+      );
 
   factory DeviceStatus.fromJson(Map<String, dynamic> json) {
     final mode = _requiredString(json, 'mode');
@@ -362,6 +409,17 @@ class DeviceStatus {
     if (minimumAppVersion != null && minimumAppVersion is! String) {
       throw const FormatException('设备状态字段 minimumAppVersion 类型无效');
     }
+    final rawCapabilities = json['capabilities'];
+    if (rawCapabilities != null &&
+        (rawCapabilities is! List ||
+            rawCapabilities.any((item) => item is! String))) {
+      throw const FormatException('设备状态字段 capabilities 类型无效');
+    }
+    final gattVersion = json['gattVersion'];
+    if (gattVersion != null &&
+        (gattVersion is! int || gattVersion < 0 || gattVersion > 255)) {
+      throw const FormatException('设备状态字段 gattVersion 超出范围');
+    }
 
     return DeviceStatus(
       fan: _requiredBool(json, 'fan'),
@@ -386,6 +444,10 @@ class DeviceStatus {
       // 兼容不返回固件版本号的旧固件；其他控制字段不做默认值回退。
       firmware: firmware as String? ?? '—',
       minimumAppVersion: minimumAppVersion as String?,
+      capabilities: rawCapabilities == null
+          ? const {}
+          : Set<String>.unmodifiable(rawCapabilities.cast<String>()),
+      gattVersion: gattVersion as int?,
     );
   }
 }

@@ -3,12 +3,15 @@ import 'package:flutter/services.dart';
 
 import '../../app/theme/mimivent_theme.dart';
 import '../../core/diagnostics/app_diagnostics_log.dart';
+import '../../data/mimivent_controller.dart';
+import '../wifi_control/wifi_control_page.dart';
 
 /// 显示可在断开蓝牙时读取的本地 BLE 与设备接口事务记录。
 class DiagnosticsPage extends StatelessWidget {
-  const DiagnosticsPage({required this.log, super.key});
+  const DiagnosticsPage({required this.log, this.controller, super.key});
 
   final AppDiagnosticsLog log;
+  final MimiVentController? controller;
 
   @override
   Widget build(BuildContext context) => Scaffold(
@@ -31,6 +34,15 @@ class DiagnosticsPage extends StatelessWidget {
                 ),
               ),
             ),
+            if (controller != null)
+              IconButton(
+                tooltip: 'WiFi 绑定与状态',
+                onPressed: () => Navigator.of(context).push<void>(
+                  MaterialPageRoute(
+                      builder: (_) => WifiControlPage(ble: controller!.ble)),
+                ),
+                icon: const Icon(Icons.wifi_rounded),
+              ),
             IconButton(
               tooltip: '复制全部日志',
               onPressed: () => _copyLogs(context),

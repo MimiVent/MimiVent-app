@@ -47,8 +47,13 @@ class _StatisticsPageState extends State<StatisticsPage> {
   _StatisticsRange _range = _StatisticsRange.today;
   int? _selectedChartIndex;
   Timer? _refreshTimer;
+  Timer? _retryTimer;
   bool _loadingMoreEvents = false;
   bool _refreshEnabled = false;
+  Map<String, dynamic>? _yesterdayData;
+  String? _yesterdayDataDay;
+  String? _comparisonDeviceId;
+  bool _yesterdayRequested = false;
 
   @override
   void initState() {
@@ -81,10 +86,41 @@ class _StatisticsPageState extends State<StatisticsPage> {
     });
   }
 
-  Future<void> _loadStatistics() =>
-      widget.controller.refreshStatistics(_range.wireValue);
+  Future<void> _loadStatistics() async {
+    await widget.controller.refreshStatistics(_range.wireValue);
+    if (_range == _StatisticsRange.today) await _ensureYesterdayData();
+    if (!mounted || !_canSynchronize || _retryTimer != null) return;
+    if (widget.controller.statisticsFailedFor(_range.wireValue) &&
+        !widget.controller.statisticsLoadingFor(_range.wireValue)) {
+      _retryTimer = Timer(const Duration(seconds: 3), () {
+        _retryTimer = null;
+        if (mounted && _canSynchronize) unawaited(_loadStatistics());
+      });
+    }
+  }
+
+  Future<void> _ensureYesterdayData() async {
+    final now = DateTime.now();
+    final dayKey = '${now.year}-${now.month}-${now.day}';
+    final current = widget.controller.statisticsFor(_range.wireValue);
+    final deviceId =
+        (current?['deviceId'] ?? current?['eventsDeviceId'])?.toString() ?? '';
+    if (_yesterdayDataDay != dayKey || _comparisonDeviceId != deviceId) {
+      _yesterdayDataDay = dayKey;
+      _comparisonDeviceId = deviceId;
+      _yesterdayData = null;
+      _yesterdayRequested = false;
+    }
+    if (_yesterdayRequested || !_canSynchronize) return;
+    _yesterdayRequested = true;
+    await widget.controller.refreshStatistics('yesterday');
+    if (!mounted) return;
+    final data = widget.controller.statisticsFor('yesterday');
+    if (data != null) setState(() => _yesterdayData = data);
+  }
 
   bool _onScrollNotification(ScrollNotification notification) {
+    if (notification.metrics.axis != Axis.vertical) return false;
     final supportsEventPages = _range == _StatisticsRange.today ||
         _range == _StatisticsRange.yesterday;
     if (widget.controller.connected &&
@@ -117,6 +153,7 @@ class _StatisticsPageState extends State<StatisticsPage> {
   @override
   void dispose() {
     _refreshTimer?.cancel();
+    _retryTimer?.cancel();
     widget.controller.removeListener(_onControllerChanged);
     super.dispose();
   }
@@ -128,7 +165,31 @@ class _StatisticsPageState extends State<StatisticsPage> {
         ? _StatisticsPreview.emptyForRange(_range)
         : _StatisticsPreview.fromDevice(_range, data,
             currentMode: widget.controller.status?.mode,
-            snapshotOnly: _readOnly);
+            snapshotOnly: _readOnly,
+            activityGapSeconds:
+                (((widget.controller.settings?.autoExhaustMs ?? 120000) ~/ 1000)
+                    .clamp(60, 600)));
+    final comparison = _range == _StatisticsRange.today &&
+            data != null &&
+            _yesterdayData != null
+        ? _YesterdayComparison.from(
+            _StatisticsPreview.fromDevice(_StatisticsRange.today, data,
+                currentMode: widget.controller.status?.mode,
+                snapshotOnly: _readOnly,
+                activityGapSeconds:
+                    ((widget.controller.settings?.autoExhaustMs ?? 120000) ~/
+                            1000)
+                        .clamp(60, 600)),
+            _StatisticsPreview.fromDevice(
+                _StatisticsRange.yesterday, _yesterdayData!,
+                currentMode: widget.controller.status?.mode,
+                snapshotOnly: _readOnly,
+                activityGapSeconds:
+                    ((widget.controller.settings?.autoExhaustMs ?? 120000) ~/
+                            1000)
+                        .clamp(60, 600)),
+          )
+        : null;
     return NotificationListener<ScrollNotification>(
         onNotification: _onScrollNotification,
         child: LayoutBuilder(
@@ -137,7 +198,7 @@ class _StatisticsPageState extends State<StatisticsPage> {
             return ListView(
               key: const PageStorageKey('statistics-page'),
               primary: false,
-              padding: const EdgeInsets.fromLTRB(18, 14, 18, 28),
+              padding: const EdgeInsets.fromLTRB(18, 8, 18, 20),
               children: [
                 Center(
                   child: ConstrainedBox(
@@ -153,23 +214,20 @@ class _StatisticsPageState extends State<StatisticsPage> {
                                 widget.controller.status!.minimumAppVersion,
                           ),
                         _pageHeading(),
-                        const SizedBox(height: 8),
+                        const SizedBox(height: 4),
                         _syncStatus(data),
-                        const SizedBox(height: 8),
+                        const SizedBox(height: 4),
                         _rangePicker(),
-                        const SizedBox(height: 14),
+                        const SizedBox(height: 8),
                         if (_readOnly && data == null)
                           _offlineEmptyState()
                         else ...[
-                          _summaryCard(view),
-                          const SizedBox(height: 12),
-                          _metricRow(view),
-                          const SizedBox(height: 16),
+                          _summaryCard(view, comparison),
+                          const SizedBox(height: 8),
+                          _metricRow(view, comparison),
+                          const SizedBox(height: 10),
                           _runtimeChart(view),
-                          const SizedBox(height: 16),
-                          if (data?['eventsTruncated'] == true)
-                            const _EventPaginationHint(
-                                label: '部分历史明细已淘汰，图表与累计时长仍保留完整汇总'),
+                          const SizedBox(height: 10),
                           if (_range == _StatisticsRange.today ||
                               _range == _StatisticsRange.yesterday)
                             _eventList(
@@ -283,7 +341,7 @@ class _StatisticsPageState extends State<StatisticsPage> {
                     : '设备数据已同步 · 每分钟更新';
     final color = failed ? MimiVentColors.amber : MimiVentColors.mint;
     return SizedBox(
-      height: 28,
+      height: 24,
       child: Row(
         children: [
           SizedBox(
@@ -348,7 +406,7 @@ class _StatisticsPageState extends State<StatisticsPage> {
                   },
                   child: AnimatedContainer(
                     duration: const Duration(milliseconds: 180),
-                    height: 37,
+                    height: 34,
                     alignment: Alignment.center,
                     decoration: BoxDecoration(
                       color: selected
@@ -380,8 +438,10 @@ class _StatisticsPageState extends State<StatisticsPage> {
         ),
       );
 
-  Widget _summaryCard(_StatisticsPreview view) => Container(
-        padding: const EdgeInsets.fromLTRB(16, 15, 16, 16),
+  Widget _summaryCard(
+          _StatisticsPreview view, _YesterdayComparison? comparison) =>
+      Container(
+        padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
         decoration: _cardDecoration(accent: MimiVentColors.mint),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -395,10 +455,18 @@ class _StatisticsPageState extends State<StatisticsPage> {
                           fontSize: 11,
                           fontWeight: FontWeight.w600)),
                 ),
+                if (comparison != null && comparison.runtimeText != null) ...[
+                  Text(comparison.runtimeText!,
+                      style: TextStyle(
+                          color: comparison.color,
+                          fontSize: 9.5,
+                          fontWeight: FontWeight.w600)),
+                  const SizedBox(width: 7),
+                ],
                 _dateRangePill(view.rangeText),
               ],
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: 6),
             Row(
               crossAxisAlignment: CrossAxisAlignment.end,
               children: [
@@ -425,8 +493,8 @@ class _StatisticsPageState extends State<StatisticsPage> {
                 ],
                 const Spacer(),
                 Container(
-                  width: 42,
-                  height: 42,
+                  width: 40,
+                  height: 40,
                   decoration: BoxDecoration(
                     color: MimiVentColors.mint.withOpacity(.10),
                     shape: BoxShape.circle,
@@ -436,7 +504,7 @@ class _StatisticsPageState extends State<StatisticsPage> {
                 ),
               ],
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: 6),
             Text(view.runtimeCaption,
                 style: const TextStyle(
                     color: MimiVentColors.muted, fontSize: 10, height: 1.3)),
@@ -444,29 +512,59 @@ class _StatisticsPageState extends State<StatisticsPage> {
         ),
       );
 
-  Widget _metricRow(_StatisticsPreview view) => Row(
-        children: [
-          Expanded(
-            child: _metricCard(
-              icon: Icons.motion_photos_on_rounded,
-              title: '感应活动段',
-              value: '${view.activityCount}',
-              unit: '次',
-              accent: MimiVentColors.mint,
-            ),
-          ),
+  Widget _metricRow(
+          _StatisticsPreview view, _YesterdayComparison? comparison) =>
+      SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(children: [
+          _metricSlot(_metricCard(
+            icon: Icons.air_rounded,
+            title: '自动排风',
+            value: '${view.autoExhaustCount}',
+            unit: '次',
+            accent: MimiVentColors.amber,
+            comparisonText: comparison?.autoExhaustText,
+            comparisonColor: comparison?.autoExhaustColor,
+          )),
           const SizedBox(width: 10),
-          Expanded(
-            child: _metricCard(
-              icon: Icons.air_rounded,
-              title: '自动排风',
-              value: '${view.autoExhaustCount}',
-              unit: '次',
-              accent: MimiVentColors.amber,
-            ),
-          ),
-        ],
+          _metricSlot(_metricCard(
+            icon: Icons.wc_rounded,
+            title: '预计入厕',
+            value: view.toiletEstimateAvailable
+                ? '${view.toiletEstimateCount}'
+                : '—',
+            unit: view.toiletEstimateAvailable ? '次' : '',
+            accent: const Color(0xFF8DB8FF),
+            comparisonText: comparison?.toiletText,
+            comparisonColor: comparison?.toiletColor,
+          )),
+          const SizedBox(width: 10),
+          _metricSlot(_metricCard(
+            icon: Icons.timer_outlined,
+            title: '平均入厕时间',
+            value: view.toiletAverageMain,
+            unit: view.toiletAverageUnit,
+            accent: const Color(0xFFB69CFF),
+            comparisonText: comparison == null
+                ? null
+                : (comparison.toiletAverageText ?? '较昨日 —'),
+            comparisonColor:
+                comparison?.toiletAverageColor ?? MimiVentColors.muted,
+          )),
+          const SizedBox(width: 10),
+          _metricSlot(_metricCard(
+            icon: Icons.motion_photos_on_rounded,
+            title: '感应活动段',
+            value: '${view.activityCount}',
+            unit: '次',
+            accent: MimiVentColors.mint,
+            comparisonText: comparison?.activityText,
+            comparisonColor: comparison?.activityColor,
+          )),
+        ]),
       );
+
+  Widget _metricSlot(Widget child) => SizedBox(width: 122, child: child);
 
   Widget _metricCard({
     required IconData icon,
@@ -474,20 +572,22 @@ class _StatisticsPageState extends State<StatisticsPage> {
     required String value,
     required String unit,
     required Color accent,
+    String? comparisonText,
+    Color? comparisonColor,
   }) =>
       Container(
-        padding: const EdgeInsets.all(13),
+        padding: const EdgeInsets.all(9),
         decoration: _cardDecoration(),
         child: Row(
           children: [
             Container(
-              width: 32,
-              height: 32,
+              width: 26,
+              height: 26,
               decoration: BoxDecoration(
                   color: accent.withOpacity(.11), shape: BoxShape.circle),
-              child: Icon(icon, color: accent, size: 15),
+              child: Icon(icon, color: accent, size: 13),
             ),
-            const SizedBox(width: 9),
+            const SizedBox(width: 7),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -496,8 +596,8 @@ class _StatisticsPageState extends State<StatisticsPage> {
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
-                          color: MimiVentColors.muted, fontSize: 10)),
-                  const SizedBox(height: 5),
+                          color: MimiVentColors.muted, fontSize: 9.5)),
+                  const SizedBox(height: 4),
                   Row(
                     crossAxisAlignment: CrossAxisAlignment.baseline,
                     textBaseline: TextBaseline.alphabetic,
@@ -514,6 +614,16 @@ class _StatisticsPageState extends State<StatisticsPage> {
                               color: MimiVentColors.muted, fontSize: 9)),
                     ],
                   ),
+                  if (comparisonText != null) ...[
+                    const SizedBox(height: 3),
+                    Text(comparisonText,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                            color: comparisonColor ?? MimiVentColors.muted,
+                            fontSize: 8.5,
+                            fontWeight: FontWeight.w600)),
+                  ],
                 ],
               ),
             ),
@@ -809,14 +919,103 @@ class _StatisticsPageState extends State<StatisticsPage> {
 }
 
 /// 统计页面的显示模型，空状态只生成固定布局所需的零值占位，不展示虚构记录。
+class _YesterdayComparison {
+  const _YesterdayComparison({
+    required this.runtimeDeltaSeconds,
+    required this.activityDelta,
+    required this.autoExhaustDelta,
+    required this.toiletDelta,
+    required this.toiletAvailable,
+    required this.toiletAverageDeltaSeconds,
+    required this.toiletAverageAvailable,
+  });
+
+  final int runtimeDeltaSeconds;
+  final int activityDelta;
+  final int autoExhaustDelta;
+  final int toiletDelta;
+  final bool toiletAvailable;
+  final int toiletAverageDeltaSeconds;
+  final bool toiletAverageAvailable;
+
+  factory _YesterdayComparison.from(
+      _StatisticsPreview today, _StatisticsPreview yesterday) {
+    final todayRuntime = today.runtimeSeconds;
+    final yesterdayRuntime = yesterday.runtimeSeconds;
+    return _YesterdayComparison(
+      runtimeDeltaSeconds: todayRuntime - yesterdayRuntime,
+      activityDelta: today.activityCount - yesterday.activityCount,
+      autoExhaustDelta: today.autoExhaustCount - yesterday.autoExhaustCount,
+      toiletDelta: today.toiletEstimateCount - yesterday.toiletEstimateCount,
+      toiletAvailable:
+          today.toiletEstimateAvailable && yesterday.toiletEstimateAvailable,
+      toiletAverageDeltaSeconds: (today.toiletAverageSeconds ?? 0) -
+          (yesterday.toiletAverageSeconds ?? 0),
+      toiletAverageAvailable:
+          today.toiletAverageAvailable && yesterday.toiletAverageAvailable,
+    );
+  }
+
+  Color get color => runtimeDeltaSeconds > 0
+      ? MimiVentColors.mint
+      : runtimeDeltaSeconds < 0
+          ? MimiVentColors.red
+          : MimiVentColors.muted;
+
+  String? get runtimeText {
+    final seconds = runtimeDeltaSeconds.abs();
+    if (seconds == 0) return '与昨日持平';
+    final minutes = seconds / 60;
+    final text = minutes < 10
+        ? minutes.toStringAsFixed(minutes == minutes.roundToDouble() ? 0 : 1)
+        : '${minutes.round()}';
+    return '较昨日 ${runtimeDeltaSeconds > 0 ? '+' : '-'}$text 分钟 ${runtimeDeltaSeconds > 0 ? '↑' : '↓'}';
+  }
+
+  Color _countColor(int delta) => delta > 0
+      ? MimiVentColors.mint
+      : delta < 0
+          ? MimiVentColors.red
+          : MimiVentColors.muted;
+
+  String? _countText(int delta) => delta == 0
+      ? '与昨日持平'
+      : '较昨日 ${delta > 0 ? '+' : '-'}${delta.abs()} ${delta > 0 ? '↑' : '↓'}';
+
+  String? get activityText => _countText(activityDelta);
+  Color get activityColor => _countColor(activityDelta);
+  String? get autoExhaustText => _countText(autoExhaustDelta);
+  Color get autoExhaustColor => _countColor(autoExhaustDelta);
+  String? get toiletText => toiletAvailable ? _countText(toiletDelta) : null;
+  Color get toiletColor => _countColor(toiletDelta);
+
+  String? get toiletAverageText {
+    if (!toiletAverageAvailable) return null;
+    final delta = toiletAverageDeltaSeconds;
+    if (delta == 0) return '与昨日持平';
+    final seconds = delta.abs();
+    final value = seconds >= 60
+        ? '${(seconds / 60).toStringAsFixed(seconds % 60 == 0 ? 0 : 1)} 分钟'
+        : '$seconds 秒';
+    return '较昨日 ${delta > 0 ? '+' : '-'}$value ${delta > 0 ? '↑' : '↓'}';
+  }
+
+  Color get toiletAverageColor => _countColor(toiletAverageDeltaSeconds);
+}
+
 class _StatisticsPreview {
   const _StatisticsPreview({
     required this.rangeText,
+    required this.runtimeSeconds,
     required this.runtimeMain,
     required this.runtimeUnit,
     required this.runtimeCaption,
     required this.activityCount,
     required this.autoExhaustCount,
+    required this.toiletEstimateCount,
+    required this.toiletEstimateAvailable,
+    required this.toiletAverageSeconds,
+    required this.toiletAverageAvailable,
     required this.chart,
     required this.maxChartValue,
     required this.chartTitle,
@@ -829,11 +1028,16 @@ class _StatisticsPreview {
   });
 
   final String rangeText;
+  final int runtimeSeconds;
   final String runtimeMain;
   final String runtimeUnit;
   final String runtimeCaption;
   final int activityCount;
   final int autoExhaustCount;
+  final int toiletEstimateCount;
+  final bool toiletEstimateAvailable;
+  final int? toiletAverageSeconds;
+  final bool toiletAverageAvailable;
   final List<_ChartPoint> chart;
   final double maxChartValue;
   final String chartTitle;
@@ -843,6 +1047,22 @@ class _StatisticsPreview {
   final int eventTotal;
   final bool eventsHasMore;
   final List<_DailySummary> days;
+
+  String get toiletAverageMain {
+    final seconds = toiletAverageSeconds;
+    if (!toiletAverageAvailable || seconds == null || seconds <= 0) return '—';
+    if (seconds >= 60) {
+      final minutes = seconds / 60;
+      return minutes.toStringAsFixed(minutes >= 10 ? 0 : 1);
+    }
+    return '$seconds';
+  }
+
+  String get toiletAverageUnit {
+    final seconds = toiletAverageSeconds;
+    if (!toiletAverageAvailable || seconds == null || seconds <= 0) return '';
+    return seconds >= 60 ? '分钟' : '秒';
+  }
 
   factory _StatisticsPreview.emptyForRange(_StatisticsRange range) {
     final now = DateTime.now();
@@ -900,11 +1120,16 @@ class _StatisticsPreview {
           : range == _StatisticsRange.yesterday
               ? _date(start)
               : '${_date(start)} — ${_date(today)}',
+      runtimeSeconds: 0,
       runtimeMain: '0',
       runtimeUnit: '分钟',
       runtimeCaption: '等待设备统计数据',
       activityCount: 0,
       autoExhaustCount: 0,
+      toiletEstimateCount: 0,
+      toiletEstimateAvailable: true,
+      toiletAverageSeconds: null,
+      toiletAverageAvailable: false,
       chart: chart,
       maxChartValue: 0,
       chartTitle: range == _StatisticsRange.sevenDays ? '每日排风时长' : '分时排风时长',
@@ -924,7 +1149,9 @@ class _StatisticsPreview {
 
   factory _StatisticsPreview.fromDevice(
       _StatisticsRange range, Map<String, dynamic> json,
-      {String? currentMode, bool snapshotOnly = false}) {
+      {String? currentMode,
+      bool snapshotOnly = false,
+      int activityGapSeconds = 120}) {
     final cachedAtMs = _intValue(json['_cacheUpdatedAt']);
     final now = cachedAtMs > 0
         ? DateTime.fromMillisecondsSinceEpoch(cachedAtMs)
@@ -994,6 +1221,11 @@ class _StatisticsPreview {
     }
 
     final chronologicalEvents = <_PreviewEvent>[];
+    var toiletEstimate = 0;
+    var toiletDurationSeconds = 0;
+    var toiletDurationSamples = 0;
+    var automaticEventsInPage = 0;
+    final summaryToilet = json['toiletCount'];
     final rawEvents = json['events'];
     if (rawEvents is List) {
       // 设备接口按事件 ID 从新到旧返回；按 ID 还原记录顺序后再合并感应段。
@@ -1025,6 +1257,29 @@ class _StatisticsPreview {
         return null;
       }
 
+      // 预计入厕：只统计自动排风，且实际排风时长达到设定时长的一半。
+      // 手动排风、临时强制排风不计入；PIR 打断导致不足一半也不计入。
+      for (var index = 0; index < ordered.length; index++) {
+        final event = ordered[index].cast<String, dynamic>();
+        if (event['kind'] != 'automatic') continue;
+        automaticEventsInPage++;
+        final configured = _intValue(event['durationSeconds']);
+        if (configured <= 0) continue;
+        final start = _eventTimestamp(event);
+        final next = nextControlEventTime(index);
+        final elapsed = next == null
+            ? (event['state'] == 'active'
+                ? DateTime.now().difference(start).inSeconds
+                : configured)
+            : math.max(0, next.difference(start).inSeconds);
+        final effective = math.min(configured, elapsed);
+        if (effective * 2 >= configured) {
+          toiletEstimate++;
+          toiletDurationSeconds += effective;
+          toiletDurationSamples++;
+        }
+      }
+
       var index = 0;
       while (index < ordered.length) {
         final event = ordered[index].cast<String, dynamic>();
@@ -1036,7 +1291,12 @@ class _StatisticsPreview {
           while (next < ordered.length) {
             final nextEvent = ordered[next].cast<String, dynamic>();
             if (nextEvent['kind'] != 'activity') break;
-            lastTimestamp = _eventTimestamp(nextEvent);
+            final nextTimestamp = _eventTimestamp(nextEvent);
+            if (nextTimestamp.difference(lastTimestamp).inSeconds >
+                activityGapSeconds) {
+              break;
+            }
+            lastTimestamp = nextTimestamp;
             next++;
           }
           final count = next - index;
@@ -1154,6 +1414,7 @@ class _StatisticsPreview {
 
     return _StatisticsPreview(
       rangeText: rangeText,
+      runtimeSeconds: runtimeSeconds,
       runtimeMain: runtimeMain,
       runtimeUnit: runtimeUnit,
       runtimeCaption: json['timeSynced'] == true
@@ -1163,6 +1424,15 @@ class _StatisticsPreview {
           : '设备时间待校准；校准后回填本次开机以来的统计',
       activityCount: _intValue(json['activityCount']),
       autoExhaustCount: _intValue(json['automaticCount']),
+      toiletEstimateCount:
+          summaryToilet is num ? summaryToilet.toInt() : toiletEstimate,
+      toiletEstimateAvailable: summaryToilet is num ||
+          automaticEventsInPage > 0 ||
+          _intValue(json['automaticCount']) == 0,
+      toiletAverageSeconds: toiletDurationSamples > 0
+          ? (toiletDurationSeconds / toiletDurationSamples).round()
+          : null,
+      toiletAverageAvailable: toiletDurationSamples > 0,
       chart: chart,
       maxChartValue: _niceAxisMaximum(maxValue),
       chartTitle: range == _StatisticsRange.sevenDays ? '每日排风时长' : '分时排风时长',

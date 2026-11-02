@@ -1,6 +1,7 @@
 import 'dart:async';
 
 /// 协调 App 前后台切换与 BLE 会话，避免短暂切后台就释放连接。
+/// 控制场景下黑屏/切后台 10 分钟内保持连接，减少亮屏重连的 Android GATT 133。
 ///
 /// 后台停留超过宽限期才关闭 BLE；若关闭过程中 App 回到前台，等待关闭
 /// 完成后再调用恢复回调，确保恢复逻辑能看到真实的断开状态并启动扫描。
@@ -8,7 +9,7 @@ class BackgroundBleLifecycle {
   BackgroundBleLifecycle({
     required Future<void> Function() closeSession,
     required Future<void> Function() resumeSession,
-    this.gracePeriod = const Duration(seconds: 30),
+    this.gracePeriod = const Duration(minutes: 10),
   })  : _closeSession = closeSession,
         _resumeSession = resumeSession;
 

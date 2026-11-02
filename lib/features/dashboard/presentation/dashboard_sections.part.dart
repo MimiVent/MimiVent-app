@@ -112,7 +112,36 @@ extension _DashboardMainSections on _DashboardPageState {
 
   Widget _connectionStatusBanner() {
     final offline = c.offlineViewing;
-    final color = offline ? MimiVentColors.muted : MimiVentColors.red;
+    final connecting = _deviceConnectActionBusy ||
+        c.ble.connectionStatus == BleConnectionStatus.connecting;
+    final scanning = c.ble.isScanning;
+    final bleLinked = c.ble.isConnected;
+    final color = offline
+        ? MimiVentColors.muted
+        : connecting || scanning || bleLinked
+            ? MimiVentColors.amber
+            : MimiVentColors.red;
+    final text = offline
+        ? '离线模式 · 仅查看缓存数据'
+        : connecting
+            ? '正在连接蓝牙 · 请稍候…'
+            : scanning
+                ? '正在搜索附近设备 · 请稍候…'
+                : bleLinked
+                    ? '蓝牙已连接 · 正在同步设备状态'
+                    : '设备未连接 · 可查看缓存数据';
+    final action = connecting
+        ? '连接中…'
+        : scanning
+            ? '搜索中…'
+            : '连接设备';
+    final icon = offline
+        ? Icons.offline_bolt_outlined
+        : connecting || scanning
+            ? Icons.bluetooth_searching
+            : bleLinked
+                ? Icons.bluetooth_connected
+                : Icons.bluetooth_disabled;
     return Material(
       color: MimiVentColors.surfaceRaised,
       borderRadius: BorderRadius.circular(14),
@@ -122,26 +151,23 @@ extension _DashboardMainSections on _DashboardPageState {
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
           child: Row(children: [
-            Icon(
-                offline
-                    ? Icons.offline_bolt_outlined
-                    : Icons.bluetooth_disabled,
-                size: 17,
-                color: color),
+            Icon(icon, size: 17, color: color),
             const SizedBox(width: 8),
             Expanded(
               child: Text(
-                offline ? '离线模式 · 仅查看缓存数据' : '蓝牙未连接 · 可查看缓存数据',
+                text,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(color: color, fontSize: 11),
               ),
             ),
             const SizedBox(width: 6),
-            const Text('连接设备',
-                style: TextStyle(color: MimiVentColors.mint, fontSize: 11)),
-            const Icon(Icons.chevron_right_rounded,
-                size: 17, color: MimiVentColors.mint),
+            Text(action,
+                style:
+                    const TextStyle(color: MimiVentColors.mint, fontSize: 11)),
+            if (!connecting && !scanning)
+              const Icon(Icons.chevron_right_rounded,
+                  size: 17, color: MimiVentColors.mint),
           ]),
         ),
       ),
@@ -350,8 +376,8 @@ extension _DashboardMainSections on _DashboardPageState {
           Expanded(
             child: _metricCard(
               title: '风机运行',
-              value: DurationFormatter.clock(status.fanRunMs),
-              detail: DeviceStatusPresenter.phaseDescription(status),
+              value: DurationFormatter.clock(c.displayFanRunMs),
+              detail: '本次运行时长',
               icon: Icons.schedule_rounded,
               accent: status.fan ? MimiVentColors.amber : MimiVentColors.mint,
             ),

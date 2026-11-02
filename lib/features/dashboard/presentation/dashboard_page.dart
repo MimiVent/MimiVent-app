@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart' show ScanResult;
 import 'package:package_info_plus/package_info_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../../app/app_identity.dart';
 import '../../../ble/mimivent_ble_manager.dart';
@@ -21,10 +22,13 @@ import '../../../shared/presentation/modal_coordinator.dart';
 import '../../../shared/widgets/device_animations.dart';
 import '../../../shared/widgets/ble_signal_indicator.dart';
 import '../../connection/connection_presentation.dart';
+import '../../../data/device_connection_manager.dart';
+import '../../connection/connection_status_badge.dart';
 import '../../control/control_operation.dart';
 import '../../diagnostics/diagnostics_page.dart';
 import '../../statistics/presentation/statistics_page.dart';
 import '../../firmware_update/firmware_update_page.dart';
+import '../../wifi_provisioning/wifi_provisioning_page.dart';
 import '../../../shared/widgets/version_compatibility_notice.dart';
 
 part 'dashboard_connection.part.dart';
@@ -34,8 +38,11 @@ part 'dashboard_status_cards.part.dart';
 
 enum _TopBarMenuAction {
   diagnostics,
+  wifiProvisioning,
   firmwareUpdate,
   connectDevice,
+  connectBluetooth,
+  switchToWifi,
   offline,
   closeApp
 }
@@ -44,11 +51,19 @@ class DashboardPage extends StatefulWidget {
   const DashboardPage({
     required this.controller,
     required this.diagnostics,
+    this.connection,
+    this.onConnectBluetooth,
+    this.onSwitchToWifi,
+    this.globalLoadingLabel,
     super.key,
   });
 
   final MimiVentController controller;
   final AppDiagnosticsLog diagnostics;
+  final DeviceConnectionManager? connection;
+  final Future<void> Function()? onConnectBluetooth;
+  final Future<void> Function()? onSwitchToWifi;
+  final String? globalLoadingLabel;
 
   @override
   State<DashboardPage> createState() => _DashboardPageState();
@@ -71,7 +86,10 @@ class _DashboardPageState extends State<DashboardPage> {
   bool _scanSheetDismissedDuringScan = false;
   bool _connectionRevealActive = false;
   bool _deviceConnectActionBusy = false;
+  String? _connectionActionError;
   bool _reconnectInProgress = false;
+  bool _wifiPromptHandled = false;
+  bool _wifiPromptShowing = false;
   String _appVersion = '读取中';
   String _appBuildNumber = '';
 
@@ -79,7 +97,10 @@ class _DashboardPageState extends State<DashboardPage> {
   void initState() {
     super.initState();
     c.addListener(_syncDeviceUi);
-    _syncDeviceUi();
+    // 路由依赖在首帧之后读取，避免 initState 中访问 ModalRoute 的继承状态。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _syncDeviceUi();
+    });
     // 从安装包元数据读取 App 版本，避免页面版本和 pubspec.yaml 不一致。
     unawaited(_loadAppVersion());
   }
@@ -155,6 +176,18 @@ class _DashboardPageState extends State<DashboardPage> {
                             padding: const EdgeInsets.fromLTRB(18, 4, 18, 0),
                             child: _connectionErrorBanner(),
                           ),
+                        if (c.wifiGattCacheStale)
+                          const Padding(
+                            padding: EdgeInsets.fromLTRB(18, 4, 18, 0),
+                            child: Card(
+                              child: Padding(
+                                padding: EdgeInsets.all(12),
+                                child: Text(
+                                  '设备支持 WiFi 配网，但手机未发现新增蓝牙服务。请在系统蓝牙中取消 MimiVent 配对后重新连接；若仍未恢复，再清除系统蓝牙缓存。',
+                                ),
+                              ),
+                            ),
+                          ),
                         Expanded(
                           child: NotificationListener<ScrollNotification>(
                             onNotification: _handleScrollNotification,
@@ -169,13 +202,52 @@ class _DashboardPageState extends State<DashboardPage> {
             ),
             bottomNavigationBar: _bottomBar(),
           );
+          final content = Stack(fit: StackFit.expand, children: [
+            page,
+            if (c.pendingWifiAction != null ||
+                widget.globalLoadingLabel != null)
+              Positioned.fill(
+                child: Stack(children: [
+                  const ModalBarrier(
+                      dismissible: false, color: Color(0x99000000)),
+                  Center(
+                    child: Material(
+                      color: MimiVentColors.surfaceRaised,
+                      borderRadius: BorderRadius.circular(20),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 28, vertical: 22),
+                        child:
+                            Column(mainAxisSize: MainAxisSize.min, children: [
+                          const SizedBox(
+                              width: 28,
+                              height: 28,
+                              child: CircularProgressIndicator(
+                                  strokeWidth: 2.6,
+                                  color: MimiVentColors.mint)),
+                          const SizedBox(height: 14),
+                          Text(
+                              c.pendingWifiAction != null
+                                  ? '正在执行：${c.pendingWifiAction}'
+                                  : widget.globalLoadingLabel!,
+                              style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w600)),
+                        ]),
+                      ),
+                    ),
+                  ),
+                ]),
+              ),
+          ]);
           return TweenAnimationBuilder<double>(
             tween: Tween<double>(end: _connectionRevealActive ? 3.2 : 0),
             duration: _connectionRevealActive
                 ? const Duration(milliseconds: 180)
                 : const Duration(milliseconds: 360),
             curve: Curves.easeOutCubic,
-            child: page,
+            child: content,
             builder: (context, blur, child) => ImageFiltered(
               imageFilter: ui.ImageFilter.blur(sigmaX: blur, sigmaY: blur),
               child: child,
@@ -274,6 +346,25 @@ class _DashboardPageState extends State<DashboardPage> {
             ],
           ),
         ),
+        if (widget.connection != null)
+          Padding(
+            padding: const EdgeInsets.only(right: 6),
+            child: ConnectionStatusBadge(
+              connection: widget.connection!,
+              onTap: () => showDialog<void>(
+                context: context,
+                builder: (context) => AlertDialog(
+                  title: const Text('连接状态'),
+                  content: Text(widget.connection!.detail),
+                  actions: [
+                    TextButton(
+                        onPressed: () => Navigator.pop(context),
+                        child: const Text('关闭'))
+                  ],
+                ),
+              ),
+            ),
+          ),
         PopupMenuButton<_TopBarMenuAction>(
           tooltip: '更多操作',
           position: PopupMenuPosition.under,
@@ -286,10 +377,16 @@ class _DashboardPageState extends State<DashboardPage> {
             switch (action) {
               case _TopBarMenuAction.diagnostics:
                 _openDiagnostics();
+              case _TopBarMenuAction.wifiProvisioning:
+                _openWifiProvisioning();
               case _TopBarMenuAction.firmwareUpdate:
                 _openFirmwareUpdate();
               case _TopBarMenuAction.connectDevice:
                 _leaveOfflineAndConnect();
+              case _TopBarMenuAction.connectBluetooth:
+                widget.onConnectBluetooth?.call();
+              case _TopBarMenuAction.switchToWifi:
+                widget.onSwitchToWifi?.call();
               case _TopBarMenuAction.offline:
                 _enterOfflineViewing();
               case _TopBarMenuAction.closeApp:
@@ -297,6 +394,28 @@ class _DashboardPageState extends State<DashboardPage> {
             }
           },
           itemBuilder: (context) => [
+            if (widget.onSwitchToWifi != null &&
+                (widget.connection?.channel == DeviceChannel.ble ||
+                    !c.wifiActive))
+              const PopupMenuItem(
+                value: _TopBarMenuAction.switchToWifi,
+                child: Row(children: [
+                  Icon(Icons.wifi_rounded,
+                      color: MimiVentColors.mint, size: 19),
+                  SizedBox(width: 11),
+                  Text('切换回 WiFi 控制'),
+                ]),
+              ),
+            if (c.wifiActive && widget.onConnectBluetooth != null)
+              const PopupMenuItem(
+                value: _TopBarMenuAction.connectBluetooth,
+                child: Row(children: [
+                  Icon(Icons.bluetooth_rounded,
+                      color: MimiVentColors.mint, size: 19),
+                  SizedBox(width: 11),
+                  Text('连接蓝牙（备用）'),
+                ]),
+              ),
             if (c.offlineViewing)
               const PopupMenuItem(
                 value: _TopBarMenuAction.connectDevice,
@@ -326,6 +445,17 @@ class _DashboardPageState extends State<DashboardPage> {
                 Text('设备诊断'),
               ]),
             ),
+            if (c.connected &&
+                c.status?.capabilities.contains('wifi.configure') == true &&
+                c.ble.hasWifiProvisioningService)
+              const PopupMenuItem(
+                value: _TopBarMenuAction.wifiProvisioning,
+                child: Row(children: [
+                  Icon(Icons.wifi, color: MimiVentColors.mint, size: 19),
+                  SizedBox(width: 11),
+                  Text('WiFi 配网'),
+                ]),
+              ),
             PopupMenuItem(
               value: _TopBarMenuAction.firmwareUpdate,
               enabled: c.connected && !c.offlineViewing,

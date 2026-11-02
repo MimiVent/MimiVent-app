@@ -14,50 +14,54 @@ class DeviceStatusPresenter {
         _ => '未连接',
       };
 
-  static String phaseTagText(DeviceStatus status) {
+  static String phaseTagText(DeviceStatus status, {int? remainingMs}) {
+    final remaining = remainingMs ?? status.remainingMs;
     if (status.phase == 'startup_cooldown') {
-      return '冷静 ${DurationFormatter.clock(status.remainingMs)}';
+      return '冷静 ${DurationFormatter.clock(remaining)}';
     }
     if (status.mode == 'timed_on' || status.mode == 'force_test') {
-      return '剩余 ${DurationFormatter.clock(status.remainingMs)}';
+      return '剩余 ${DurationFormatter.clock(remaining)}';
     }
     if (status.mode == 'timed_off') return '暂停中';
     if (status.mode == 'lock_off') return '手动恢复';
     if (status.phase == 'occupied') return '活动中';
     if (status.phase == 'clear_confirm') {
-      return '离开确认 ${DurationFormatter.clock(status.remainingMs)}';
+      return '离开确认 ${DurationFormatter.clock(remaining)}';
     }
     if (status.phase == 'exhausting') {
-      return '排风中 ${DurationFormatter.clock(status.remainingMs)}';
+      return '排风中 ${DurationFormatter.clock(remaining)}';
     }
     return status.pir ? '等待离开' : '待机';
   }
 
-  static String phaseDescription(DeviceStatus status) {
+  static String phaseDescription(DeviceStatus status, {int? remainingMs}) {
+    final remaining = remainingMs ?? status.remainingMs;
     if (status.phase == 'startup_cooldown') {
-      return '开机冷静期 · ${DurationFormatter.clock(status.remainingMs)}';
+      return '开机冷静期 · ${DurationFormatter.clock(remaining)}';
     }
     if (status.mode == 'timed_on') {
-      return '临时排风 · ${DurationFormatter.clock(status.remainingMs)}';
+      return '临时排风 · ${DurationFormatter.clock(remaining)}';
     }
     if (status.mode == 'timed_off') {
-      return '暂停剩余 · ${DurationFormatter.clock(status.remainingMs)}';
+      return '暂停剩余 · ${DurationFormatter.clock(remaining)}';
     }
     if (status.mode == 'force_test') {
-      return '强制排风 · 剩余 ${DurationFormatter.clock(status.remainingMs)}';
+      return '强制排风 · 剩余 ${DurationFormatter.clock(remaining)}';
     }
     if (status.mode == 'lock_off') return '持续关闭 · 手动恢复';
     if (status.phase == 'occupied') return '检测到活动，风机保持停止';
     if (status.phase == 'clear_confirm') {
-      return '离开确认 · ${DurationFormatter.clock(status.remainingMs)}';
+      return '离开确认 · ${DurationFormatter.clock(remaining)}';
     }
     if (status.phase == 'exhausting') {
-      return '自动排风 · ${DurationFormatter.clock(status.remainingMs)}';
+      return '自动排风 · ${DurationFormatter.clock(remaining)}';
     }
     return status.pir ? '检测到活动，等待离开' : '等待下一次活动';
   }
 
-  static (String, String, String) runtimeDescription(DeviceStatus status) {
+  static (String, String, String) runtimeDescription(DeviceStatus status,
+      {int? remainingMs}) {
+    final remaining = remainingMs ?? status.remainingMs;
     if (status.phase == 'startup_cooldown') {
       return (
         '开机冷静期',
@@ -83,7 +87,7 @@ class DeviceStatusPresenter {
       return (
         '强制排风',
         '本次运行忽略 PIR',
-        DurationFormatter.clock(status.remainingMs),
+        DurationFormatter.clock(remaining),
       );
     }
     if (status.mode == 'lock_off') {

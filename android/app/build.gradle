@@ -33,6 +33,7 @@ android {
     }
 
     defaultConfig {
+        testInstrumentationRunner "dev.mimivent.mimivent_app.WifiStorageSmokeInstrumentation"
         applicationId = "dev.mimivent.mimivent_app"
         // You can update the following values to match your application needs.
         // For more information, see: https://docs.flutter.dev/deployment/android#reviewing-the-gradle-build-configuration.

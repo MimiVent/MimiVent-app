@@ -25,6 +25,34 @@ void main() {
     );
   });
 
+  test('读取设备能力位并兼容旧固件缺少能力字段', () {
+    final status = DeviceStatus.fromJson({
+      ...validStatus,
+      'capabilities': ['ble.control', 'ble.stats', 'ble.ota'],
+    });
+    expect(status.capabilities, {'ble.control', 'ble.stats', 'ble.ota'});
+    expect(DeviceStatus.fromJson(validStatus).capabilities, isEmpty);
+  });
+
+  test('拒绝类型错误的能力位响应', () {
+    expect(
+      () => DeviceStatus.fromJson(
+          {...validStatus, 'capabilities': 'wifi.control'}),
+      throwsFormatException,
+    );
+  });
+
+  test('读取 GATT 结构版本并拒绝越界值', () {
+    expect(
+      DeviceStatus.fromJson({...validStatus, 'gattVersion': 2}).gattVersion,
+      2,
+    );
+    expect(
+      () => DeviceStatus.fromJson({...validStatus, 'gattVersion': 256}),
+      throwsFormatException,
+    );
+  });
+
   test('配置关键字段缺失或时间不在固件选项内时拒绝加载', () {
     expect(
       () => TimingSettings.fromJson({

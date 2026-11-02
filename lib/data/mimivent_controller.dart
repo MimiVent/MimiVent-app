@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -10,6 +12,8 @@ import '../api/mimivent_api.dart';
 import '../ble/mimivent_ble_manager.dart';
 import '../core/diagnostics/app_diagnostics_log.dart';
 import '../features/control/control_operation.dart';
+import '../features/wifi_control/wifi_binding.dart';
+import '../features/wifi_control/wifi_read_transport.dart';
 import 'ble_device_repository.dart';
 import 'device_repository.dart';
 import 'settings_draft.dart';
@@ -29,10 +33,16 @@ class MimiVentController extends ChangeNotifier {
         BleDeviceRepository(MimiVentApi(ble, diagnostics: diagnostics));
     ble.addListener(_onBleChanged);
     _pollTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (wifiActive && (status?.fan == true || displayRemainingMs > 0)) {
+        _notifyIfAlive();
+      }
       if (ble.isConnected &&
           !_offlineViewing &&
+          status != null &&
+          lastError == null &&
           !ble.isOtaUploading &&
           !ble.isOtaVerifying &&
+          !_connectionBootstrapInProgress &&
           !busy &&
           !_polling) {
         refresh();
@@ -45,6 +55,30 @@ class MimiVentController extends ChangeNotifier {
   final String? appVersionOverride;
   late DeviceRepository repository;
   DeviceStatus? status;
+
+  /// 两次 WiFi 状态采样之间本地插值，让运行时间每秒推进。
+  int get displayFanRunMs {
+    final current = status;
+    if (current == null) return 0;
+    if (!wifiActive || !current.fan) return current.fanRunMs;
+    final started = _fanRunStartedAt;
+    if (started == null) return current.fanRunMs;
+    final elapsed = DateTime.now().difference(started).inMilliseconds;
+    return elapsed > 0 ? elapsed : 0;
+  }
+
+  /// 两次 WiFi 状态采样之间本地推进倒计时，避免倒计时每 3–6 秒才跳一次。
+  int get displayRemainingMs {
+    final current = status;
+    if (current == null) return 0;
+    final remaining = current.remainingMs;
+    if (!wifiActive || _wifiStatusAt == null || remaining <= 0)
+      return remaining;
+    final elapsed = DateTime.now().difference(_wifiStatusAt!).inMilliseconds;
+    final value = remaining - elapsed;
+    return value > 0 ? value : 0;
+  }
+
   Map<String, dynamic>? statistics;
   final Map<String, Map<String, dynamic>> _statisticsByRange = {};
   final Set<String> _statisticsLoadingRanges = {};
@@ -58,6 +92,7 @@ class MimiVentController extends ChangeNotifier {
   TimingProfile profile = TimingProfile.production;
   Timer? _pollTimer;
   bool busy = false;
+  bool wifiGattCacheStale = false;
   bool _polling = false;
   bool _statusInvalid = false;
   bool _initialized = false;
@@ -68,16 +103,39 @@ class MimiVentController extends ChangeNotifier {
   bool _disposed = false;
   int _sessionGeneration = 0;
   int _connectAttempt = 0;
+  int? _connectionBootstrapAttempt;
   Future<void>? _closingBluetoothSession;
   String? _appVersionCache;
   static const _profileKey = 'mimivent.selected_profile';
   static const _offlineViewingKey = 'mimivent.offline_viewing';
   static const _statisticsCacheKeyPrefix = 'mimivent.statistics.cache.';
   String? lastError;
+  WifiBinding? _wifiBinding;
+  WifiReadTransport? _wifiTransport;
+  bool _wifiVersionCompatible = true;
+  final List<_WifiSerialTask> _wifiQueue = [];
+  bool _wifiPumping = false;
+  Timer? _wifiHealthTimer;
+  Timer? _wifiSyncTimer;
+  bool _wifiHealthInFlight = false;
+  bool wifiLost = false;
+  bool wifiBusy = false;
+  String? pendingWifiAction;
+  int _wifiHealthFailures = 0;
+  bool _wifiStatsSerialized = false;
+  int _wifiSyncFailures = 0;
+  bool _appForeground = true;
+  DateTime? _wifiStatusAt;
+  DateTime? _fanRunStartedAt;
 
-  bool get connected => ble.isConnected;
+  bool get wifiActive => _wifiBinding != null;
+
+  bool get connected => ble.isConnected || wifiActive;
+  bool get _connectionBootstrapInProgress =>
+      _connectionBootstrapAttempt != null;
   bool get deviceOtaBusy => ble.deviceOtaBusy;
-  bool get appVersionCompatible => ble.appVersionCompatible;
+  bool get appVersionCompatible =>
+      wifiActive ? _wifiVersionCompatible : ble.appVersionCompatible;
 
   /// 离线只读是独立的页面模式，不能由一次短暂断连自动开启控制能力。
   bool get offlineViewing => _offlineViewing;
@@ -152,6 +210,7 @@ class MimiVentController extends ChangeNotifier {
       // 让断开前正在进行的状态读取失效，避免异步结果重新写入旧会话。
       _sessionGeneration++;
       status = null;
+      wifiGattCacheStale = false;
       statistics = null;
       for (final range in _statisticsByRange.keys) {
         _statisticsCachedRanges.add(range);
@@ -339,11 +398,21 @@ class MimiVentController extends ChangeNotifier {
     if (_disposed || attempt != _connectAttempt) {
       throw StateError('连接请求已取消');
     }
+    _connectionBootstrapAttempt = attempt;
     lastError = null;
     _notifyIfAlive();
     int? sessionGeneration;
     try {
-      await ble.connect(device);
+      final sameActiveDevice =
+          ble.isConnected && ble.connectedDeviceId == device.remoteId.str;
+      if (sameActiveDevice) {
+        diagnostics?.info(
+          '蓝牙连接',
+          '设备链路仍然连接，复用现有 GATT 会话重新执行控制器初始化',
+        );
+      } else {
+        await ble.connect(device);
+      }
       if (_disposed || attempt != _connectAttempt) {
         throw StateError('连接请求已取消');
       }
@@ -396,6 +465,7 @@ class MimiVentController extends ChangeNotifier {
         return;
       }
       status = loadedStatus;
+      _updateWifiGattCacheState(loadedStatus);
       _statusInvalid = false;
       settings = loadedSettings;
       _settingsDraft =
@@ -404,7 +474,7 @@ class MimiVentController extends ChangeNotifier {
       unawaited(_persistOfflineViewing());
       lastError = null;
       _notifyIfAlive();
-    } catch (error) {
+    } catch (error, stackTrace) {
       if (_disposed ||
           attempt != _connectAttempt ||
           (sessionGeneration != null &&
@@ -423,9 +493,15 @@ class MimiVentController extends ChangeNotifier {
         }
         if (error is FormatException) _statusInvalid = true;
         lastError = error.toString();
+        diagnostics?.error('连接初始化', lastError!, stackTrace: stackTrace);
         _notifyIfAlive();
       }
       rethrow;
+    } finally {
+      if (_connectionBootstrapAttempt == attempt) {
+        _connectionBootstrapAttempt = null;
+        _notifyIfAlive();
+      }
     }
   }
 
@@ -465,15 +541,347 @@ class MimiVentController extends ChangeNotifier {
 
   bool _isCurrentSession(int generation, TimingProfile profile) =>
       !_disposed &&
-      ble.isConnected &&
+      (ble.isConnected || wifiActive) &&
       generation == _sessionGeneration &&
       profile == this.profile;
 
+  Future<T> _wifiSerial<T>(Future<T> Function() action,
+      {bool priority = false}) {
+    final result = Completer<T>();
+    _wifiQueue.add(_WifiSerialTask(() async {
+      try {
+        result.complete(await action());
+      } catch (error, stack) {
+        result.completeError(error, stack);
+      }
+    }, priority));
+    _pumpWifiQueue();
+    return result.future;
+  }
+
+  void _pumpWifiQueue() {
+    if (_wifiPumping || _wifiQueue.isEmpty) return;
+    final index = _wifiQueue.indexWhere((task) => task.priority);
+    final task = _wifiQueue.removeAt(index < 0 ? 0 : index);
+    _wifiPumping = true;
+    unawaited(task.run().whenComplete(() {
+      _wifiPumping = false;
+      _pumpWifiQueue();
+    }));
+  }
+
+  Future<void> activateWifi(WifiBinding binding) async {
+    _wifiBinding = binding;
+    _wifiTransport = WifiReadTransport();
+    wifiLost = false;
+    wifiBusy = false;
+    _wifiSyncFailures = 0;
+    try {
+      await _wifiSerial(_refreshWifi, priority: true);
+      // WiFi 已成为控制通道时主动断开 BLE，释放设备广播/连接槽，避免第二台手机连不上。
+      if (ble.isConnected) {
+        await ble.disconnect();
+      }
+      _startWifiHealth();
+      _startWifiSync();
+    } catch (error) {
+      _wifiBinding = null;
+      _wifiTransport = null;
+      if (error is WifiReadException && error.code == 'WIFI_IN_USE') {
+        wifiBusy = true;
+      }
+      lastError = error is WifiReadException ? error.message : error.toString();
+      _notifyIfAlive();
+      rethrow;
+    }
+  }
+
+  Future<void> releaseWifiLease() async {
+    final binding = _wifiBinding;
+    final transport = _wifiTransport;
+    if (binding == null || transport == null || !wifiActive) return;
+    try {
+      await transport.releaseLease(binding).timeout(const Duration(seconds: 2));
+      diagnostics?.info('WiFi 租约', '已释放 WiFi 主控');
+    } catch (error) {
+      diagnostics?.warning('WiFi 租约', '释放失败，等待租约过期：$error');
+    }
+  }
+
+  void deactivateWifi() {
+    _wifiHealthTimer?.cancel();
+    _wifiHealthTimer = null;
+    _wifiSyncTimer?.cancel();
+    _wifiSyncTimer = null;
+    _wifiBinding = null;
+    _wifiTransport = null;
+    _wifiStatusAt = null;
+    _fanRunStartedAt = null;
+    wifiLost = false;
+    wifiBusy = false;
+    _wifiSyncFailures = 0;
+    _notifyIfAlive();
+  }
+
+  void _startWifiHealth() {
+    // 用户优先：不再后台轮询，避免健康检查占用单 HTTPS 连接阻塞控制。
+    // 断线由写操作/手动刷新/启动探测发现，或回到前台时重新探测。
+    _wifiHealthTimer?.cancel();
+    _wifiHealthTimer = null;
+    _wifiHealthFailures = 0;
+  }
+
+  void _startWifiSync() {
+    _wifiSyncTimer?.cancel();
+    _scheduleWifiSync();
+  }
+
+  void setAppForeground(bool value) {
+    if (_appForeground == value) return;
+    _appForeground = value;
+    if (wifiActive) _startWifiSync();
+  }
+
+  void _scheduleWifiSync() {
+    final delay = _appForeground
+        ? 3000 + Random().nextInt(2000)
+        : 8000 + Random().nextInt(4000);
+    _wifiSyncTimer = Timer(Duration(milliseconds: delay), () {
+      if (!wifiActive || _disposed) return;
+      if (pendingWifiAction == null) {
+        unawaited(_wifiSerial(_refreshWifi).then((_) {
+          _wifiSyncFailures = 0;
+        }).catchError((Object error) {
+          if (error is WifiReadException && error.code == 'WIFI_IN_USE') {
+            _handleWifiBusy(error);
+            return;
+          }
+          _wifiSyncFailures++;
+          diagnostics?.warning('WiFi 同步', '状态同步失败：$error');
+          if (_wifiSyncFailures >= 2) _handleWifiLost(error);
+        }));
+      }
+      if (wifiActive) _scheduleWifiSync();
+    });
+  }
+
+  void _scheduleWifiHealth() {
+    // 多手机场景加抖动，避免两台手机在同一秒同时重试造成单连接互踢。
+    final jitter = 12000 + Random().nextInt(6000);
+    _wifiHealthTimer = Timer(Duration(milliseconds: jitter), () {
+      if (!wifiActive || _disposed) return;
+      if (_wifiHealthInFlight) {
+        _scheduleWifiHealth();
+        return;
+      }
+      _wifiHealthInFlight = true;
+      unawaited(
+          _wifiSerial(_refreshWifi, priority: true).catchError((Object error) {
+        _wifiHealthFailures++;
+        if (_wifiHealthFailures >= 2) {
+          _handleWifiLost(error);
+        } else {
+          diagnostics?.warning('WiFi 连接', '健康检查失败，等待下次重试：$error');
+        }
+      }).whenComplete(() {
+        _wifiHealthInFlight = false;
+        if (wifiActive) _scheduleWifiHealth();
+      }));
+    });
+  }
+
+  void _handleWifiLost(Object error) {
+    if (!wifiActive) return;
+    wifiLost = true;
+    lastError = 'WiFi 连接已断开';
+    _wifiHealthTimer?.cancel();
+    _wifiHealthTimer = null;
+    _wifiSyncTimer?.cancel();
+    _wifiSyncTimer = null;
+    _wifiBinding = null;
+    _wifiTransport = null;
+    _wifiStatusAt = null;
+    _fanRunStartedAt = null;
+    status = null;
+    settings = null;
+    _settingsDraft = null;
+    diagnostics?.warning('WiFi 连接', '状态同步失败：$error');
+    _notifyIfAlive();
+  }
+
+  void _handleWifiBusy(Object error) {
+    if (!wifiActive) return;
+    wifiBusy = true;
+    lastError = 'WiFi 正被另一台手机控制';
+    _wifiHealthTimer?.cancel();
+    _wifiHealthTimer = null;
+    _wifiSyncTimer?.cancel();
+    _wifiSyncTimer = null;
+    _wifiBinding = null;
+    _wifiTransport = null;
+    _wifiStatusAt = null;
+    _fanRunStartedAt = null;
+    status = null;
+    settings = null;
+    _settingsDraft = null;
+    diagnostics?.warning('WiFi 租约', 'WiFi 已被其他手机占用：$error');
+    _notifyIfAlive();
+  }
+
+  Future<void> _refreshWifi() async {
+    final binding = _wifiBinding;
+    final transport = _wifiTransport;
+    if (binding == null || transport == null) return;
+    Map<String, dynamic> data;
+    for (var attempt = 0;; attempt++) {
+      try {
+        data = await transport.read(binding);
+        break;
+      } catch (error) {
+        if (attempt == 0 && _wifiTransient(error)) {
+          await Future<void>.delayed(const Duration(milliseconds: 200));
+          continue;
+        }
+        rethrow;
+      }
+    }
+    if (pendingWifiAction != null) return;
+    final loaded = DeviceStatus.fromJson(data);
+    final loadedSettings = TimingSettings.fromJson(data);
+    final wasFanOn = status?.fan == true;
+    status = loaded;
+    _wifiStatusAt = DateTime.now();
+    if (loaded.fan) {
+      if (!wasFanOn || _fanRunStartedAt == null) {
+        _fanRunStartedAt =
+            DateTime.now().subtract(Duration(milliseconds: loaded.fanRunMs));
+      }
+    } else {
+      _fanRunStartedAt = null;
+    }
+    profile = loaded.activeProfile;
+    settings = loadedSettings;
+    if (_settingsDraft == null || !_settingsDraft!.isDirty) {
+      _settingsDraft =
+          SettingsDraft(saved: loadedSettings, value: loadedSettings);
+    }
+    _statusInvalid = false;
+    _wifiVersionCompatible = true;
+    _wifiHealthFailures = 0;
+    lastError = null;
+    _notifyIfAlive();
+  }
+
+  String _requestId() {
+    final random = Random.secure();
+    final bytes = List<int>.generate(16, (_) => random.nextInt(256));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    final hex = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    return '${hex.substring(0, 8)}-${hex.substring(8, 12)}-'
+        '${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}';
+  }
+
+  bool _wifiTransient(Object error) {
+    if (error is TimeoutException || error is SocketException) return true;
+    if (error is WifiReadException) {
+      return const {
+        'HTTP_INCOMPLETE',
+        'HTTP_FORMAT',
+        'RESOURCE_BUSY',
+        'RATE_LIMITED',
+      }.contains(error.code);
+    }
+    return false;
+  }
+
+  Future<Map<String, dynamic>> _wifiReadPath(String path) async {
+    final binding = _wifiBinding;
+    final transport = _wifiTransport;
+    if (binding == null || transport == null) {
+      throw StateError('WiFi 控制通道不可用');
+    }
+    for (var attempt = 0;; attempt++) {
+      try {
+        return await transport.readPath(binding, path);
+      } catch (error) {
+        if (attempt == 0 && _wifiTransient(error)) {
+          await Future<void>.delayed(const Duration(milliseconds: 200));
+          continue;
+        }
+        rethrow;
+      }
+    }
+  }
+
+  Future<void> _wifiWrite(String path, String body) =>
+      _wifiSerial(() => _wifiWriteUnlocked(path, body), priority: true);
+
+  Future<void> _wifiWriteUnlocked(String path, String body) async {
+    // WiFi 控制期间释放 BLE 连接，避免占用设备唯一的 BLE 槽导致第二台手机无法连接。
+    if (ble.isConnected) {
+      await ble.disconnect();
+    }
+    final binding = _wifiBinding;
+    final transport = _wifiTransport;
+    if (binding == null || transport == null) {
+      throw StateError('WiFi 控制通道不可用');
+    }
+    final requestId = _requestId();
+    WifiHttpResult result;
+    for (var attempt = 0;; attempt++) {
+      try {
+        result = await transport.write(binding,
+            path: path, body: body, requestId: requestId);
+        break;
+      } catch (error) {
+        if (attempt == 0 && _wifiTransient(error)) {
+          await Future<void>.delayed(const Duration(milliseconds: 200));
+          continue;
+        }
+        if (error is WifiReadException && error.code == 'WIFI_IN_USE') {
+          _handleWifiBusy(error);
+          rethrow;
+        }
+        throw StateError('WiFi 写请求失败：$error');
+      }
+    }
+    if (result.statusCode != 200) {
+      final code =
+          result.body['error']?.toString() ?? 'HTTP_${result.statusCode}';
+      diagnostics?.warning(
+          'WiFi 控制拒绝', 'POST $path HTTP ${result.statusCode} $code');
+      if (result.statusCode == 409) {
+        throw StateError('设备正在执行其他流程，请先确认“停止并切换”后再试');
+      }
+      if (result.statusCode == 423) {
+        throw StateError('设备正在升级，暂时不能控制');
+      }
+      if (code.contains('RESOURCE_BUSY')) {
+        throw StateError('设备正忙，请稍后重试');
+      }
+      if (code.contains('DEDUP_UNAVAILABLE')) {
+        throw StateError('设备请求记录已满，请重启设备后再试');
+      }
+      throw StateError('设备未完成 WiFi 控制（$code）');
+    }
+    // 写请求成功后立即返回，状态刷新排队在后台完成，避免控制按钮等待两次 TLS。
+    unawaited(
+        _wifiSerial(_refreshWifi, priority: true).catchError((Object error) {
+      diagnostics?.warning('WiFi 状态', '写后刷新失败：$error');
+    }));
+  }
+
   Future<void> refresh({int? expectedGeneration}) async {
+    if (wifiActive) {
+      await _wifiSerial(_refreshWifi, priority: true);
+      return;
+    }
     if (_offlineViewing ||
         !ble.isConnected ||
         ble.isOtaUploading ||
         ble.isOtaVerifying ||
+        _connectionBootstrapInProgress ||
         _polling) {
       return;
     }
@@ -498,6 +906,7 @@ class MimiVentController extends ChangeNotifier {
           (appVersion != null && _compareVersions(appVersion, minimumApp) >= 0);
       ble.setFirmwareAppCompatible(compatible);
       status = loaded;
+      _updateWifiGattCacheState(loaded);
       ble.setDeviceOtaBusy(false);
       _statusInvalid = false;
       if (!compatible) {
@@ -552,11 +961,39 @@ class MimiVentController extends ChangeNotifier {
     }
   }
 
+  void _updateWifiGattCacheState(DeviceStatus loaded) {
+    final stale = loaded.capabilities.contains('wifi.configure') &&
+        !ble.hasWifiProvisioningService;
+    if (stale == wifiGattCacheStale) return;
+    wifiGattCacheStale = stale;
+    if (stale) {
+      diagnostics?.warning(
+        'WiFi 配网',
+        '固件支持 WiFi 配网，但当前手机未发现 WiFi GATT 服务；可能需要清除旧 BLE 服务缓存后重新连接。',
+      );
+    }
+    _notifyIfAlive();
+  }
+
   Future<void> refreshStatistics(String range,
       {int? expectedGeneration,
       int eventOffset = 0,
       int? eventBeforeId}) async {
-    if (_offlineViewing || !ble.isConnected) return;
+    if (_offlineViewing || (!ble.isConnected && !wifiActive)) return;
+    if (wifiActive && !_wifiStatsSerialized) {
+      await _wifiSerial(() async {
+        _wifiStatsSerialized = true;
+        try {
+          await refreshStatistics(range,
+              expectedGeneration: expectedGeneration,
+              eventOffset: eventOffset,
+              eventBeforeId: eventBeforeId);
+        } finally {
+          _wifiStatsSerialized = false;
+        }
+      });
+      return;
+    }
     final generation = expectedGeneration ?? _sessionGeneration;
     if (generation != _sessionGeneration) return;
     if (!_statisticsRequests.add(range)) return;
@@ -567,7 +1004,36 @@ class MimiVentController extends ChangeNotifier {
     _notifyIfAlive();
     try {
       final Map<String, dynamic> loaded;
-      if (eventOffset == 0 && eventBeforeId == null) {
+      if (wifiActive) {
+        if (eventOffset == 0 && eventBeforeId == null) {
+          loaded = await _wifiReadPath('/api/stats?mode=$range');
+          _validateStatisticsSnapshot(range, loaded);
+        } else {
+          final previous = _statisticsByRange[range];
+          final start = _intValue(previous?['eventsStart']);
+          final end = _intValue(previous?['eventsEnd']);
+          final epoch = previous?['eventsDataEpoch']?.toString();
+          if (start <= 0 || end <= start) return;
+          final cursor =
+              eventBeforeId == null ? '' : '&beforeId=$eventBeforeId';
+          final query = 'start=$start&end=$end&offset=$eventOffset&limit=32'
+              '&kind=all$cursor${epoch == null ? '' : '&dataEpoch=${Uri.encodeQueryComponent(epoch)}'}';
+          final page = await _wifiReadPath('/api/events?$query');
+          loaded = {
+            'events': page['events'],
+            'eventsOffset': page['offset'],
+            'eventsNextOffset': page['nextOffset'],
+            'eventsNextCursor': page['nextCursor'],
+            'eventsTotal': page['total'],
+            'eventsHasMore': page['hasMore'],
+            'eventsTruncated': page['eventsTruncated'],
+            'eventsStart': page['start'],
+            'eventsEnd': page['end'],
+            'eventsDeviceId': page['deviceId'],
+            'eventsDataEpoch': page['dataEpoch'],
+          };
+        }
+      } else if (eventOffset == 0 && eventBeforeId == null) {
         loaded = await repository.getStatistics(selectedProfile, range);
         _validateStatisticsSnapshot(range, loaded);
         if (range == 'today' || range == 'yesterday') {
@@ -620,7 +1086,7 @@ class MimiVentController extends ChangeNotifier {
         };
       }
       if (_disposed ||
-          !ble.isConnected ||
+          (!ble.isConnected && !wifiActive) ||
           generation != _sessionGeneration ||
           selectedProfile != profile) return;
       await _invalidateOlderStatisticsDatasets(
@@ -664,7 +1130,9 @@ class MimiVentController extends ChangeNotifier {
       _statisticsLoadingRanges.remove(range);
       _notifyIfAlive();
     }
-    if (restartAfterDatasetChange && !_disposed && ble.isConnected) {
+    if (restartAfterDatasetChange &&
+        !_disposed &&
+        (ble.isConnected || wifiActive)) {
       // 旧游标属于已清除的数据批次；从当前数据集首屏重新开始。
       unawaited(refreshStatistics(range, expectedGeneration: generation));
     }
@@ -916,6 +1384,18 @@ class MimiVentController extends ChangeNotifier {
   }
 
   Future<void> loadSettings({int? expectedGeneration}) async {
+    if (wifiActive) {
+      await _wifiSerial(() async {
+        final binding = _wifiBinding!;
+        final data = await _wifiTransport!
+            .readPath(binding, '/api/settings?profile=${profile.wireValue}');
+        final loaded = TimingSettings.fromJson(data);
+        settings = loaded;
+        _settingsDraft = SettingsDraft(saved: loaded, value: loaded);
+        _notifyIfAlive();
+      }, priority: true);
+      return;
+    }
     if (_offlineViewing || !ble.isConnected) return;
     final generation = expectedGeneration ?? _sessionGeneration;
     if (generation != _sessionGeneration) return;
@@ -947,6 +1427,19 @@ class MimiVentController extends ChangeNotifier {
   Future<void> switchProfile(TimingProfile next) async {
     if (next == profile) return;
     if (busy) throw StateError('操作正在执行，请稍后重试');
+    if (wifiActive) {
+      _beginPending('切换环境');
+      try {
+        await _wifiWrite(
+            '/api/auto', 'profile=${next.wireValue}&switchProfile=1&replace=1');
+        profile = next;
+        await _persistSelectedProfile();
+        await _refreshWifi();
+      } finally {
+        _endPending();
+      }
+      return;
+    }
     if (!ble.isConnected) throw StateError('蓝牙未连接，请先连接设备');
     await _perform((generation) async {
       // 固件收到 switch=1 后立即取消旧流程并切换到目标环境的自动感应。
@@ -999,7 +1492,68 @@ class MimiVentController extends ChangeNotifier {
     }, allowMismatch: true);
   }
 
+  void _beginPending(String label) {
+    pendingWifiAction = label;
+    _notifyIfAlive();
+  }
+
+  void _endPending() {
+    if (pendingWifiAction == null) return;
+    pendingWifiAction = null;
+    _notifyIfAlive();
+  }
+
+  void _applyWifiOptimistic({
+    required String mode,
+    required String phase,
+    required bool fan,
+    int? remainingMs,
+    int? durationMs,
+  }) {
+    // 控制已经在设备上成功；先撤掉 pending 遮罩，再同时更新状态，
+    // 避免遮罩仍显示“正在排风”时底层计时器已经跑起来。
+    pendingWifiAction = null;
+    final current = status;
+    if (current == null) {
+      _notifyIfAlive();
+      return;
+    }
+    final wasFanOn = current.fan;
+    if (fan) {
+      if (!wasFanOn || _fanRunStartedAt == null) {
+        _fanRunStartedAt = DateTime.now();
+      }
+    } else {
+      _fanRunStartedAt = null;
+    }
+    status = current.copyWith(
+      mode: mode,
+      phase: phase,
+      fan: fan,
+      remainingMs: remainingMs ?? 0,
+      durationMs: durationMs ?? 0,
+      phaseDurationMs: durationMs ?? 0,
+      // 停止/切换时不能回退到上一次采样的基础运行时长（否则会先闪 3 秒再归零）；
+      // 设备确认停止后，运行时长直接归零，后续状态采样再校正。
+      fanRunMs: 0,
+    );
+    // 乐观状态从收到 ACK 的这一刻开始插值，不能沿用上一次状态的时间戳。
+    _wifiStatusAt = DateTime.now();
+    _notifyIfAlive();
+  }
+
   Future<void> setAuto({bool replace = false}) async {
+    if (wifiActive) {
+      _beginPending('恢复自动感应');
+      try {
+        await _wifiWrite('/api/auto',
+            'profile=${profile.wireValue}&switchProfile=1&replace=${replace ? 1 : 0}');
+        _applyWifiOptimistic(mode: 'auto', phase: 'armed', fan: false);
+      } finally {
+        _endPending();
+      }
+      return;
+    }
     final generation = _sessionGeneration;
     await _perform((_) => repository.setAuto(profile, replace: replace));
     await refresh(expectedGeneration: generation);
@@ -1032,6 +1586,23 @@ class MimiVentController extends ChangeNotifier {
   }
 
   Future<void> exhaust({bool replace = false}) async {
+    if (wifiActive) {
+      final duration = settings?.manualExhaustMs ?? 180000;
+      _beginPending('启动临时排风');
+      try {
+        await _wifiWrite('/api/timed',
+            'profile=${profile.wireValue}&mode=on&replace=${replace ? 1 : 0}');
+        _applyWifiOptimistic(
+            mode: 'timed_on',
+            phase: 'exhausting',
+            fan: true,
+            remainingMs: duration,
+            durationMs: duration);
+      } finally {
+        _endPending();
+      }
+      return;
+    }
     await _perform((generation) async {
       await repository.startTimed(profile, replace: replace);
       await refresh(expectedGeneration: generation);
@@ -1039,6 +1610,23 @@ class MimiVentController extends ChangeNotifier {
   }
 
   Future<void> pause({bool replace = false}) async {
+    if (wifiActive) {
+      final duration = settings?.pauseMs ?? 600000;
+      _beginPending('启动临时暂停');
+      try {
+        await _wifiWrite('/api/timed',
+            'profile=${profile.wireValue}&mode=off&replace=${replace ? 1 : 0}');
+        _applyWifiOptimistic(
+            mode: 'timed_off',
+            phase: 'armed',
+            fan: false,
+            remainingMs: duration,
+            durationMs: duration);
+      } finally {
+        _endPending();
+      }
+      return;
+    }
     await _perform((generation) async {
       await repository.startPause(profile, replace: replace);
       await refresh(expectedGeneration: generation);
@@ -1046,6 +1634,23 @@ class MimiVentController extends ChangeNotifier {
   }
 
   Future<void> forceTest({bool replace = false}) async {
+    if (wifiActive) {
+      final duration = settings?.manualExhaustMs ?? 180000;
+      _beginPending('启动强制排风');
+      try {
+        await _wifiWrite('/api/test-fan',
+            'profile=${profile.wireValue}&replace=${replace ? 1 : 0}');
+        _applyWifiOptimistic(
+            mode: 'force_test',
+            phase: 'exhausting',
+            fan: true,
+            remainingMs: duration,
+            durationMs: duration);
+      } finally {
+        _endPending();
+      }
+      return;
+    }
     await _perform((generation) async {
       await repository.startFanTest(profile, replace: replace);
       await refresh(expectedGeneration: generation);
@@ -1054,6 +1659,19 @@ class MimiVentController extends ChangeNotifier {
 
   /// 把持续关闭的 prepare/confirm 两条命令绑定在同一 BLE 会话中。
   Future<void> enableLockOff({bool replace = false}) async {
+    if (wifiActive) {
+      _beginPending('持续关闭');
+      try {
+        await _wifiWrite('/api/lockoff',
+            'profile=${profile.wireValue}&stage=prepare&replace=${replace ? 1 : 0}');
+        await _wifiWrite('/api/lockoff',
+            'profile=${profile.wireValue}&stage=confirm&replace=${replace ? 1 : 0}');
+        _applyWifiOptimistic(mode: 'lock_off', phase: 'armed', fan: false);
+      } finally {
+        _endPending();
+      }
+      return;
+    }
     await _perform((generation) async {
       await repository.armLockOff(profile);
       if (!_isCurrentSession(generation, profile)) {
@@ -1067,6 +1685,11 @@ class MimiVentController extends ChangeNotifier {
   Future<void> cancelLockOff() async {
     if (_offlineViewing || !connected) {
       throw StateError('离线模式无法操作设备，请先连接蓝牙');
+    }
+    if (wifiActive) {
+      await _wifiWrite('/api/lockoff',
+          'profile=${profile.wireValue}&stage=cancel&replace=1');
+      return;
     }
     await repository.cancelLockOff(profile);
   }
@@ -1119,6 +1742,13 @@ class MimiVentController extends ChangeNotifier {
     final draft = draftSettings;
     if (draft == null) throw StateError('时序配置尚未加载');
     if (!profileMatches) throw StateError('环境与设备不一致，请先切换到正确环境');
+    if (wifiActive) {
+      await _wifiWrite('/api/settings',
+          'profile=${profile.wireValue}&${draft.toFormBody()}');
+      settings = draft;
+      _settingsDraft = _settingsDraft?.markSaved(draft);
+      return;
+    }
     await _perform((generation) async {
       await repository.saveSettings(profile, draft);
       if (!_isCurrentSession(generation, profile)) {
@@ -1177,9 +1807,16 @@ class MimiVentController extends ChangeNotifier {
     _connectAttempt++;
     _sessionGeneration++;
     _pollTimer?.cancel();
+    _wifiHealthTimer?.cancel();
     ble.removeListener(_onBleChanged);
     unawaited(closeBluetoothSession());
     ble.dispose();
     super.dispose();
   }
+}
+
+class _WifiSerialTask {
+  _WifiSerialTask(this.run, this.priority);
+  final Future<void> Function() run;
+  final bool priority;
 }

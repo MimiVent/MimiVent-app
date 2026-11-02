@@ -11,6 +11,7 @@ import 'package:permission_handler/permission_handler.dart';
 import '../app/app_identity.dart';
 import '../core/diagnostics/app_diagnostics_log.dart';
 import 'ble_disconnect_gate.dart';
+import 'ble_gatt_scheduler.dart';
 import 'ble_request_queue.dart';
 import 'ble_protocol.dart';
 import '../transport/device_transport.dart';
@@ -37,13 +38,19 @@ class MimiVentBleManager extends ChangeNotifier
   BluetoothCharacteristic? _otaControl;
   BluetoothCharacteristic? _otaData;
   BluetoothCharacteristic? _otaStatus;
+  BluetoothCharacteristic? _wifiCommand;
+  BluetoothCharacteristic? _wifiResponse;
   StreamSubscription<List<int>>? _otaSubscription;
+  StreamSubscription<List<int>>? _wifiNotificationSubscription;
+  bool _wifiNotificationsEnabled = false;
+  bool _wifiBondedForSession = false;
   final StreamController<String> _otaEvents = StreamController.broadcast();
   Completer<DeviceResponse>? _pendingResponse;
   final List<List<int>> _responseChunks = [];
   final BleResponseDecoder _decoder = BleResponseDecoder();
   final LegacyBleResponseDecoder _legacyDecoder = LegacyBleResponseDecoder();
   final BleRequestQueue _requestQueue = BleRequestQueue();
+  final BleGattScheduler _gattScheduler = BleGattScheduler();
   int _connectionAttempt = 0;
   int _scanAttempt = 0;
   int _nextRequestId = 1;
@@ -106,6 +113,8 @@ class MimiVentBleManager extends ChangeNotifier
   bool get isScanning => connectionStatus == BleConnectionStatus.scanning;
   @override
   String? get connectedDeviceId => _device?.remoteId.str;
+  bool get hasWifiProvisioningService =>
+      _wifiCommand != null && _wifiResponse != null;
 
   @override
   Future<String> readOtaStatus() async {
@@ -141,7 +150,7 @@ class MimiVentBleManager extends ChangeNotifier
               identical(characteristic, _otaStatus) ||
               identical(characteristic, _otaData)) &&
           isConnected,
-      send: operation,
+      send: () => _gattScheduler.run(operation),
     );
     if (result is BleRequestSucceeded<T>) return result.value;
     final rejected = result as BleRequestRejected<T>;
@@ -256,6 +265,33 @@ class MimiVentBleManager extends ChangeNotifier
     return serviceAdvertised || name == BleProtocol.deviceName.toLowerCase();
   }
 
+  Future<void> _connectWithRetry(BluetoothDevice device, int attempt) async {
+    for (var retry = 0;; retry++) {
+      try {
+        await device.connect(
+          timeout: const Duration(seconds: 20),
+          // flutter_blue_plus 默认 mtu=512，会在 connect() 内隐式请求 MTU，
+          // Android 上可能卡满其 15 秒默认超时；MTU 在下方单独协商并可降级。
+          mtu: null,
+          autoConnect: false,
+        );
+        return;
+      } catch (error) {
+        final text = error.toString();
+        final transient = text.contains('android-code: 133') ||
+            text.contains('android-code: 129') ||
+            text.contains('android-code: 62');
+        if (!transient || retry >= 2) rethrow;
+        if (attempt != _connectionAttempt) throw Exception('连接已取消');
+        try {
+          await device.disconnect();
+        } catch (_) {}
+        await Future<void>.delayed(Duration(milliseconds: 800 * (retry + 1)));
+        if (attempt != _connectionAttempt) throw Exception('连接已取消');
+      }
+    }
+  }
+
   Future<void> connect(BluetoothDevice device) async {
     if (_device != null || _connectionSubscription != null) {
       await disconnect();
@@ -263,6 +299,7 @@ class MimiVentBleManager extends ChangeNotifier
     // 使当前扫描回调和 finally 失效，避免扫描结束把 connecting 改回 disconnected。
     ++_scanAttempt;
     final attempt = ++_connectionAttempt;
+    final connectStopwatch = Stopwatch()..start();
     _device = device;
     lastError = null;
     connectionStatus = BleConnectionStatus.connecting;
@@ -295,33 +332,42 @@ class MimiVentBleManager extends ChangeNotifier
           _notifyIfAlive();
         }
       });
-      await device.connect(
-          timeout: const Duration(seconds: 12), autoConnect: false);
-      diagnostics?.info('BLE 连接', 'GATT 连接完成，开始发现服务');
+      await _connectWithRetry(device, attempt);
+      diagnostics?.info(
+        'BLE 连接',
+        'GATT 链路完成，耗时=${connectStopwatch.elapsedMilliseconds}ms；开始发现服务',
+      );
       if (attempt != _connectionAttempt) throw Exception('连接已取消');
       negotiatedMtu = device.mtuNow;
       if (Platform.isAndroid) {
         try {
-          negotiatedMtu = await device.requestMtu(247);
-          diagnostics?.info('BLE MTU', '协商完成，实际 MTU=$negotiatedMtu');
+          negotiatedMtu = await device.requestMtu(247, timeout: 5);
+          diagnostics?.info(
+            'BLE MTU',
+            '协商完成，实际 MTU=$negotiatedMtu；累计耗时=${connectStopwatch.elapsedMilliseconds}ms',
+          );
         } catch (error) {
           negotiatedMtu = device.mtuNow;
           diagnostics?.warning(
-              'BLE MTU', '协商失败，使用系统实际 MTU=$negotiatedMtu：$error');
+            'BLE MTU',
+            '协商失败，使用系统实际 MTU=$negotiatedMtu；累计耗时=${connectStopwatch.elapsedMilliseconds}ms：$error',
+          );
         }
       } else {
         diagnostics?.info('BLE MTU', '系统协商 MTU=$negotiatedMtu');
       }
       if (attempt != _connectionAttempt) throw Exception('连接已取消');
-      final services = await device.discoverServices();
+      final services = await _gattScheduler.run(device.discoverServices);
       diagnostics?.info('BLE GATT',
-          '发现 ${services.length} 个服务：${services.map((item) => item.uuid.str).join(', ')}');
+          '发现 ${services.length} 个服务，累计耗时=${connectStopwatch.elapsedMilliseconds}ms：${services.map((item) => item.uuid.str).join(', ')}');
       if (attempt != _connectionAttempt) throw Exception('连接已取消');
       BluetoothService? service;
+      BluetoothService? wifiService;
       for (final item in services) {
         if (item.uuid.str.toLowerCase() == BleProtocol.serviceUuid) {
           service = item;
-          break;
+        } else if (item.uuid.str.toLowerCase() == BleProtocol.wifiServiceUuid) {
+          wifiService = item;
         }
       }
       if (service == null) {
@@ -335,13 +381,29 @@ class MimiVentBleManager extends ChangeNotifier
         if (uuid == BleProtocol.otaDataUuid) _otaData = characteristic;
         if (uuid == BleProtocol.otaStatusUuid) _otaStatus = characteristic;
       }
+      if (wifiService != null) {
+        for (final characteristic in wifiService.characteristics) {
+          final uuid = characteristic.uuid.str.toLowerCase();
+          if (uuid == BleProtocol.wifiCommandUuid)
+            _wifiCommand = characteristic;
+          if (uuid == BleProtocol.wifiResponseUuid) {
+            _wifiResponse = characteristic;
+          }
+        }
+        if (_wifiCommand == null || _wifiResponse == null) {
+          _wifiCommand = null;
+          _wifiResponse = null;
+          diagnostics?.warning('WiFi 配网', '设备 WiFi GATT 服务特征不完整，已隐藏配网能力');
+        }
+      }
       if (_command == null || _response == null) {
         throw Exception('未找到 ${AppIdentity.productName} 命令或响应通道');
       }
       String greeting = '';
       for (var attempt = 0; attempt < 3 && greeting.isEmpty; attempt++) {
         try {
-          greeting = ascii.decode(await _response!.read(), allowInvalid: true);
+          greeting = ascii.decode(await _gattScheduler.run(_response!.read),
+              allowInvalid: true);
         } catch (error) {
           diagnostics?.warning('BLE 协议', '读取协议问候失败 ${attempt + 1}/3：$error');
           if (attempt < 2) {
@@ -365,43 +427,16 @@ class MimiVentBleManager extends ChangeNotifier
       }
       diagnostics?.info(
           'BLE 协议', '识别到 ${_legacyControlProtocol ? 'v1 旧协议' : 'v2'} 控制通道');
-      await _response!.setNotifyValue(true);
+      await _gattScheduler.run(() => _response!.setNotifyValue(true));
       diagnostics?.info('BLE GATT',
           '已启用响应通知；command=${_command!.uuid.str}, response=${_response!.uuid.str}');
-      _notificationSubscription = _response!.onValueReceived.listen((bytes) {
-        try {
-          // 只把当前请求期间的通知交给解码器；完成响应后到达的冗余尾包不属于下一请求。
-          if (_pendingResponse == null) return;
-          _responseChunks.add(List.of(bytes));
-          DeviceResponse? result;
-          if (_legacyControlProtocol) {
-            result = _legacyDecoder.add(bytes);
-          } else if (_protocolProbePending &&
-              _looksLikeLegacyResponsePrefix(_responseChunks)) {
-            result = _legacyDecoder.add(bytes);
-            if (result != null) {
-              _legacyControlProtocol = true;
-              _protocolProbePending = false;
-              diagnostics?.info('BLE 协议', '首个响应符合 v1 状态行格式，切换到兼容控制通道');
-            }
-          } else {
-            _protocolProbePending = false;
-            result = _decoder.add(bytes, expectedRequestId: _activeRequestId);
-          }
-          if (result != null && _pendingResponse?.isCompleted == false) {
-            _pendingResponse!.complete(result);
-            _pendingResponse = null;
-          }
-        } catch (error) {
-          if (_pendingResponse?.isCompleted == false) {
-            _pendingResponse!.completeError(error);
-            _pendingResponse = null;
-          }
-        }
-      });
+      _notificationSubscription =
+          _response!.onValueReceived.listen(_handleResponseNotification);
+      // WiFi 配网响应通知在 requestWifi() 完成配对后单独启用；
+      // 这里不订阅，避免同一通知被两个 listener 重复处理。
       if (_otaControl != null && _otaData != null && _otaStatus != null) {
         try {
-          await _otaStatus!.setNotifyValue(true);
+          await _gattScheduler.run(() => _otaStatus!.setNotifyValue(true));
           _otaSubscription =
               _otaStatus!.onValueReceived.listen(_handleOtaNotification);
           diagnostics?.info('BLE OTA', '升级通道就绪');
@@ -418,10 +453,10 @@ class MimiVentBleManager extends ChangeNotifier
       connectionStatus = BleConnectionStatus.connected;
       diagnostics?.info('蓝牙连接', 'GATT 服务与命令通道已就绪');
       _notifyIfAlive();
-    } catch (error) {
+    } catch (error, stackTrace) {
       if (attempt == _connectionAttempt) {
         lastError = '连接失败：$error';
-        diagnostics?.error('蓝牙连接', lastError!);
+        diagnostics?.error('蓝牙连接', lastError!, stackTrace: stackTrace);
         connectionStatus = BleConnectionStatus.disconnected;
         await _connectionSubscription?.cancel();
         _connectionSubscription = null;
@@ -432,6 +467,37 @@ class MimiVentBleManager extends ChangeNotifier
         _notifyIfAlive();
       }
       rethrow;
+    }
+  }
+
+  void _handleResponseNotification(List<int> bytes) {
+    try {
+      if (_pendingResponse == null) return;
+      _responseChunks.add(List.of(bytes));
+      DeviceResponse? result;
+      if (_legacyControlProtocol) {
+        result = _legacyDecoder.add(bytes);
+      } else if (_protocolProbePending &&
+          _looksLikeLegacyResponsePrefix(_responseChunks)) {
+        result = _legacyDecoder.add(bytes);
+        if (result != null) {
+          _legacyControlProtocol = true;
+          _protocolProbePending = false;
+          diagnostics?.info('BLE 协议', '首个响应符合 v1 状态行格式，切换到兼容控制通道');
+        }
+      } else {
+        _protocolProbePending = false;
+        result = _decoder.add(bytes, expectedRequestId: _activeRequestId);
+      }
+      if (result != null && _pendingResponse?.isCompleted == false) {
+        _pendingResponse!.complete(result);
+        _pendingResponse = null;
+      }
+    } catch (error) {
+      if (_pendingResponse?.isCompleted == false) {
+        _pendingResponse!.completeError(error);
+        _pendingResponse = null;
+      }
     }
   }
 
@@ -458,9 +524,11 @@ class MimiVentBleManager extends ChangeNotifier
     // 断开前的 ScanResult 仍包含旧 BluetoothDevice；不能把它显示成新扫描结果。
     _scanResults.clear();
     await _notificationSubscription?.cancel();
+    await _wifiNotificationSubscription?.cancel();
     await _otaSubscription?.cancel();
     await _connectionSubscription?.cancel();
     _notificationSubscription = null;
+    _wifiNotificationSubscription = null;
     _otaSubscription = null;
     _connectionSubscription = null;
     _device = null;
@@ -475,11 +543,17 @@ class MimiVentBleManager extends ChangeNotifier
     _otaControl = null;
     _otaData = null;
     _otaStatus = null;
+    _wifiCommand = null;
+    _wifiResponse = null;
+    _wifiNotificationsEnabled = false;
+    _wifiBondedForSession = false;
     _legacyControlProtocol = false;
     _protocolProbePending = false;
     _legacyDecoder.reset();
     _notificationSubscription?.cancel();
     _notificationSubscription = null;
+    unawaited(_wifiNotificationSubscription?.cancel());
+    _wifiNotificationSubscription = null;
     unawaited(_otaSubscription?.cancel());
     _otaSubscription = null;
     _device = null;
@@ -993,7 +1067,8 @@ class MimiVentBleManager extends ChangeNotifier
     final frame = encodeOtaDataFrame(offset, payload);
     final nextOffset = offset + payload.length;
     final ackFuture = waitForAck ? _waitForOtaAck(nextOffset, total) : null;
-    await characteristic.write(frame, withoutResponse: true);
+    await _gattScheduler
+        .run(() => characteristic.write(frame, withoutResponse: true));
     if (ackFuture != null) await ackFuture;
     return nextOffset;
   }
@@ -1071,7 +1146,79 @@ class MimiVentBleManager extends ChangeNotifier
       path: path,
       query: query,
       body: body,
+      rawPacket: null,
     );
+  }
+
+  /// 发送 WiFi 配网服务的 JSON 请求；首次调用会触发 Android 系统配对流程。
+  Future<DeviceResponse> requestWifi(Map<String, dynamic> envelope) async {
+    final attempt = _connectionAttempt;
+    final device = _device;
+    final command = _wifiCommand;
+    final response = _wifiResponse;
+    if (!isConnected || device == null) {
+      throw StateError('蓝牙未连接，请先连接设备后重试');
+    }
+    if (command == null || response == null) {
+      throw StateError('当前固件没有可用的 WiFi 配网服务');
+    }
+    if (!Platform.isAndroid) {
+      throw UnsupportedError('WiFi 配网目前仅支持 Android 系统蓝牙配对流程');
+    }
+    final operation = envelope['op']?.toString() ?? 'unknown';
+    if (operation != 'wifi.status' &&
+        (operation != 'wifi.scan' || envelope['start'] == true)) {
+      diagnostics?.info('WiFi 配网', '开始操作 ' + operation);
+    }
+    try {
+      if (!_wifiBondedForSession) {
+        await device.createBond(timeout: 120);
+        _wifiBondedForSession = true;
+      }
+      if (!_wifiNotificationsEnabled) {
+        await _gattScheduler.run(() => response.setNotifyValue(true));
+        _wifiNotificationSubscription =
+            response.onValueReceived.listen(_handleResponseNotification);
+        _wifiNotificationsEnabled = true;
+      }
+    } catch (error) {
+      diagnostics?.warning('WiFi 配网', '系统蓝牙配对未完成：$error');
+      throw StateError('系统蓝牙配对未完成，请完成系统配对弹窗后重试');
+    }
+    final result = await _runQueuedRequest(
+      attempt: attempt,
+      device: device,
+      command: command,
+      method: 'WIFI',
+      path: '/wifi',
+      query: const {},
+      body: '',
+      rawPacket: jsonEncode(envelope),
+    );
+    if (operation == 'wifi.scan') {
+      try {
+        final decoded = jsonDecode(result.body);
+        if (decoded is Map<String, dynamic>) {
+          final networks = decoded['networks'];
+          final total = decoded['total'];
+          final error = decoded['error'];
+          final start = envelope['start'] == true;
+          final state = decoded['state']?.toString() ?? 'unknown';
+          if (start || state != 'scanning') {
+            diagnostics?.info(
+              'WiFi 扫描',
+              'HTTP ${result.statusCode} state=$state'
+                  '${total is num ? ' total=${total.toInt()}' : ''}'
+                  '${networks is List ? ' networks=${networks.length}' : ''}'
+                  '${error == null ? '' : ' error=$error'}',
+            );
+          }
+        }
+      } catch (error) {
+        diagnostics?.warning('WiFi 扫描', '无法解析设备扫描响应：$error');
+      }
+    }
+    return result;
   }
 
   Future<DeviceResponse> _runQueuedRequest({
@@ -1082,6 +1229,7 @@ class MimiVentBleManager extends ChangeNotifier
     required String path,
     required Map<String, String> query,
     required String body,
+    String? rawPacket,
   }) async {
     final result = await _requestQueue.enqueue(
       isSessionCurrent: () =>
@@ -1089,7 +1237,7 @@ class MimiVentBleManager extends ChangeNotifier
           device != null &&
           identical(device, _device) &&
           command != null &&
-          identical(command, _command) &&
+          (identical(command, _command) || identical(command, _wifiCommand)) &&
           isConnected,
       send: () => _sendRequest(
         attempt: attempt,
@@ -1099,6 +1247,7 @@ class MimiVentBleManager extends ChangeNotifier
         path: path,
         query: query,
         body: body,
+        rawPacket: rawPacket,
       ),
     );
     if (result is BleRequestSucceeded<DeviceResponse>) return result.value;
@@ -1116,6 +1265,7 @@ class MimiVentBleManager extends ChangeNotifier
     required String path,
     required Map<String, String> query,
     required String body,
+    String? rawPacket,
   }) async {
     if (isOtaExclusive && !(method == 'GET' && path == '/api/status')) {
       throw const DeviceBusyException('设备正在执行 OTA，普通控制请求已暂停');
@@ -1128,25 +1278,32 @@ class MimiVentBleManager extends ChangeNotifier
         device == null ||
         !identical(device, _device) ||
         command == null ||
-        !identical(command, _command)) {
+        (!identical(command, _command) && !identical(command, _wifiCommand))) {
       throw Exception('请先连接 ${AppIdentity.productName}');
     }
-    final packet = BleProtocol.encodeRequest(
-      method: method,
-      path: path,
-      profile: query['profile'] ?? 'production',
-      mode: query['mode'] ?? '',
-      stage: query['stage'] ?? '',
-      replace: query['replace'] == '1',
-      switchProfile: query['switch'] == '1',
-      body: body,
-    );
+    if (rawPacket != null && _legacyControlProtocol) {
+      throw StateError('当前旧固件不支持 WiFi 配网协议');
+    }
+    final packet = rawPacket ??
+        BleProtocol.encodeRequest(
+          method: method,
+          path: path,
+          profile: query['profile'] ?? 'production',
+          mode: query['mode'] ?? '',
+          stage: query['stage'] ?? '',
+          replace: query['replace'] == '1',
+          switchProfile: query['switch'] == '1',
+          body: body,
+        );
     final requestId = _nextRequestId;
     _nextRequestId = _nextRequestId >= 0xFFFF ? 1 : _nextRequestId + 1;
     _activeRequestId = requestId;
     final packetBytes = _legacyControlProtocol
         ? utf8.encode(packet)
         : BleProtocol.frameRequest(requestId, packet);
+    if (rawPacket != null && packetBytes.length >= 512) {
+      throw StateError('WiFi 配网请求超过 BLE 特征值上限');
+    }
     _responseChunks.clear();
     _decoder.reset();
     _legacyDecoder.reset();
@@ -1159,11 +1316,17 @@ class MimiVentBleManager extends ChangeNotifier
     _pendingResponse = pending;
     final stopwatch = Stopwatch()..start();
     try {
-      // 固件命令特征支持 Write With Response；每次只发送一条请求。
-      await command.write(packetBytes, withoutResponse: false);
+      // Android 在上一条 GATT 操作刚完成时可能短暂返回 REQUEST_BUSY。
+      // 该错误表示本次写入未入队，短暂退避后重试不会重复执行设备命令。
+      await _writeCommandWithBusyRetry(
+        command,
+        packetBytes,
+        allowLongWrite: rawPacket != null,
+      );
+      final expectedCommand = method == 'WIFI' ? _wifiCommand : _command;
       if (attempt != _connectionAttempt ||
           !identical(device, _device) ||
-          !identical(command, _command)) {
+          !identical(command, expectedCommand)) {
         throw StateError('蓝牙会话已变化，请重新发起请求');
       }
       final response = await pending.future.timeout(const Duration(seconds: 6));
@@ -1171,8 +1334,9 @@ class MimiVentBleManager extends ChangeNotifier
       stopwatch.stop();
       // 高频状态轮询默认交给 API 层记录状态变化摘要，避免每秒保存一整笔原始报文。
       // 用户可在设备日志页短时开启原始抓取，排查分包或协议异常。
-      if (!_isRoutineStatusPoll(method, path) ||
-          (diagnostics?.isCapturingStatusPolls ?? false)) {
+      if (rawPacket == null &&
+          (!_isRoutineStatusPoll(method, path) ||
+              (diagnostics?.isCapturingStatusPolls ?? false))) {
         diagnostics?.info(
           'BLE 事务',
           '耗时=${stopwatch.elapsedMilliseconds}ms\n'
@@ -1185,13 +1349,14 @@ class MimiVentBleManager extends ChangeNotifier
       return response;
     } on TimeoutException {
       stopwatch.stop();
-      diagnostics?.error(
-        'BLE 超时',
-        '耗时=${stopwatch.elapsedMilliseconds}ms\n'
-            'TX ${packetBytes.length}B requestId=$requestId ${_visibleText(packet)}\n'
-            'RX ${_responseChunks.fold<int>(0, (sum, chunk) => sum + chunk.length)}B '
-            'chunks=${_responseChunks.length} mtu=$negotiatedMtu hex=${_formatChunks(_responseChunks)}',
-      );
+      if (rawPacket == null)
+        diagnostics?.error(
+          'BLE 超时',
+          '耗时=${stopwatch.elapsedMilliseconds}ms\n'
+              'TX ${packetBytes.length}B requestId=$requestId ${_visibleText(packet)}\n'
+              'RX ${_responseChunks.fold<int>(0, (sum, chunk) => sum + chunk.length)}B '
+              'chunks=${_responseChunks.length} mtu=$negotiatedMtu hex=${_formatChunks(_responseChunks)}',
+        );
       _consecutiveRequestTimeouts++;
       if (_consecutiveRequestTimeouts >= 3 &&
           !isOtaExclusive &&
@@ -1203,16 +1368,18 @@ class MimiVentBleManager extends ChangeNotifier
       throw Exception(_consecutiveRequestTimeouts >= 3 && !isOtaExclusive
           ? '蓝牙请求连续超时，已断开连接；请重新连接设备'
           : '蓝牙请求超时，请稍后重试');
-    } catch (error) {
+    } catch (error, stackTrace) {
       stopwatch.stop();
-      diagnostics?.error(
-        'BLE 请求异常',
-        '耗时=${stopwatch.elapsedMilliseconds}ms\n'
-            'TX ${packetBytes.length}B requestId=$requestId ${_visibleText(packet)}\n'
-            'RX ${_responseChunks.fold<int>(0, (sum, chunk) => sum + chunk.length)}B '
-            'chunks=${_responseChunks.length} mtu=$negotiatedMtu hex=${_formatChunks(_responseChunks)}\n'
-            'error=$error',
-      );
+      if (rawPacket == null)
+        diagnostics?.error(
+          'BLE 请求异常',
+          '耗时=${stopwatch.elapsedMilliseconds}ms\n'
+              'TX ${packetBytes.length}B requestId=$requestId ${_visibleText(packet)}\n'
+              'RX ${_responseChunks.fold<int>(0, (sum, chunk) => sum + chunk.length)}B '
+              'chunks=${_responseChunks.length} mtu=$negotiatedMtu hex=${_formatChunks(_responseChunks)}\n'
+              'error=$error',
+          stackTrace: stackTrace,
+        );
       if (_isLinkLossError(error)) {
         // 有些 Android GATT 写入会直接报“设备未连接”，却不发断开状态事件。
         // 主动清理会话，让控制页、导航和顶部连接指示同步进入离线状态。
@@ -1223,6 +1390,34 @@ class MimiVentBleManager extends ChangeNotifier
       rethrow;
     } finally {
       if (identical(_pendingResponse, pending)) _pendingResponse = null;
+    }
+  }
+
+  Future<void> _writeCommandWithBusyRetry(
+    BluetoothCharacteristic command,
+    List<int> bytes, {
+    required bool allowLongWrite,
+  }) async {
+    const backoff = [120, 250, 500];
+    for (var attempt = 0;; attempt++) {
+      try {
+        await _gattScheduler.run(() => command.write(
+              bytes,
+              withoutResponse: false,
+              allowLongWrite: allowLongWrite,
+            ));
+        return;
+      } catch (error) {
+        final message = error.toString().toLowerCase();
+        final isGattBusy = message.contains('gatt_write_request_busy');
+        if (!isGattBusy || attempt >= backoff.length) rethrow;
+        final delay = backoff[attempt];
+        diagnostics?.warning(
+          'BLE GATT',
+          '设备暂忙，${delay}ms 后重试控制写入（${attempt + 1}/${backoff.length}）',
+        );
+        await Future<void>.delayed(Duration(milliseconds: delay));
+      }
     }
   }
 
@@ -1267,6 +1462,7 @@ class MimiVentBleManager extends ChangeNotifier
     _disposed = true;
     _scanSubscription?.cancel();
     _notificationSubscription?.cancel();
+    _wifiNotificationSubscription?.cancel();
     _connectionSubscription?.cancel();
     unawaited(_otaSubscription?.cancel());
     _otaEvents.close();

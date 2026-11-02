@@ -302,8 +302,10 @@ extension _DashboardStatusCards on _DashboardPageState {
                           letterSpacing: -.6),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis),
-                  const SizedBox(height: 5),
-                  Text(DeviceStatusPresenter.phaseDescription(status),
+                  const SizedBox(height: 10),
+                  Text(
+                      DeviceStatusPresenter.phaseDescription(status,
+                          remainingMs: c.displayRemainingMs),
                       style: const TextStyle(
                           color: MimiVentColors.muted, fontSize: 13, height: 1),
                       maxLines: 1,
@@ -343,11 +345,15 @@ extension _DashboardStatusCards on _DashboardPageState {
                         ? MimiVentColors.amber
                         : MimiVentColors.mint),
                 const SizedBox(width: 7),
-                _pill(DeviceStatusPresenter.phaseTagText(status),
+                _pill(
+                    DeviceStatusPresenter.phaseTagText(status,
+                        remainingMs: c.displayRemainingMs),
                     MimiVentColors.muted),
                 const SizedBox(width: 7),
-                _pill('蓝牙在线', MimiVentColors.mint,
-                    icon: Icons.bluetooth_connected_rounded),
+                _pill(c.wifiActive ? 'WiFi 在线' : '蓝牙在线', MimiVentColors.mint,
+                    icon: c.wifiActive
+                        ? Icons.wifi
+                        : Icons.bluetooth_connected_rounded),
               ],
             ),
           ),
@@ -433,7 +439,8 @@ extension _DashboardStatusCards on _DashboardPageState {
       );
 
   Widget _runtimeCard(DeviceStatus status) {
-    final config = DeviceStatusPresenter.runtimeDescription(status);
+    final config = DeviceStatusPresenter.runtimeDescription(status,
+        remainingMs: c.displayRemainingMs);
     return Container(
       padding: const EdgeInsets.fromLTRB(16, 14, 16, 13),
       decoration: BoxDecoration(

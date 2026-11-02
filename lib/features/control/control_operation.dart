@@ -21,7 +21,8 @@ bool hasInterruptibleOperation(DeviceStatus? status) {
   if (status == null) return false;
   return const {'timed_on', 'timed_off', 'force_test'}.contains(status.mode) ||
       (status.mode == 'auto' &&
-          const {'clear_confirm', 'exhausting'}.contains(status.phase));
+          const {'occupied', 'clear_confirm', 'exhausting'}
+              .contains(status.phase));
 }
 
 /// 可展示的操作结果，页面据此给出一致反馈，不把业务失败伪装为成功。

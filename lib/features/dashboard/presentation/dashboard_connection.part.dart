@@ -44,13 +44,20 @@ extension _DashboardConnectionSection on _DashboardPageState {
 
   Future<void> _openDiagnostics() => Navigator.of(context).push<void>(
         MaterialPageRoute(
-          builder: (_) => DiagnosticsPage(log: widget.diagnostics),
+          builder: (_) =>
+              DiagnosticsPage(log: widget.diagnostics, controller: c),
         ),
       );
 
   Future<void> _openFirmwareUpdate() => Navigator.of(context).push<void>(
         MaterialPageRoute(
           builder: (_) => FirmwareUpdatePage(ble: c.ble),
+        ),
+      );
+
+  Future<void> _openWifiProvisioning() => Navigator.of(context).push<void>(
+        MaterialPageRoute(
+          builder: (_) => WifiProvisioningPage(ble: c.ble),
         ),
       );
 
@@ -116,7 +123,20 @@ extension _DashboardConnectionSection on _DashboardPageState {
   }
 
   void _syncDeviceUi() {
+    if (!mounted || ModalRoute.of(context)?.isCurrent == false) return;
     if (c.offlineViewing) return;
+    if (!_wifiPromptHandled &&
+        !_wifiPromptShowing &&
+        c.connected &&
+        c.status?.capabilities.contains('wifi.configure') == true &&
+        c.ble.hasWifiProvisioningService) {
+      _wifiPromptHandled = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && ModalRoute.of(context)?.isCurrent != false) {
+          unawaited(_maybeShowWifiPrompt());
+        }
+      });
+    }
     // App 启动时会自动开始扫描；检测到扫描状态后，首页自动打开搜索面板。
     if (!c.ble.isScanning) {
       // 一轮扫描结束后，后续新扫描可以再次自动打开搜索面板。
@@ -126,12 +146,53 @@ extension _DashboardConnectionSection on _DashboardPageState {
     if (!_scanSheetOpen && !_scanSheetDismissedDuringScan) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted &&
+            ModalRoute.of(context)?.isCurrent != false &&
             c.ble.isScanning &&
             !_scanSheetOpen &&
             !_scanSheetDismissedDuringScan) {
           unawaited(_scanAndConnect());
         }
       });
+    }
+  }
+
+  Future<void> _maybeShowWifiPrompt() async {
+    if (_wifiPromptShowing ||
+        !c.connected ||
+        !c.ble.hasWifiProvisioningService) {
+      return;
+    }
+    final deviceId = c.ble.connectedDeviceId;
+    if (deviceId == null) return;
+    _wifiPromptShowing = true;
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      final key = 'mimivent.wifi.provision_prompt_dismissed.' + deviceId;
+      if (preferences.getBool(key) == true || !mounted) return;
+      final configure = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('配置 WiFi？'),
+          content: const Text('配置并绑定后可通过局域网读取状态，控制和升级仍使用蓝牙。首次配网会弹出系统蓝牙配对确认。'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('稍后'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('立即配置'),
+            ),
+          ],
+        ),
+      );
+      if (!mounted || configure == null) return;
+      await preferences.setBool(key, true);
+      if (configure) await _openWifiProvisioning();
+    } catch (error) {
+      if (mounted) _toast('无法打开 WiFi 配网：' + error.toString());
+    } finally {
+      _wifiPromptShowing = false;
     }
   }
 
@@ -151,9 +212,15 @@ extension _DashboardConnectionSection on _DashboardPageState {
 
   void _toast(String message) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(message)));
+    try {
+      final messenger = ScaffoldMessenger.maybeOf(context);
+      if (messenger == null || !messenger.mounted) return;
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text(message)));
+    } catch (_) {
+      // 异步连接失败可能晚于路由退场；提示不可用时不再触发二次异常。
+    }
   }
 
   Future<bool> _confirm({
@@ -175,6 +242,7 @@ extension _DashboardConnectionSection on _DashboardPageState {
 
   Future<void> _scanAndConnect() async {
     if (_scanSheetOpen) return;
+    _connectionActionError = null;
     // 显式进入扫描面板代表用户希望查看这一轮扫描结果。
     _scanSheetDismissedDuringScan = false;
     _scanSheetOpen = true;
@@ -208,14 +276,15 @@ extension _DashboardConnectionSection on _DashboardPageState {
                       constraints: const BoxConstraints(maxWidth: 720),
                       child: SizedBox.expand(
                         child: Padding(
-                          padding: const EdgeInsets.fromLTRB(18, 8, 18, 12),
+                          padding: const EdgeInsets.fromLTRB(18, 0, 18, 10),
                           child: Column(
                             mainAxisSize: MainAxisSize.max,
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               Builder(builder: (context) {
                                 final presentation = connectionPresentation(
-                                  connected: c.ble.isConnected,
+                                  connected: c.ble.isConnected &&
+                                      _connectionActionError == null,
                                   connecting: _deviceConnectActionBusy ||
                                       c.ble.connectionStatus ==
                                           BleConnectionStatus.connecting,
@@ -225,28 +294,39 @@ extension _DashboardConnectionSection on _DashboardPageState {
                                     ConnectionPresentation.connecting;
                                 final isConnected = presentation ==
                                     ConnectionPresentation.connected;
+                                final connectionFailed =
+                                    _connectionActionError != null &&
+                                        !_deviceConnectActionBusy;
                                 final foundCount = c.ble.scanResults.length;
-                                final title = isConnecting
-                                    ? '正在连接设备'
-                                    : isConnected
-                                        ? '${AppIdentity.productName} 已连接'
-                                        : '搜索附近的 ${AppIdentity.productName}';
-                                final subtitle = isConnecting
-                                    ? '正在连接 ${c.ble.connectedName}，请稍候…'
-                                    : isConnected
-                                        ? '连接成功，正在打开控制面板。'
-                                        : foundCount == 1
-                                            ? '已发现 1 台 ${AppIdentity.productName}，点击下方按钮开始连接。'
-                                            : foundCount > 0
-                                                ? '扫描到 $foundCount 台设备，请选择您的设备。'
-                                                : c.ble.isScanning
-                                                    ? '正在搜索附近设备…'
-                                                    : '没有扫描到设备。请检查设备通电，或点击重新扫描。';
+                                final title = connectionFailed
+                                    ? (c.ble.isConnected
+                                        ? '设备已连接，但初始化失败'
+                                        : '蓝牙连接已断开')
+                                    : isConnecting
+                                        ? '正在连接设备'
+                                        : isConnected
+                                            ? '${AppIdentity.productName} 已连接'
+                                            : '搜索附近的 ${AppIdentity.productName}';
+                                final subtitle = connectionFailed
+                                    ? (c.ble.isConnected
+                                        ? '${_connectionActionError!}。可以点击设备重试连接。'
+                                        : '${_connectionActionError!}。请重新点击设备连接。')
+                                    : isConnecting
+                                        ? '正在连接 ${c.ble.connectedName}，请稍候…'
+                                        : isConnected
+                                            ? '连接成功，正在打开控制面板。'
+                                            : foundCount == 1
+                                                ? '已发现 1 台 ${AppIdentity.productName}，点击下方按钮开始连接。'
+                                                : foundCount > 0
+                                                    ? '扫描到 $foundCount 台设备，请选择您的设备。'
+                                                    : c.ble.isScanning
+                                                        ? '正在搜索附近设备…'
+                                                        : '没有扫描到设备。请检查设备通电，或点击重新扫描。';
                                 return Column(
                                   mainAxisSize: MainAxisSize.min,
                                   children: [
                                     SizedBox(
-                                      height: 48,
+                                      height: 34,
                                       child: Row(
                                         children: [
                                           const Spacer(),
@@ -255,12 +335,13 @@ extension _DashboardConnectionSection on _DashboardPageState {
                                             onPressed: isConnecting
                                                 ? null
                                                 : () => Navigator.pop(context),
-                                            icon:
-                                                const Icon(Icons.close_rounded),
+                                            icon: const Icon(
+                                                Icons.close_rounded,
+                                                size: 21),
                                             padding: EdgeInsets.zero,
                                             constraints:
                                                 const BoxConstraints.tightFor(
-                                                    width: 48, height: 48),
+                                                    width: 34, height: 34),
                                             visualDensity:
                                                 VisualDensity.compact,
                                           ),
@@ -546,17 +627,20 @@ extension _DashboardConnectionSection on _DashboardPageState {
     BuildContext modalContext,
     ScanResult result,
   ) async {
+    c.diagnostics?.info('蓝牙连接', '用户开始连接 ${result.device.remoteId.str}');
     try {
       if (mounted) {
         setState(() {
           _connectionRevealActive = true;
           _deviceConnectActionBusy = true;
+          _connectionActionError = null;
         });
       }
       await c.connect(result.device);
       if (!c.connected) {
         throw StateError(c.lastError ?? '设备连接已中断，请重新连接');
       }
+      c.diagnostics?.info('蓝牙连接', '控制器初始化完成，准备关闭搜索弹窗');
       if (!modalContext.mounted) return;
       final route = ModalRoute.of(modalContext);
       Navigator.pop(modalContext);
@@ -569,11 +653,16 @@ extension _DashboardConnectionSection on _DashboardPageState {
         });
       }
       _toast(c.lastError ?? '${AppIdentity.productName} 已连接');
-    } catch (error) {
+    } catch (error, stackTrace) {
+      c.diagnostics?.error('连接页面', error.toString(), stackTrace: stackTrace);
       if (mounted) {
         setState(() {
           _connectionRevealActive = false;
           _deviceConnectActionBusy = false;
+          _connectionActionError = error
+              .toString()
+              .replaceFirst('Bad state: ', '')
+              .replaceFirst('Exception: ', '');
         });
       }
       _toast(error.toString());

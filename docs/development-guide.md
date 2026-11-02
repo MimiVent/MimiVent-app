@@ -1,6 +1,6 @@
 # MimiVent App 开发维护指南
 
-本文说明常见改动应落在哪一层，以及改动后要核对哪些边界。项目当前是 Android BLE 控制端；Wi-Fi 扩展说明是架构方向，不代表 Wi-Fi 或其他平台已经实现。
+本文说明常见改动应落在哪一层，以及改动后要核对哪些边界。项目当前是 Android BLE/WiFi HTTPS 控制端，安全配网经 BLE 完成，OTA 仍只走 BLE；其他平台不属于当前交付。
 
 ## 日常修改流程
 
@@ -19,7 +19,7 @@ flutter test
 flutter build apk --debug
 ```
 
-项目使用的 `custom_3.22.0_harmony` SDK 如果缺少 `flutter_tester`，测试命令可能无法启动；不要因此修改依赖锁文件。可使用本机已配置的标准 Flutter SDK 运行测试，再回到项目 SDK 做静态分析和 Android 构建。完整环境与设备安装命令见 [README](../README.md)。
+项目使用的 `custom_3.22.0_harmony` SDK 如果缺少 `flutter_tester`，测试命令可能无法启动；不要因此修改依赖锁文件。可在隔离测试副本中使用本机标准 Flutter SDK 运行测试，避免改写主项目锁文件，再回到项目 SDK 做静态分析和 Android 构建。完整环境与设备安装命令见 [README](../README.md)。
 
 ## 常见改动对应的位置
 
@@ -36,7 +36,7 @@ flutter build apk --debug
 | 改时长选项或格式 | `lib/core/formatting/duration_formatter.dart` | 所有时间选择与展示复用同一组选项和格式化规则。 |
 | 改响应式断点 | `lib/core/layout/app_layout.dart` | 按窗口约束与字号缩放处理，不按具体手机型号写分支。 |
 | 改共用动画或弹窗协调 | `lib/shared/` | 共用组件只保留通用视觉/交互，不承载设备业务策略。 |
-| 增加诊断事件或日志展示 | `lib/core/diagnostics/app_diagnostics_log.dart`、`lib/features/diagnostics/` | 高频状态轮询默认记录状态变化及 30 秒摘要；必要时可短时开启原始状态抓取。不要记录 Wi‑Fi 凭证或未脱敏设备地址。日志上限为 300 条，持久化限频，存储失败不能影响控制流程。 |
+| 增加诊断事件或日志展示 | `lib/core/diagnostics/app_diagnostics_log.dart`、`lib/features/diagnostics/` | 高频状态轮询默认记录状态变化及 30 秒摘要；必要时可短时开启原始状态抓取。不要记录 Wi‑Fi 凭证或未脱敏设备地址。诊断页上限为 300 条；文件按日期及 1 MiB 切片，最多 10 个，存储失败不能影响控制流程。 |
 
 ## 新增控制操作
 
@@ -62,8 +62,8 @@ flutter build apk --debug
 
 - 新页面放入相应 `lib/features/<feature>/`；主 Dashboard 目前用 `IndexedStack` 保留控制与设置页面状态。新增导航时同时维护当前 Tab、断连行为、滚动状态与底部导航。
 - 一个 App 会话只保留一套 `MimiVentController` 和设备 Repository；不要在新页面内创建第二个 BLE 管理器或并行轮询。
-- 新传输方式应实现 Repository 能力并明确平台生命周期、权限和错误语义。接入 Wi-Fi 时需先决定连接选择、会话冲突和状态同步策略，再调整 App 装配；网页静态托管不等于设备 Wi-Fi API 已存在。
-- 当前工程只有 Android 平台工程，且当前设备通信只有 BLE。加入 iOS、鸿蒙、macOS、Windows 或 Wi-Fi 前，分别验证 Flutter 插件、原生权限和真实设备链路。
+- 新传输方式应实现 Repository 能力并明确平台生命周期、权限和错误语义。修改 WiFi 时须保持现有连接选择、租约、写请求去重及状态同步语义，网络实现集中在 `lib/features/wifi_control/`。
+- 当前交付平台为 Android，设备通信已支持 BLE 与 WiFi HTTPS。新增其他平台前分别验证插件、原生权限、安全存储和真实设备链路。
 
 ## 命名、注释与版本
 
