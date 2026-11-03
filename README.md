@@ -107,3 +107,7 @@ Android 优先写入应用专属外部目录，通常为：
 - `lib/core/diagnostics/`：本地诊断与文件日志。
 
 维护参考：[架构](docs/architecture.md)、[行为约定](docs/behavior-contract.md)、[开发指南](docs/development-guide.md)、[回归清单](docs/regression-checklist.md)。
+
+## License
+
+本项目使用 MIT License，见 [LICENSE](LICENSE)。

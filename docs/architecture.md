@@ -50,7 +50,7 @@ Dashboard presentation 采用 part 文件把一组紧密耦合的 State 辅助�
 1. `MimiVentApp` 创建唯一 `MimiVentController`，并连接 Flutter App 生命周期。
 2. 启动先探测本机 WiFi 绑定；成功则 `activateWifi` 进入主页 WiFi 控制，失败则延迟 6 秒再探测一次，仍未恢复才进入 BLE 扫描。
 3. `DeviceConnectionManager` 根据实际可用通道显示 `WiFi 控制`/`蓝牙控制`/`设备未连接`；BLE 断开回到 WiFi，WiFi 断开进入重试。
-4. `BackgroundBleLifecycle` 处理后台 30 秒宽限期；在宽限期内回前台保留 BLE，超时后释放连接，回前台重新扫描。
+4. `BackgroundBleLifecycle` 处理后台 10 分钟宽限期；在宽限期内回前台保留 BLE，超时后释放连接，回前台重新扫描。
 5. `MimiVentBleManager` 唯一拥有扫描订阅、设备连接、GATT 特征和 BLE 命令队列。
 6. `MimiVentApi` 以 BLE 请求承载固件 `/api/*` 路径、环境和模式参数。
 5. Controller 读取设备快照，绑定当前 BLE 会话、连接尝试与 App 环境。会话或环境变更后，过期响应不会继续触发后续读取，也不会覆盖当前 UI。
