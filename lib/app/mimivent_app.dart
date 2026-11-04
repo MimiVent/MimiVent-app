@@ -16,6 +16,7 @@ import '../features/wifi_control/wifi_binding_store.dart';
 import '../features/wifi_control/wifi_read_transport.dart';
 import '../features/wifi_control/wifi_startup_probe.dart';
 import 'theme/mimivent_theme.dart';
+import '../shared/widgets/top_toast.dart';
 
 class MimiVentApp extends StatefulWidget {
   const MimiVentApp({super.key});
@@ -312,9 +313,7 @@ class _MimiVentAppState extends State<MimiVentApp> with WidgetsBindingObserver {
   void _showChannelMessage(String text) {
     final context = _navigatorKey.currentContext;
     if (context == null) return;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(text)));
+    TopToast.show(context, text);
   }
 
   Future<void> _openWifiControl() async {
@@ -330,14 +329,19 @@ class _MimiVentAppState extends State<MimiVentApp> with WidgetsBindingObserver {
       final deadline = DateTime.now().add(const Duration(seconds: 25));
       var waitingForLease = false;
       while (mounted) {
-        final snapshot = _wifiSnapshot ?? await probeWifiStartup();
+        Object? probeError;
+        final snapshot = _wifiSnapshot ??
+            await probeWifiStartup(onError: (error) => probeError = error);
         if (snapshot == null) {
           var hasActiveBinding = false;
           try {
             hasActiveBinding = (await WifiBindingStore().load())
                 .any((binding) => binding.state == 'active');
           } catch (_) {}
-          if (hasActiveBinding && DateTime.now().isBefore(deadline)) {
+          final failure = probeError;
+          final busy =
+              failure is WifiReadException && failure.code == 'WIFI_IN_USE';
+          if (busy && hasActiveBinding && DateTime.now().isBefore(deadline)) {
             if (!waitingForLease) {
               waitingForLease = true;
               _setGlobalLoading(true, label: '等待另一台手机释放 WiFi…');
@@ -345,8 +349,26 @@ class _MimiVentAppState extends State<MimiVentApp> with WidgetsBindingObserver {
             await Future<void>.delayed(const Duration(seconds: 2));
             continue;
           }
+          if (failure != null) {
+            diagnostics.warning('WiFi 切换', '探测失败：$failure');
+          }
+          if (failure is WifiReadException) {
+            final code = failure.code;
+            if (code == 'BINDING_INVALID' || code == 'AUTH_REQUIRED') {
+              _showChannelMessage('本机 WiFi 绑定已失效，请通过蓝牙重新绑定本机');
+            } else if (code == 'PERMISSION_DENIED') {
+              _showChannelMessage('设备拒绝了本机 WiFi 绑定，请通过蓝牙重新绑定');
+            } else if (code == 'WIFI_IN_USE') {
+              _showChannelMessage('WiFi 仍被另一台手机占用，请继续使用蓝牙或稍后重试');
+            } else if (code == 'OTA_BUSY') {
+              _showChannelMessage('设备正在升级，暂时不能切换 WiFi');
+            } else {
+              _showChannelMessage('WiFi 连接失败：${failure.message}');
+            }
+            return;
+          }
           _showChannelMessage(hasActiveBinding
-              ? 'WiFi 仍被另一台手机占用，请继续使用蓝牙或稍后重试'
+              ? 'WiFi 连接失败，请检查本机 WiFi 绑定或重新绑定'
               : '没有可用的 WiFi 绑定，请先通过蓝牙完成配网并绑定本机');
           return;
         }
@@ -368,7 +390,21 @@ class _MimiVentAppState extends State<MimiVentApp> with WidgetsBindingObserver {
             _showChannelMessage('WiFi 仍被另一台手机占用，请继续使用蓝牙或稍后重试');
             return;
           }
-          rethrow;
+          if (error.code == 'BINDING_INVALID' ||
+              error.code == 'AUTH_REQUIRED') {
+            _showChannelMessage('本机 WiFi 绑定已失效，请通过蓝牙重新绑定本机');
+            return;
+          }
+          if (error.code == 'PERMISSION_DENIED') {
+            _showChannelMessage('设备拒绝了本机 WiFi 绑定，请通过蓝牙重新绑定');
+            return;
+          }
+          if (error.code == 'OTA_BUSY') {
+            _showChannelMessage('设备正在升级，暂时不能切换 WiFi');
+            return;
+          }
+          _showChannelMessage('WiFi 连接失败：${error.message}');
+          return;
         }
         if (!mounted) return;
         setState(() {

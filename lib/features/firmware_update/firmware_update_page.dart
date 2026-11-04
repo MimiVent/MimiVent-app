@@ -15,6 +15,7 @@ import 'ota_task_controller.dart';
 import 'ota_package.dart';
 import 'ota_delta_package.dart';
 import 'ota_task_snapshot.dart';
+import '../../shared/widgets/top_toast.dart';
 
 /// BLE 固件升级界面。镜像只经由独立 OTA GATT 通道传输，不占用控制 RPC。
 class FirmwareUpdatePage extends StatefulWidget {
@@ -62,6 +63,7 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
   bool _abandonInProgress = false;
   bool _exitDialogOpen = false;
   bool _installCommandPending = false;
+  bool _successNotified = false;
   bool _legacyProtocolActive = false;
   bool _backgroundPausePending = false;
   bool _statusRefreshInFlight = false;
@@ -187,6 +189,7 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
       }
       if (!mounted) return;
       var clearCompletedSelection = false;
+      var completedNow = false;
       setState(() {
         _deviceStatus = status;
         _otaCapabilities = capabilities;
@@ -219,6 +222,7 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
             _installCommandPending = false;
             _completedImageIdentity = installedIdentity;
             clearCompletedSelection = _firmware != null;
+            completedNow = true;
           }
         } else if (lacksOtaEndpoint) {
           _status = capabilities == 'ERROR|USB_BOOTSTRAP_REQUIRED'
@@ -242,6 +246,7 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
             _status = '旧协议升级后已重连核验运行版本与固件 SHA-256，升级完成';
             _installCommandPending = false;
             clearCompletedSelection = _firmware != null;
+            completedNow = true;
           } else if (taskSnapshot.phase == OtaTaskPhase.installing) {
             _status = '设备已提交安装，正在启动目标固件；重连核验中';
           } else {
@@ -259,6 +264,11 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
       if (clearCompletedSelection) {
         await _clearSelectedFirmware(afterSuccessfulInstall: true);
       }
+      if (completedNow && !_successNotified) {
+        _successNotified = true;
+        if (mounted) TopToast.show(context, '固件升级成功');
+        await _clearInstalledRecordAfterSuccess();
+      }
     } catch (error) {
       if (mounted) setState(() => _status = '读取设备状态失败：$error');
     } finally {
@@ -267,6 +277,26 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
         _statusRefreshPending = false;
         unawaited(_refreshStatus());
       }
+    }
+  }
+
+  Future<void> _clearInstalledRecordAfterSuccess() async {
+    final taskId = _taskSnapshot.taskId ?? _taskId;
+    if (taskId == null) return;
+    try {
+      await _taskController.abandon(taskId: taskId);
+      _taskId = _createTaskId();
+      await _taskController.saveTaskId(_taskId!);
+      await _taskController.clearInstallIntent();
+      _installCommandPending = false;
+      if (mounted) {
+        setState(() {
+          _deviceStatus = 'IDLE';
+          _status = '升级成功，已清除设备升级记录';
+        });
+      }
+    } catch (_) {
+      // 记录清除失败不影响已经确认成功的升级；保留手动清除入口。
     }
   }
 
@@ -642,6 +672,7 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
   }
 
   Future<void> _startUpdateOnce() async {
+    _successNotified = false;
     final firmware = _firmware;
     final path = firmware?.path;
     final imageDigest = _firmwareSha256;

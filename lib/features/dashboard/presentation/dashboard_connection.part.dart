@@ -213,11 +213,7 @@ extension _DashboardConnectionSection on _DashboardPageState {
   void _toast(String message) {
     if (!mounted) return;
     try {
-      final messenger = ScaffoldMessenger.maybeOf(context);
-      if (messenger == null || !messenger.mounted) return;
-      messenger
-        ..hideCurrentSnackBar()
-        ..showSnackBar(SnackBar(content: Text(message)));
+      TopToast.show(context, message);
     } catch (_) {
       // 异步连接失败可能晚于路由退场；提示不可用时不再触发二次异常。
     }

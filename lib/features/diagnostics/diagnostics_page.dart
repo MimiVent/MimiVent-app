@@ -5,6 +5,7 @@ import '../../app/theme/mimivent_theme.dart';
 import '../../core/diagnostics/app_diagnostics_log.dart';
 import '../../data/mimivent_controller.dart';
 import '../wifi_control/wifi_control_page.dart';
+import '../../shared/widgets/top_toast.dart';
 
 /// 显示可在断开蓝牙时读取的本地 BLE 与设备接口事务记录。
 class DiagnosticsPage extends StatelessWidget {
@@ -115,9 +116,7 @@ class DiagnosticsPage extends StatelessWidget {
   Future<void> _copyLogs(BuildContext context) async {
     await Clipboard.setData(ClipboardData(text: log.exportText()));
     if (!context.mounted) return;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(const SnackBar(content: Text('日志已复制')));
+    TopToast.show(context, '日志已复制');
   }
 
   Future<void> _confirmClear(BuildContext context) async {

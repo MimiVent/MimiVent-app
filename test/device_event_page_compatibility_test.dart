@@ -40,4 +40,30 @@ void main() {
     expect(page.start, 1700000000);
     expect(page.end, 1700003600);
   });
+
+  test('preserves compressed activity trigger count on paged events', () {
+    final page = DeviceEventPage.fromJson(
+      {
+        'events': [
+          {
+            'id': 7,
+            'time': 1700000000,
+            'kind': 'activity',
+            'state': 'complete',
+            'durationSeconds': 90,
+            'triggerCount': 4,
+          }
+        ],
+        'offset': 0,
+        'nextOffset': 1,
+        'total': 1,
+        'hasMore': false,
+      },
+      requestedStart: 1700000000,
+      requestedEnd: 1700003600,
+    );
+
+    expect(page.events.single.triggerCount, 4);
+    expect(page.events.single.toJson()['triggerCount'], 4);
+  });
 }

@@ -102,7 +102,7 @@ class WifiBindingController extends ChangeNotifier {
       throw WifiReadException(
           code,
           const {
-                'BINDINGS_FULL': '设备已绑定两台客户端，请通过蓝牙管理绑定，或清除设备端全部绑定后重试',
+                'BINDINGS_FULL': '设备已绑定三台客户端，请通过蓝牙管理绑定，或清除设备端全部绑定后重试',
                 'WIFI_STORAGE_LOW': '设备存储余量不足，暂不能建立新绑定，请先完成设备维护',
                 'BIND_BUSY': '另一个绑定任务尚未结束，请稍后重试',
                 'BIND_WINDOW_CLOSED': '绑定窗口已关闭，请重新点击绑定',
@@ -466,7 +466,7 @@ class WifiBindingController extends ChangeNotifier {
         secureStoreReady = true;
       });
 
-  /// 清除设备端全部 WiFi 授权；用于旧手机丢失/卸载后，2 个槽位被占满的恢复。
+  /// 清除设备端全部 WiFi 授权；用于旧手机丢失/卸载后，3 个槽位被占满的恢复。
   Future<void> resetDeviceBindings() => run(() async {
         final network = await request('wifi.status');
         final device = network['deviceId'];

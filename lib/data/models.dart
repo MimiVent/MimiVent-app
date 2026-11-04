@@ -101,6 +101,7 @@ class DeviceEvent {
     required this.state,
     required this.durationSeconds,
     this.id,
+    this.triggerCount = 0,
   });
 
   final int? id;
@@ -108,6 +109,7 @@ class DeviceEvent {
   final String kind;
   final String state;
   final int durationSeconds;
+  final int triggerCount;
 
   factory DeviceEvent.fromJson(Map<String, dynamic> json) {
     final time = json['time'];
@@ -115,11 +117,13 @@ class DeviceEvent {
     final state = json['state'];
     final duration = json['durationSeconds'];
     final id = json['id'];
+    final triggerCount = json['triggerCount'];
     if (time is! num ||
         kind is! String ||
         state is! String ||
         duration is! num ||
-        (id != null && id is! num)) {
+        (id != null && id is! num) ||
+        (triggerCount != null && triggerCount is! num)) {
       throw const FormatException('设备事件字段缺失或类型无效');
     }
     if (time < 0 ||
@@ -128,6 +132,10 @@ class DeviceEvent {
         duration > 0xFFFFFFFF ||
         time != time.toInt() ||
         duration != duration.toInt() ||
+        (triggerCount is num &&
+            (triggerCount < 0 ||
+                triggerCount > 0xFFFF ||
+                triggerCount != triggerCount.toInt())) ||
         (id is num && (id < 1 || id > 0xFFFFFFFF || id != id.toInt()))) {
       throw const FormatException('设备事件数值超出协议范围');
     }
@@ -137,6 +145,7 @@ class DeviceEvent {
       kind: kind,
       state: state,
       durationSeconds: duration.toInt(),
+      triggerCount: triggerCount is num ? triggerCount.toInt() : 0,
     );
   }
 
@@ -146,6 +155,7 @@ class DeviceEvent {
         'kind': kind,
         'state': state,
         'durationSeconds': durationSeconds,
+        if (triggerCount > 0) 'triggerCount': triggerCount,
       };
 }
 

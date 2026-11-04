@@ -20,6 +20,7 @@ import '../../../app/theme/mimivent_theme.dart';
 import '../../../shared/presentation/mimi_vent_dialogs.dart';
 import '../../../shared/presentation/modal_coordinator.dart';
 import '../../../shared/widgets/device_animations.dart';
+import '../../../shared/widgets/top_toast.dart';
 import '../../../shared/widgets/ble_signal_indicator.dart';
 import '../../connection/connection_presentation.dart';
 import '../../../data/device_connection_manager.dart';
@@ -456,19 +457,20 @@ class _DashboardPageState extends State<DashboardPage> {
                   Text('WiFi 配网'),
                 ]),
               ),
-            PopupMenuItem(
-              value: _TopBarMenuAction.firmwareUpdate,
-              enabled: c.connected && !c.offlineViewing,
-              child: Row(children: [
-                Icon(Icons.system_update_alt_rounded,
-                    color: c.connected
-                        ? MimiVentColors.mint
-                        : MimiVentColors.muted,
-                    size: 19),
-                const SizedBox(width: 11),
-                const Text('固件升级'),
-              ]),
-            ),
+            if (!c.wifiActive)
+              PopupMenuItem(
+                value: _TopBarMenuAction.firmwareUpdate,
+                enabled: c.connected && !c.offlineViewing,
+                child: Row(children: [
+                  Icon(Icons.system_update_alt_rounded,
+                      color: c.connected
+                          ? MimiVentColors.mint
+                          : MimiVentColors.muted,
+                      size: 19),
+                  const SizedBox(width: 11),
+                  const Text('固件升级'),
+                ]),
+              ),
             PopupMenuItem(
               value: _TopBarMenuAction.closeApp,
               enabled: !c.busy,

@@ -49,6 +49,9 @@ class _StatisticsPageState extends State<StatisticsPage> {
   Timer? _refreshTimer;
   Timer? _retryTimer;
   bool _loadingMoreEvents = false;
+  bool _loadingSelectedIntervalEvents = false;
+  bool _selectedIntervalEventsIncomplete = false;
+  int _selectedIntervalGeneration = 0;
   bool _refreshEnabled = false;
   Map<String, dynamic>? _yesterdayData;
   String? _yesterdayDataDay;
@@ -127,6 +130,7 @@ class _StatisticsPageState extends State<StatisticsPage> {
         !widget.controller.offlineViewing &&
         supportsEventPages &&
         notification.metrics.extentAfter < 180 &&
+        !_loadingSelectedIntervalEvents &&
         !_loadingMoreEvents &&
         widget.controller.statisticsHasMoreEventsFor(_range.wireValue)) {
       _loadMoreEvents();
@@ -136,11 +140,102 @@ class _StatisticsPageState extends State<StatisticsPage> {
   }
 
   Future<void> _loadMoreEvents() async {
+    if (_loadingSelectedIntervalEvents) return;
     setState(() => _loadingMoreEvents = true);
     try {
       await widget.controller.loadMoreStatisticsEvents(_range.wireValue);
     } finally {
       if (mounted) setState(() => _loadingMoreEvents = false);
+    }
+  }
+
+  void _clearSelectedChartPoint() {
+    if (!mounted ||
+        (_selectedChartIndex == null && !_loadingSelectedIntervalEvents)) {
+      return;
+    }
+    _selectedIntervalGeneration++;
+    setState(() {
+      _selectedChartIndex = null;
+      _loadingSelectedIntervalEvents = false;
+      _selectedIntervalEventsIncomplete = false;
+    });
+  }
+
+  void _selectChartPoint(int index, List<_ChartPoint> points) {
+    if (_selectedChartIndex == index) {
+      _clearSelectedChartPoint();
+      return;
+    }
+    final generation = ++_selectedIntervalGeneration;
+    final point = points[index];
+    setState(() {
+      _selectedChartIndex = index;
+      _selectedIntervalEventsIncomplete = false;
+    });
+    if (_range == _StatisticsRange.today ||
+        _range == _StatisticsRange.yesterday) {
+      if (_canSynchronize) {
+        unawaited(_loadSelectedIntervalEvents(point, generation));
+      } else if (widget.controller
+          .statisticsHasMoreEventsFor(_range.wireValue)) {
+        setState(() => _selectedIntervalEventsIncomplete = true);
+      }
+    } else if (widget.controller.statisticsHasMoreEventsFor(_range.wireValue)) {
+      setState(() => _selectedIntervalEventsIncomplete = true);
+    }
+  }
+
+  Future<void> _loadSelectedIntervalEvents(
+      _ChartPoint point, int generation) async {
+    final start = point.startAt;
+    if (start == null || !_canSynchronize) return;
+    if (_loadingMoreEvents) {
+      if (mounted && generation == _selectedIntervalGeneration) {
+        setState(() => _selectedIntervalEventsIncomplete = true);
+      }
+      return;
+    }
+
+    setState(() {
+      _loadingSelectedIntervalEvents = true;
+      _selectedIntervalEventsIncomplete = false;
+    });
+    var covered = false;
+    try {
+      // 统计摘要首屏最多带 32 条事件；继续按设备游标翻页，直到覆盖所选时段。
+      for (var page = 0; page < 20; page++) {
+        if (!mounted || generation != _selectedIntervalGeneration) return;
+        final data = widget.controller.statisticsFor(_range.wireValue);
+        final rawEvents = data?['events'];
+        final List<Map> events = rawEvents is List
+            ? rawEvents.whereType<Map>().toList()
+            : const <Map>[];
+        final intervalStart = start.millisecondsSinceEpoch ~/ 1000;
+        covered = events.any((event) {
+          final value = event['time'];
+          return value is num && value.toInt() <= intervalStart;
+        });
+        if (covered ||
+            !widget.controller.statisticsHasMoreEventsFor(_range.wireValue)) {
+          break;
+        }
+        final countBefore = events.length;
+        await widget.controller.loadMoreStatisticsEvents(_range.wireValue);
+        final updated = widget.controller.statisticsFor(_range.wireValue);
+        final updatedEvents = updated?['events'];
+        final countAfter = updatedEvents is List ? updatedEvents.length : 0;
+        if (countAfter <= countBefore) break;
+      }
+    } finally {
+      if (mounted && generation == _selectedIntervalGeneration) {
+        final remains =
+            widget.controller.statisticsHasMoreEventsFor(_range.wireValue);
+        setState(() {
+          _loadingSelectedIntervalEvents = false;
+          _selectedIntervalEventsIncomplete = remains && !covered;
+        });
+      }
     }
   }
 
@@ -400,6 +495,9 @@ class _StatisticsPageState extends State<StatisticsPage> {
                     setState(() {
                       _range = range;
                       _selectedChartIndex = null;
+                      _selectedIntervalGeneration++;
+                      _loadingSelectedIntervalEvents = false;
+                      _selectedIntervalEventsIncomplete = false;
                       _loadingMoreEvents = false;
                     });
                     unawaited(_loadStatistics());
@@ -662,75 +760,359 @@ class _StatisticsPageState extends State<StatisticsPage> {
               const SizedBox(width: 5),
               const Text('风机运行',
                   style: TextStyle(color: MimiVentColors.muted, fontSize: 9)),
+              const SizedBox(width: 10),
+              Container(
+                width: 7,
+                height: 7,
+                decoration: const BoxDecoration(
+                    color: MimiVentColors.amber, shape: BoxShape.circle),
+              ),
+              const SizedBox(width: 5),
+              const Text('感应跨度',
+                  style: TextStyle(color: MimiVentColors.muted, fontSize: 9)),
             ],
           ),
           const SizedBox(height: 8),
-          SizedBox(
-            height: 30,
-            child: selectedPoint == null
-                ? const Text(
-                    '点击图表查看该时段排风时长',
-                    style: TextStyle(
-                        color: MimiVentColors.muted, fontSize: 10, height: 1.4),
-                  )
-                : Row(
-                    children: [
-                      Expanded(
-                        child: Text(
-                          selectedPoint.intervalLabel,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                              color: MimiVentColors.muted, fontSize: 10),
+          TapRegion(
+            onTapOutside: (_) => _clearSelectedChartPoint(),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                SizedBox(
+                  height: 30,
+                  child: selectedPoint == null
+                      ? const Text(
+                          '点击图表查看该时段排风与感应跨度',
+                          style: TextStyle(
+                              color: MimiVentColors.muted,
+                              fontSize: 10,
+                              height: 1.4),
+                        )
+                      : Align(
+                          alignment: Alignment.centerRight,
+                          child: Text.rich(
+                            TextSpan(children: [
+                              TextSpan(
+                                text: '${selectedPoint.intervalLabel}  ',
+                                style: const TextStyle(
+                                    color: MimiVentColors.muted,
+                                    fontWeight: FontWeight.w500),
+                              ),
+                              TextSpan(
+                                text:
+                                    '排风 ${_formatStatisticMinutes(selectedPoint.minutes)}',
+                                style:
+                                    const TextStyle(color: MimiVentColors.mint),
+                              ),
+                              const TextSpan(
+                                  text: ' · ',
+                                  style:
+                                      TextStyle(color: MimiVentColors.muted)),
+                              TextSpan(
+                                text:
+                                    '感应 ${_formatStatisticMinutes(selectedPoint.activityMinutes)}',
+                                style: const TextStyle(
+                                    color: MimiVentColors.amber),
+                              ),
+                            ]),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            textAlign: TextAlign.end,
+                            style: const TextStyle(
+                                fontSize: 10, fontWeight: FontWeight.w700),
+                          ),
                         ),
-                      ),
-                      const SizedBox(width: 8),
-                      Text(
-                        '${_formatMinutes(selectedPoint.minutes)} 分钟',
-                        style: const TextStyle(
-                            color: MimiVentColors.mint,
-                            fontSize: 11,
-                            fontWeight: FontWeight.w700),
-                      ),
-                    ],
+                ),
+                SizedBox(
+                  height: 180,
+                  child: LayoutBuilder(
+                    builder: (context, constraints) {
+                      final chartSize = Size(constraints.maxWidth, 180);
+                      return GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTapDown: (details) {
+                          const leftInset = _StatisticsChartPainter.leftInset;
+                          final plotWidth = chartSize.width - leftInset - 5;
+                          final x = details.localPosition.dx - leftInset;
+                          if (plotWidth <= 0 || x < 0 || x > plotWidth) {
+                            _clearSelectedChartPoint();
+                            return;
+                          }
+                          final index = (x / plotWidth * view.chart.length)
+                              .floor()
+                              .clamp(0, view.chart.length - 1);
+                          _selectChartPoint(index, view.chart);
+                        },
+                        child: CustomPaint(
+                          size: chartSize,
+                          painter: _StatisticsChartPainter(
+                            points: view.chart,
+                            maxValue: view.maxChartValue,
+                            selectedIndex: selectedIndex,
+                          ),
+                        ),
+                      );
+                    },
                   ),
-          ),
-          SizedBox(
-            height: 168,
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                final chartSize = Size(constraints.maxWidth, 168);
-                return GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTapDown: (details) {
-                    const leftInset = _StatisticsChartPainter.leftInset;
-                    final plotWidth = chartSize.width - leftInset - 5;
-                    final x = details.localPosition.dx - leftInset;
-                    if (plotWidth <= 0 || x < 0 || x > plotWidth) return;
-                    final index = (x / plotWidth * view.chart.length)
-                        .floor()
-                        .clamp(0, view.chart.length - 1);
-                    setState(() => _selectedChartIndex = index);
-                  },
-                  child: CustomPaint(
-                    size: chartSize,
-                    painter: _StatisticsChartPainter(
-                      points: view.chart,
-                      maxValue: view.maxChartValue,
-                      selectedIndex: selectedIndex,
-                    ),
+                ),
+                if (selectedPoint != null &&
+                    (_range == _StatisticsRange.today ||
+                        _range == _StatisticsRange.yesterday))
+                  _selectedIntervalDetails(
+                    view.events,
+                    selectedPoint,
+                    loading: _loadingSelectedIntervalEvents,
+                    incomplete: _selectedIntervalEventsIncomplete,
                   ),
-                );
-              },
+              ],
             ),
           ),
           const SizedBox(height: 4),
-          Text(view.chartCaption,
+          Text('${view.chartCaption} · 感应跨度为活动首末触发时差',
               style: const TextStyle(color: MimiVentColors.muted, fontSize: 9)),
         ],
       ),
     );
   }
+
+  Widget _selectedIntervalDetails(List<_PreviewEvent> events, _ChartPoint point,
+      {required bool loading, required bool incomplete}) {
+    final start = point.startAt;
+    final end = point.endAt;
+    if (start == null || end == null) return const SizedBox.shrink();
+    bool overlaps(_PreviewEvent event) {
+      final eventStart = event.startAt;
+      final eventEnd = event.endAt;
+      if (eventStart == null || eventEnd == null) return false;
+      if (eventStart.isAtSameMomentAs(eventEnd)) {
+        return !eventStart.isBefore(start) && eventStart.isBefore(end);
+      }
+      return eventStart.isBefore(end) && eventEnd.isAfter(start);
+    }
+
+    final fanEvents = events
+        .where((event) => event.isFan && overlaps(event))
+        .toList()
+      ..sort((a, b) => a.startAt!.compareTo(b.startAt!));
+    final activityEvents = events
+        .where((event) => event.isActivity && overlaps(event))
+        .toList()
+      ..sort((a, b) => a.startAt!.compareTo(b.startAt!));
+
+    final settings = widget.controller.settings;
+    final pairWindow = Duration(
+      milliseconds: math.max(
+        settings?.leaveConfirmMs ?? 20000,
+        settings?.autoExhaustMs ?? 180000,
+      ),
+    );
+    final pendingFans = List<_PreviewEvent>.from(fanEvents);
+    final rows = <_DetailTimelineRow>[];
+    for (final activity in activityEvents) {
+      final activityStart = activity.startAt!;
+      final activityEnd = activity.endAt!;
+      _PreviewEvent? paired;
+      for (final fan in pendingFans) {
+        final fanStart = fan.startAt!;
+        if (fanStart
+            .isBefore(activityStart.subtract(const Duration(seconds: 30)))) {
+          continue;
+        }
+        if (fanStart.isAfter(activityEnd.add(pairWindow))) break;
+        paired = fan;
+        break;
+      }
+      if (paired != null) pendingFans.remove(paired);
+      rows.add(_DetailTimelineRow(activity: activity, fan: paired));
+    }
+    for (final fan in pendingFans) {
+      rows.add(_DetailTimelineRow(fan: fan));
+    }
+    rows.sort((a, b) => a.sortAt.compareTo(b.sortAt));
+
+    return Container(
+      width: double.infinity,
+      height: 238,
+      margin: const EdgeInsets.only(top: 5),
+      padding: const EdgeInsets.fromLTRB(9, 8, 9, 7),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(.035),
+        borderRadius: BorderRadius.circular(9),
+        border: Border.all(color: Colors.white.withOpacity(.07)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('${point.intervalLabel} 详情',
+              style: const TextStyle(
+                  color: Colors.white70,
+                  fontSize: 9,
+                  fontWeight: FontWeight.w600)),
+          const SizedBox(height: 4),
+          const Row(
+            children: [
+              Expanded(
+                flex: 5,
+                child: Row(children: [
+                  Icon(Icons.sensors_rounded,
+                      size: 12, color: MimiVentColors.amber),
+                  SizedBox(width: 4),
+                  Text('感应',
+                      style: TextStyle(
+                          color: MimiVentColors.amber,
+                          fontSize: 9,
+                          fontWeight: FontWeight.w700)),
+                ]),
+              ),
+              SizedBox(width: 8),
+              Expanded(
+                flex: 5,
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    Text('排风',
+                        style: TextStyle(
+                            color: MimiVentColors.mint,
+                            fontSize: 9,
+                            fontWeight: FontWeight.w700)),
+                    SizedBox(width: 4),
+                    Icon(Icons.air_rounded,
+                        size: 12, color: MimiVentColors.mint),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 2),
+          Expanded(
+            child: rows.isEmpty
+                ? const Center(
+                    child: Text('此时段暂无感应或排风记录',
+                        style: TextStyle(
+                            color: MimiVentColors.muted, fontSize: 9)),
+                  )
+                : ListView.builder(
+                    primary: false,
+                    padding: EdgeInsets.zero,
+                    itemCount: rows.length,
+                    itemBuilder: (context, index) => _timelineRow(rows[index]),
+                  ),
+          ),
+          if (loading || incomplete)
+            Padding(
+              padding: const EdgeInsets.only(top: 3),
+              child: Text(
+                loading ? '正在载入此时段完整记录…' : '当前连接未能载入全部记录',
+                style:
+                    const TextStyle(color: MimiVentColors.muted, fontSize: 9),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _timelineRow(_DetailTimelineRow row) => Padding(
+        padding: const EdgeInsets.only(bottom: 4),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+                flex: 5, child: _timelineCell(row.activity, alignEnd: false)),
+            const SizedBox(width: 8),
+            Expanded(flex: 5, child: _timelineCell(row.fan, alignEnd: true)),
+          ],
+        ),
+      );
+
+  Widget _timelineCell(_PreviewEvent? event, {required bool alignEnd}) {
+    if (event == null) {
+      return Container(
+        height: 48,
+        decoration: BoxDecoration(
+          color: Colors.white.withOpacity(.018),
+          borderRadius: BorderRadius.circular(7),
+        ),
+      );
+    }
+    final alignment =
+        alignEnd ? CrossAxisAlignment.end : CrossAxisAlignment.start;
+    final textAlign = alignEnd ? TextAlign.end : TextAlign.start;
+    return Container(
+      constraints: const BoxConstraints(minHeight: 48),
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(.035),
+        borderRadius: BorderRadius.circular(7),
+      ),
+      child: Column(
+        crossAxisAlignment: alignment,
+        children: [
+          Text(event.time,
+              textAlign: textAlign,
+              style: const TextStyle(color: MimiVentColors.muted, fontSize: 8)),
+          const SizedBox(height: 1),
+          Text(event.title,
+              textAlign: textAlign,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                  color: Colors.white70,
+                  fontSize: 9,
+                  fontWeight: FontWeight.w600)),
+          if (event.detail.isNotEmpty)
+            Text(event.detail,
+                textAlign: textAlign,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style:
+                    const TextStyle(color: MimiVentColors.muted, fontSize: 8)),
+        ],
+      ),
+    );
+  }
+
+  Widget _intervalDetailRow(
+          {required String title,
+          required String detail,
+          required Widget icon}) =>
+      Container(
+        width: double.infinity,
+        height: 52,
+        margin: const EdgeInsets.only(bottom: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+        decoration: BoxDecoration(
+          color: Colors.white.withOpacity(.035),
+          borderRadius: BorderRadius.circular(7),
+        ),
+        child: Row(
+          children: [
+            SizedBox(width: 20, child: Center(child: icon)),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 9,
+                          fontWeight: FontWeight.w600)),
+                  if (detail.isNotEmpty)
+                    Text(detail,
+                        maxLines: 2,
+                        overflow: TextOverflow.fade,
+                        style: const TextStyle(
+                            color: MimiVentColors.muted, fontSize: 8)),
+                ],
+              ),
+            ),
+          ],
+        ),
+      );
 
   Widget _dailyBreakdown(List<_DailySummary> days) => Container(
         padding: const EdgeInsets.fromLTRB(15, 14, 15, 5),
@@ -1083,22 +1465,30 @@ class _StatisticsPreview {
       _StatisticsRange.today => List.generate(
           24,
           (index) => _ChartPoint(index.toString().padLeft(2, '0'), 0,
-              intervalLabel: _hourInterval(index, 1))),
+              intervalLabel: _hourInterval(index, 1),
+              startAt: today.add(Duration(hours: index)),
+              endAt: today.add(Duration(hours: index + 1)))),
       _StatisticsRange.yesterday => List.generate(
           12,
           (index) => _ChartPoint((index * 2).toString().padLeft(2, '0'), 0,
-              intervalLabel: _hourInterval(index * 2, 2))),
+              intervalLabel: _hourInterval(index * 2, 2),
+              startAt: start.add(Duration(hours: index * 2)),
+              endAt: start.add(Duration(hours: (index + 1) * 2)))),
       _StatisticsRange.threeDays => List.generate(9, (index) {
           final day = start.add(Duration(days: index ~/ 3));
           final hour = (index % 3) * 8;
           return _ChartPoint(hour.toString().padLeft(2, '0'), 0,
               intervalLabel: '${_date(day)} ${_hourInterval(hour, 8)}',
+              startAt: day.add(Duration(hours: hour)),
+              endAt: day.add(Duration(hours: hour + 8)),
               groupLabel: _date(day));
         }),
       _StatisticsRange.sevenDays => List.generate(7, (index) {
           final date = start.add(Duration(days: index));
           return _ChartPoint('${date.month}/${date.day}', 0,
-              intervalLabel: '${_date(date)} 00:00–24:00');
+              intervalLabel: '${_date(date)} 00:00–24:00',
+              startAt: date,
+              endAt: date.add(const Duration(days: 1)));
         }),
     };
     final days = List.generate(dayCount, (index) {
@@ -1132,12 +1522,13 @@ class _StatisticsPreview {
       toiletAverageAvailable: false,
       chart: chart,
       maxChartValue: 0,
-      chartTitle: range == _StatisticsRange.sevenDays ? '每日排风时长' : '分时排风时长',
+      chartTitle:
+          range == _StatisticsRange.sevenDays ? '每日排风与感应跨度' : '分时排风与感应跨度',
       chartCaption: switch (range) {
-        _StatisticsRange.today => '每柱代表 1 小时 · 单位：分钟',
-        _StatisticsRange.yesterday => '每柱代表 2 小时 · 单位：分钟',
+        _StatisticsRange.today => '上方排风、下方感应跨度 · 每柱代表 1 小时',
+        _StatisticsRange.yesterday => '上方排风、下方感应跨度 · 每柱代表 2 小时',
         _StatisticsRange.threeDays => '每柱代表 8 小时 · 日期标在当天首个时段',
-        _StatisticsRange.sevenDays => '每柱代表 1 天 · 单位：分钟',
+        _StatisticsRange.sevenDays => '每柱代表 1 天 · 上方排风、下方感应跨度',
       },
       events: const [],
       rawEventCount: 0,
@@ -1173,6 +1564,14 @@ class _StatisticsPreview {
     final rawBuckets = json['bucketSeconds'];
     final bucketSeconds =
         rawBuckets is List ? rawBuckets.map(_intValue).toList() : <int>[];
+    final rawActivityBuckets = json['activityBucketSeconds'];
+    final activityBucketSeconds = rawActivityBuckets is List
+        ? rawActivityBuckets.map(_intValue).toList()
+        : <int>[];
+    final rawActivityCounts = json['activityBucketCount'];
+    final activityBucketCount = rawActivityCounts is List
+        ? rawActivityCounts.map(_intValue).toList()
+        : <int>[];
     final rawDays = json['days'];
     final dayRows = rawDays is List
         ? rawDays
@@ -1181,14 +1580,23 @@ class _StatisticsPreview {
             .toList()
         : <Map<String, dynamic>>[];
 
-    late final List<_ChartPoint> chart;
+    late List<_ChartPoint> chart;
     if (range == _StatisticsRange.today) {
       chart = List.generate(
           24,
           (index) => _ChartPoint(
                 index.toString().padLeft(2, '0'),
                 (index < bucketSeconds.length ? bucketSeconds[index] : 0) / 60,
+                activityMinutes: (index < activityBucketSeconds.length
+                        ? activityBucketSeconds[index]
+                        : 0) /
+                    60,
+                activityEventCount: index < activityBucketCount.length
+                    ? activityBucketCount[index]
+                    : 0,
                 intervalLabel: _hourInterval(index, 1),
+                startAt: today.add(Duration(hours: index)),
+                endAt: today.add(Duration(hours: index + 1)),
               ));
     } else if (range == _StatisticsRange.yesterday) {
       chart = List.generate(
@@ -1196,7 +1604,20 @@ class _StatisticsPreview {
           (index) => _ChartPoint(
                 (index * 2).toString().padLeft(2, '0'),
                 (index < bucketSeconds.length ? bucketSeconds[index] : 0) / 60,
+                activityMinutes: (index < activityBucketSeconds.length
+                        ? activityBucketSeconds[index]
+                        : 0) /
+                    60,
+                activityEventCount: index < activityBucketCount.length
+                    ? activityBucketCount[index]
+                    : 0,
                 intervalLabel: _hourInterval(index * 2, 2),
+                startAt: today
+                    .subtract(const Duration(days: 1))
+                    .add(Duration(hours: index * 2)),
+                endAt: today
+                    .subtract(const Duration(days: 1))
+                    .add(Duration(hours: (index + 1) * 2)),
               ));
     } else if (range == _StatisticsRange.threeDays) {
       final firstDate = today.subtract(const Duration(days: 2));
@@ -1205,7 +1626,16 @@ class _StatisticsPreview {
         final hour = (index % 3) * 8;
         return _ChartPoint(hour.toString().padLeft(2, '0'),
             (index < bucketSeconds.length ? bucketSeconds[index] : 0) / 60,
+            activityMinutes: (index < activityBucketSeconds.length
+                    ? activityBucketSeconds[index]
+                    : 0) /
+                60,
+            activityEventCount: index < activityBucketCount.length
+                ? activityBucketCount[index]
+                : 0,
             intervalLabel: '${_date(day)} ${_hourInterval(hour, 8)}',
+            startAt: day.add(Duration(hours: hour)),
+            endAt: day.add(Duration(hours: hour + 8)),
             groupLabel: _date(day));
       });
     } else {
@@ -1216,7 +1646,16 @@ class _StatisticsPreview {
             : firstDate.add(Duration(days: index));
         return _ChartPoint('${date.month}/${date.day}',
             (index < bucketSeconds.length ? bucketSeconds[index] : 0) / 60,
-            intervalLabel: '${_date(date)} 00:00–24:00');
+            activityMinutes: (index < activityBucketSeconds.length
+                    ? activityBucketSeconds[index]
+                    : 0) /
+                60,
+            activityEventCount: index < activityBucketCount.length
+                ? activityBucketCount[index]
+                : 0,
+            intervalLabel: '${_date(date)} 00:00–24:00',
+            startAt: date,
+            endAt: date.add(const Duration(days: 1)));
       });
     }
 
@@ -1226,6 +1665,8 @@ class _StatisticsPreview {
     var toiletDurationSamples = 0;
     var automaticEventsInPage = 0;
     final summaryToilet = json['toiletCount'];
+    final summaryToiletAverage = json['toiletAverageSeconds'];
+    final summaryToiletSamples = json['toiletSampleCount'];
     final rawEvents = json['events'];
     if (rawEvents is List) {
       // 设备接口按事件 ID 从新到旧返回；按 ID 还原记录顺序后再合并感应段。
@@ -1286,6 +1727,27 @@ class _StatisticsPreview {
         final kind = event['kind']?.toString() ?? 'automatic';
         final timestamp = _eventTimestamp(event);
         if (kind == 'activity') {
+          final encodedCount = _intValue(event['triggerCount']);
+          final encodedSpan = _intValue(event['durationSeconds']);
+          if (encodedCount > 1 || encodedSpan > 0) {
+            final count = encodedCount > 0 ? encodedCount : 1;
+            final rangeEnd = timestamp.add(Duration(seconds: encodedSpan));
+            final timeRange = _activityTimeRange(timestamp, rangeEnd);
+            chronologicalEvents.add(_PreviewEvent(
+              time: _clockTime(timestamp),
+              title: count == 1 ? '检测到活动' : '连续感应 · $count 次',
+              detail: count == 1
+                  ? '$timeRange · 单次'
+                  : '$timeRange · ${_activitySpanLabel(Duration(seconds: encodedSpan))}',
+              icon: const Icon(Icons.sensors_rounded,
+                  size: 16, color: MimiVentColors.amber),
+              startAt: timestamp,
+              endAt: rangeEnd,
+              isActivity: true,
+            ));
+            index++;
+            continue;
+          }
           var lastTimestamp = timestamp;
           var next = index + 1;
           while (next < ordered.length) {
@@ -1313,9 +1775,12 @@ class _StatisticsPreview {
                 ? '$timeRange · 单次触发'
                 : clockMovedBack
                     ? '$timeRange · 设备时间回退，跨度暂不可用'
-                    : '$timeRange · 活动跨度 ${_activitySpanLabel(span)}',
+                    : '$timeRange · ${_activitySpanLabel(span)}',
             icon: const Icon(Icons.sensors_rounded,
-                size: 16, color: MimiVentColors.mint),
+                size: 16, color: MimiVentColors.amber),
+            startAt: rangeStart,
+            endAt: rangeEnd,
+            isActivity: true,
           ));
           index = next;
           continue;
@@ -1369,14 +1834,14 @@ class _StatisticsPreview {
         };
         final icon = switch (kind) {
           'activity' => const Icon(Icons.sensors_rounded,
-              size: 16, color: MimiVentColors.mint),
+              size: 16, color: MimiVentColors.amber),
           // 自定义扇叶线稿视觉面积比 Material 图标大，事件列表中使用较小尺寸。
           'manual' => const FanRotorGlyph(color: MimiVentColors.mint, size: 6),
           'automatic' =>
-            const FanRotorGlyph(color: MimiVentColors.amber, size: 6),
+            const FanRotorGlyph(color: MimiVentColors.mint, size: 6),
           'resume' => const Icon(Icons.sensors_rounded,
               size: 16, color: MimiVentColors.mint),
-          'force' => Icon(Icons.science_outlined, size: 16, color: color),
+          'force' => const FanRotorGlyph(color: MimiVentColors.mint, size: 6),
           'pause' =>
             Icon(Icons.pause_circle_outline_rounded, size: 16, color: color),
           'locked_off' =>
@@ -1388,6 +1853,12 @@ class _StatisticsPreview {
           title: title,
           detail: detail,
           icon: icon,
+          startAt: timestamp,
+          endAt: timestamp.add(Duration(
+              seconds: state == 'active'
+                  ? math.max(0, now.difference(timestamp).inSeconds)
+                  : configuredDuration)),
+          isFan: kind == 'automatic' || kind == 'manual' || kind == 'force',
         ));
         index++;
       }
@@ -1404,8 +1875,34 @@ class _StatisticsPreview {
         runtimeMinutes: _intValue(day['runtimeSeconds']) ~/ 60,
       ));
     }
-    final maxValue = chart.fold<double>(
-        0, (max, point) => point.minutes > max ? point.minutes : max);
+    // 设备端 activityBucketSeconds 只保存已合并的活动段跨度；单次触发和旧记录
+    // 可能为 0。今日/昨日已有事件列表时，用同一活动段的首末触发时间补齐图表。
+    if (range == _StatisticsRange.today ||
+        range == _StatisticsRange.yesterday) {
+      final spans = <int, double>{};
+      for (final event in chronologicalEvents) {
+        final start = event.startAt;
+        final end = event.endAt;
+        if (!event.isActivity || start == null || end == null) continue;
+        final seconds = end.difference(start).inSeconds;
+        if (seconds <= 0) continue;
+        final local = start.toLocal();
+        final bucket =
+            range == _StatisticsRange.today ? local.hour : local.hour ~/ 2;
+        spans[bucket] = (spans[bucket] ?? 0) + seconds / 60;
+      }
+      chart = List.generate(chart.length, (index) {
+        final point = chart[index];
+        final computed = spans[index] ?? 0;
+        if (computed <= point.activityMinutes) return point;
+        return point.copyWith(activityMinutes: computed);
+      });
+    }
+
+    final maxValue = chart.fold<double>(0, (max, point) {
+      final pointMax = math.max(point.minutes, point.activityMinutes);
+      return pointMax > max ? pointMax : max;
+    });
     final rangeText = range == _StatisticsRange.today
         ? _date(today)
         : range == _StatisticsRange.yesterday
@@ -1429,18 +1926,25 @@ class _StatisticsPreview {
       toiletEstimateAvailable: summaryToilet is num ||
           automaticEventsInPage > 0 ||
           _intValue(json['automaticCount']) == 0,
-      toiletAverageSeconds: toiletDurationSamples > 0
-          ? (toiletDurationSeconds / toiletDurationSamples).round()
-          : null,
-      toiletAverageAvailable: toiletDurationSamples > 0,
+      toiletAverageSeconds: summaryToiletSamples is num &&
+              summaryToiletSamples > 0 &&
+              summaryToiletAverage is num
+          ? summaryToiletAverage.toInt()
+          : toiletDurationSamples > 0
+              ? (toiletDurationSeconds / toiletDurationSamples).round()
+              : null,
+      toiletAverageAvailable: summaryToiletSamples is num
+          ? summaryToiletSamples > 0
+          : toiletDurationSamples > 0,
       chart: chart,
       maxChartValue: _niceAxisMaximum(maxValue),
-      chartTitle: range == _StatisticsRange.sevenDays ? '每日排风时长' : '分时排风时长',
+      chartTitle:
+          range == _StatisticsRange.sevenDays ? '每日排风与感应跨度' : '分时排风与感应跨度',
       chartCaption: switch (range) {
-        _StatisticsRange.today => '每柱代表 1 小时 · 单位：分钟',
-        _StatisticsRange.yesterday => '每柱代表 2 小时 · 单位：分钟',
+        _StatisticsRange.today => '上方排风、下方感应跨度 · 每柱代表 1 小时',
+        _StatisticsRange.yesterday => '上方排风、下方感应跨度 · 每柱代表 2 小时',
         _StatisticsRange.threeDays => '每柱代表 8 小时 · 日期标在当天首个时段',
-        _StatisticsRange.sevenDays => '每柱代表 1 天 · 单位：分钟',
+        _StatisticsRange.sevenDays => '每柱代表 1 天 · 上方排风、下方感应跨度',
       },
       events: events,
       rawEventCount: rawEvents is List ? rawEvents.length : 0,
@@ -1468,8 +1972,8 @@ class _StatisticsPreview {
       '${_twoDigits(value.hour)}:${_twoDigits(value.minute)}:${_twoDigits(value.second)}';
 
   static String _activityTimeRange(DateTime start, DateTime end) {
-    final startText = _clockTime(start);
-    final endText = _clockTime(end);
+    final startText = '${_twoDigits(start.hour)}:${_twoDigits(start.minute)}';
+    final endText = '${_twoDigits(end.hour)}:${_twoDigits(end.minute)}';
     final sameDay = start.year == end.year &&
         start.month == end.month &&
         start.day == end.day;
@@ -1519,12 +2023,32 @@ class _StatisticsPreview {
 
 class _ChartPoint {
   const _ChartPoint(this.label, this.minutes,
-      {this.intervalLabel = '', this.groupLabel = ''});
+      {this.activityMinutes = 0,
+      this.activityEventCount = 0,
+      this.intervalLabel = '',
+      this.groupLabel = '',
+      this.startAt,
+      this.endAt});
 
   final String label;
   final double minutes;
+  final double activityMinutes;
+  final int activityEventCount;
   final String intervalLabel;
   final String groupLabel;
+  final DateTime? startAt;
+  final DateTime? endAt;
+
+  _ChartPoint copyWith({double? activityMinutes}) => _ChartPoint(
+        label,
+        minutes,
+        activityMinutes: activityMinutes ?? this.activityMinutes,
+        activityEventCount: activityEventCount,
+        intervalLabel: intervalLabel,
+        groupLabel: groupLabel,
+        startAt: startAt,
+        endAt: endAt,
+      );
 }
 
 class _StatisticsChartPainter extends CustomPainter {
@@ -1543,13 +2067,13 @@ class _StatisticsChartPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     if (points.isEmpty || size.width <= leftInset + 8) return;
     const top = 7.0;
-    const bottomInset = 37.0;
+    const bottomInset = 30.0;
     const rightInset = 4.0;
-    final baseline = size.height - bottomInset;
-    final plotHeight = baseline - top;
+    final bottom = size.height - bottomInset;
+    final baseline = (top + bottom) / 2;
+    final halfHeight = baseline - top;
     final plotWidth = size.width - leftInset - rightInset;
     final axisMaximum = maxValue > 0 ? maxValue : 1.0;
-    final tickStep = _niceStep(axisMaximum / 4);
     final gridPaint = Paint()
       ..color = Colors.white.withOpacity(.09)
       ..strokeWidth = 1;
@@ -1557,21 +2081,29 @@ class _StatisticsChartPainter extends CustomPainter {
       ..color = Colors.white.withOpacity(.2)
       ..strokeWidth = 1;
 
-    for (var value = 0.0;
-        value <= axisMaximum + tickStep * .01;
-        value += tickStep) {
-      final y = baseline - (value / axisMaximum) * plotHeight;
-      canvas.drawLine(Offset(leftInset, y), Offset(size.width - rightInset, y),
-          value == 0 ? axisPaint : gridPaint);
-      _drawText(
-        canvas,
-        _formatMinutes(value),
-        Offset(0, y - 6),
-        maxWidth: leftInset - 6,
-        align: TextAlign.right,
-        color: MimiVentColors.muted,
-        fontSize: 9,
-      );
+    for (var tick = 0; tick <= 4; tick++) {
+      final value = axisMaximum * tick / 4;
+      final distance = value / axisMaximum * halfHeight;
+      final upperY = baseline - distance;
+      final lowerY = baseline + distance;
+      canvas.drawLine(
+          Offset(leftInset, upperY),
+          Offset(size.width - rightInset, upperY),
+          tick == 0 ? axisPaint : gridPaint);
+      _drawText(canvas, _formatMinutes(value), Offset(0, upperY - 5),
+          maxWidth: leftInset - 6,
+          align: TextAlign.right,
+          color: MimiVentColors.muted,
+          fontSize: 8);
+      if (tick > 0) {
+        canvas.drawLine(Offset(leftInset, lowerY),
+            Offset(size.width - rightInset, lowerY), gridPaint);
+        _drawText(canvas, _formatMinutes(value), Offset(0, lowerY - 5),
+            maxWidth: leftInset - 6,
+            align: TextAlign.right,
+            color: MimiVentColors.muted,
+            fontSize: 8);
+      }
     }
     canvas.drawLine(
         const Offset(leftInset, top), Offset(leftInset, baseline), axisPaint);
@@ -1580,32 +2112,44 @@ class _StatisticsChartPainter extends CustomPainter {
     for (var index = 0; index < points.length; index++) {
       final point = points[index];
       final centerX = leftInset + slotWidth * (index + .5);
-      final value = point.minutes.clamp(0.0, axisMaximum);
-      final barHeight = (value / axisMaximum) * plotHeight;
+      final fanHeight =
+          (point.minutes.clamp(0.0, axisMaximum) / axisMaximum) * halfHeight;
+      final scaledActivityHeight =
+          (point.activityMinutes.clamp(0.0, axisMaximum) / axisMaximum) *
+              halfHeight;
+      final activityHeight =
+          scaledActivityHeight > 0 ? math.max(2.5, scaledActivityHeight) : 0.0;
       if (index == selectedIndex) {
         final highlight = Paint()..color = MimiVentColors.mint.withOpacity(.07);
         canvas.drawRRect(
           RRect.fromRectAndRadius(
             Rect.fromLTWH(
-                leftInset + index * slotWidth, top, slotWidth, baseline - top),
+                leftInset + index * slotWidth, top, slotWidth, bottom - top),
             const Radius.circular(4),
           ),
           highlight,
         );
       }
       final barWidth = math.min(16.0, math.max(3.0, slotWidth * .52));
-      final barPaint = Paint()
-        ..color = index == selectedIndex
-            ? MimiVentColors.amber
-            : MimiVentColors.mint.withOpacity(.82);
-      if (barHeight > 0) {
+      final barPaint = Paint()..color = MimiVentColors.mint.withOpacity(.82);
+      if (fanHeight > 0) {
         canvas.drawRRect(
           RRect.fromRectAndRadius(
-            Rect.fromLTWH(centerX - barWidth / 2, baseline - barHeight,
-                barWidth, barHeight),
+            Rect.fromLTWH(centerX - barWidth / 2, baseline - fanHeight,
+                barWidth, fanHeight),
             const Radius.circular(4),
           ),
           barPaint,
+        );
+      }
+      if (activityHeight > 0) {
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromLTWH(
+                centerX - barWidth / 2, baseline, barWidth, activityHeight),
+            const Radius.circular(4),
+          ),
+          Paint()..color = MimiVentColors.amber.withOpacity(.86),
         );
       }
     }
@@ -1621,7 +2165,7 @@ class _StatisticsChartPainter extends CustomPainter {
       _drawText(
         canvas,
         point.label,
-        Offset(centerX - slotWidth / 2, baseline + 7),
+        Offset(centerX - slotWidth / 2, bottom + 4),
         maxWidth: slotWidth,
         align: TextAlign.center,
         color: MimiVentColors.muted,
@@ -1705,6 +2249,17 @@ String _formatMinutes(double value) {
       : rounded.toStringAsFixed(1);
 }
 
+String _formatStatisticMinutes(double value) {
+  if (!value.isFinite || value <= 0) return '0秒';
+  final seconds = (value * 60).round();
+  if (seconds < 60) return '$seconds秒';
+  final roundedMinutes = (seconds / 60 * 10).round() / 10;
+  final text = roundedMinutes == roundedMinutes.roundToDouble()
+      ? roundedMinutes.toInt().toString()
+      : roundedMinutes.toStringAsFixed(1);
+  return '$text分钟';
+}
+
 double _niceAxisMaximum(double maximum) {
   if (!maximum.isFinite || maximum <= 0) return 1;
   final step = _StatisticsChartPainter._niceStep(maximum / 4);
@@ -1742,18 +2297,36 @@ class _EventPaginationHint extends StatelessWidget {
       );
 }
 
+class _DetailTimelineRow {
+  const _DetailTimelineRow({this.activity, this.fan});
+
+  final _PreviewEvent? activity;
+  final _PreviewEvent? fan;
+
+  DateTime get sortAt =>
+      (activity ?? fan)!.startAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+}
+
 class _PreviewEvent {
   const _PreviewEvent({
     required this.time,
     required this.title,
     required this.detail,
     required this.icon,
+    this.startAt,
+    this.endAt,
+    this.isActivity = false,
+    this.isFan = false,
   });
 
   final String time;
   final String title;
   final String detail;
   final Widget icon;
+  final DateTime? startAt;
+  final DateTime? endAt;
+  final bool isActivity;
+  final bool isFan;
 }
 
 class _DailySummary {

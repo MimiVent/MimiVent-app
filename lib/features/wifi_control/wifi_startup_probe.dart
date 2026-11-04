@@ -10,7 +10,9 @@ class WifiStartupSnapshot {
 }
 
 /// 启动时只尝试已有绑定，不触发蓝牙扫描或蓝牙权限弹窗。
-Future<WifiStartupSnapshot?> probeWifiStartup() async {
+Future<WifiStartupSnapshot?> probeWifiStartup({
+  void Function(Object error)? onError,
+}) async {
   try {
     final records = await WifiBindingStore().load();
     for (final binding in records) {
@@ -18,13 +20,16 @@ Future<WifiStartupSnapshot?> probeWifiStartup() async {
       try {
         final status = await WifiReadTransport().read(binding);
         return WifiStartupSnapshot(binding: binding, status: status);
-      } on WifiReadException {
+      } on WifiReadException catch (error) {
+        onError?.call(error);
         continue;
-      } catch (_) {
+      } catch (error) {
+        onError?.call(error);
         continue;
       }
     }
-  } catch (_) {
+  } catch (error) {
+    onError?.call(error);
     // 安全存储不可用或记录损坏时回到蓝牙流程，不在这里覆盖任何记录。
   }
   return null;
