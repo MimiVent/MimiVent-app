@@ -19,7 +19,9 @@ class BleProtocol {
   static const wifiCommandUuid = '6f9b0011-7d5a-4c3b-9a21-2f6d4d494d49';
   static const wifiResponseUuid = '6f9b0012-7d5a-4c3b-9a21-2f6d4d494d49';
   static const frameVersion = 2;
-  static const maximumResponseBytes = 4096;
+  // 范围统计响应远大于旧的 mode 接口：单日 24 桶约 5.1 KB，
+  // 7 天约 8 KB，30 天约 20 KB。上限按 30 天满载留余量。
+  static const maximumResponseBytes = 24576;
   static const maximumFragments = 1024;
 
   static String encodeRequest({

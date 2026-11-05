@@ -24,6 +24,19 @@ class BleDeviceRepository implements DeviceRepository {
   }) =>
       _api.getStatistics(profile, range, offset: offset);
   @override
+  Future<Map<String, dynamic>> getStatisticsRange(
+    TimingProfile profile, {
+    required int from,
+    required int to,
+    required int tzOffsetSeconds,
+  }) =>
+      _api.getStatisticsRange(
+        profile,
+        from: from,
+        to: to,
+        tzOffsetSeconds: tzOffsetSeconds,
+      );
+  @override
   Future<DeviceEventPage> queryEvents(
           TimingProfile profile, DeviceEventQuery query) =>
       _api.queryEvents(profile, query);

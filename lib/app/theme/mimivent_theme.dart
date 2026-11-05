@@ -94,6 +94,11 @@ class MimiVentMotion {
 ThemeData buildMimiVentTheme() {
   return ThemeData(
     useMaterial3: true,
+    // InkSparkle 在 Flutter 3.22 的软件渲染路径（测试环境、无 GPU 的低端设备）
+    // 会在 paint 阶段抛 RangeError，进而让 State 生命周期异常收尾，
+    // 表现为 "_debugLifecycleState == _StateLifecycle.ready" 断言。
+    // 固定为经典波纹（InkRipple），避开这条会崩的分支。
+    splashFactory: InkRipple.splashFactory,
     brightness: Brightness.dark,
     scaffoldBackgroundColor: MimiVentColors.page,
     colorScheme: ColorScheme.fromSeed(

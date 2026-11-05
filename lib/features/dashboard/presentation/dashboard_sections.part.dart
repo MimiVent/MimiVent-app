@@ -195,7 +195,10 @@ extension _DashboardMainSections on _DashboardPageState {
                               : c.connected && !c.appVersionCompatible
                                   ? '请更新 MimiVent App'
                                   : c.connected
-                                      ? '正在同步'
+                                      ? (c.status == null &&
+                                              c.lastError != null
+                                          ? '设备无响应'
+                                          : '正在同步')
                                       : '等待连接',
                       style: const TextStyle(
                           fontSize: 27, fontWeight: FontWeight.w800)),

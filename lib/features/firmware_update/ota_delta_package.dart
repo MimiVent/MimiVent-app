@@ -18,6 +18,7 @@ class OtaDeltaPackage {
     required this.targetSha256,
     required this.partitionProfile,
     required this.statisticsSchema,
+    this.minReadableStorageSchema,
   });
 
   static const int headerSize = 576;
@@ -35,6 +36,7 @@ class OtaDeltaPackage {
   final String targetSha256;
   final String partitionProfile;
   final int statisticsSchema;
+  final int? minReadableStorageSchema;
   String get packageSha256 => sha256.convert(bytes).toString();
 
   static OtaDeltaPackage parse(Uint8List bytes) {
@@ -129,6 +131,8 @@ class OtaDeltaPackage {
       targetSha256: _hex(bytes, 56),
       partitionProfile: profile,
       statisticsSchema: view.getUint16(153, Endian.little),
+      minReadableStorageSchema: view.getUint16(162, Endian.little) == 0
+          ? null : view.getUint16(162, Endian.little),
     );
   }
 

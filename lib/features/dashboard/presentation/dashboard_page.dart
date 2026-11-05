@@ -56,6 +56,8 @@ class DashboardPage extends StatefulWidget {
     this.onConnectBluetooth,
     this.onSwitchToWifi,
     this.globalLoadingLabel,
+    this.onCancelGlobalLoading,
+    this.onBackgroundConnect,
     super.key,
   });
 
@@ -65,6 +67,11 @@ class DashboardPage extends StatefulWidget {
   final Future<void> Function()? onConnectBluetooth;
   final Future<void> Function()? onSwitchToWifi;
   final String? globalLoadingLabel;
+
+  /// 启动自动重连可能持续十几秒，期间整屏遮罩会让人误以为卡死。
+  /// 取消：中止本次连接尝试；后台连接：收起遮罩但继续在后台连。
+  final Future<void> Function()? onCancelGlobalLoading;
+  final VoidCallback? onBackgroundConnect;
 
   @override
   State<DashboardPage> createState() => _DashboardPageState();
@@ -235,6 +242,29 @@ class _DashboardPageState extends State<DashboardPage> {
                                   color: Colors.white,
                                   fontSize: 14,
                                   fontWeight: FontWeight.w600)),
+                          if (widget.globalLoadingLabel != null &&
+                              c.pendingWifiAction == null) ...[
+                            const SizedBox(height: 16),
+                            Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                TextButton(
+                                  onPressed: widget.onCancelGlobalLoading ==
+                                          null
+                                      ? null
+                                      : () =>
+                                          widget.onCancelGlobalLoading!(),
+                                  child: const Text('取消'),
+                                ),
+                                const SizedBox(width: 4),
+                                TextButton(
+                                  onPressed:
+                                      widget.onBackgroundConnect,
+                                  child: const Text('后台连接'),
+                                ),
+                              ],
+                            ),
+                          ],
                         ]),
                       ),
                     ),

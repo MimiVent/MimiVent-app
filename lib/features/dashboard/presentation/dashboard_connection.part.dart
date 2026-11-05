@@ -321,7 +321,11 @@ extension _DashboardConnectionSection on _DashboardPageState {
                                 return Column(
                                   mainAxisSize: MainAxisSize.min,
                                   children: [
-                                    SizedBox(
+                                    // 外层 padding 顶部为 0、右侧为 18，原先按钮贴顶显得偏上；
+                                    // 补 12 的顶部间距后与右侧视觉平衡。
+                                    Padding(
+                                      padding: const EdgeInsets.only(top: 12),
+                                      child: SizedBox(
                                       height: 34,
                                       child: Row(
                                         children: [
@@ -343,6 +347,7 @@ extension _DashboardConnectionSection on _DashboardPageState {
                                           ),
                                         ],
                                       ),
+                                    ),
                                     ),
                                     Center(
                                       child: Text(

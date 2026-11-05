@@ -14,6 +14,7 @@ import '../../transport/ota_capabilities.dart';
 import 'ota_task_controller.dart';
 import 'ota_package.dart';
 import 'ota_delta_package.dart';
+import 'ota_storage_compatibility.dart';
 import 'ota_task_snapshot.dart';
 import '../../shared/widgets/top_toast.dart';
 
@@ -48,7 +49,11 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
   String? _taskId;
   String? _currentFirmwareVersion;
   int? _currentStatisticsSchema;
+  /// 升级成功后的常驻提示：展示设备实际运行的版本，直到用户关闭或离开页面。
+  bool _upgradeSucceeded = false;
+  String? _upgradeSucceededVersion;
   int? _firmwareStatisticsSchema;
+  int? _firmwareMinimumReadableSchema;
   String? _firmwarePartitionProfile;
   String _status = '通过蓝牙连接设备后即可升级';
   String? _deviceStatus;
@@ -71,6 +76,9 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
   String? _lastQueriedDeviceId;
   Timer? _connectionRefreshTimer;
   DateTime? _transferStartedAt;
+  /// 本次传输的起始字节数。续传时设备已确认的部分不计入速度，
+  /// 否则 "恢复的字节 ÷ 刚过去的几十毫秒" 会算出荒谬的速度与剩余时间。
+  int? _transferBaseBytes;
   DateTime? _lastProgressUpdate;
   double? _transferBytesPerSecond;
   Duration? _transferRemaining;
@@ -182,7 +190,10 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
         final decoded = jsonDecode(response.body);
         if (decoded is Map<String, dynamic>) {
           firmwareVersion = decoded['firmware'] as String?;
-          statisticsSchema = decoded['statisticsSchema'] as int?;
+          // statisticsSchema 是给旧 App 的兼容值（固定 4）；OTA 安装门槛必须比对
+          // 真实落盘格式 storageSchema，否则永远与包内 marker 5 不相等而阻止升级。
+          statisticsSchema = (decoded['storageSchema'] as int?) ??
+              (decoded['statisticsSchema'] as int?);
         }
       } catch (_) {
         // OTA 状态仍可读时保留页面入口；未知版本不允许执行无法核实的降级。
@@ -266,7 +277,14 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
       }
       if (completedNow && !_successNotified) {
         _successNotified = true;
-        if (mounted) TopToast.show(context, '固件升级成功');
+        final running = firmwareVersion ?? _firmwareVersion ?? '未知';
+        if (mounted) {
+          setState(() {
+            _upgradeSucceeded = true;
+            _upgradeSucceededVersion = running;
+          });
+          TopToast.show(context, '固件升级成功 · 当前运行 v$running');
+        }
         await _clearInstalledRecordAfterSuccess();
       }
     } catch (error) {
@@ -357,6 +375,7 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
     var imageBytes = bytes;
     String? version;
     int? statisticsSchema;
+    int? minimumReadableSchema;
     String? partitionProfile;
     String imageDigest;
     int targetImageLength;
@@ -369,6 +388,7 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
       }
       version = delta.targetVersion;
       statisticsSchema = delta.statisticsSchema;
+      minimumReadableSchema = delta.minReadableStorageSchema;
       partitionProfile = delta.partitionProfile;
       imageDigest = delta.targetSha256;
       targetImageLength = delta.targetLength;
@@ -400,6 +420,10 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
       partitionProfile = RegExp(r'MIMIVENT_PARTITION_PROFILE=([A-Za-z0-9_-]+)')
           .firstMatch(binaryText)
           ?.group(1);
+      minimumReadableSchema = int.tryParse(
+        RegExp(r'MIMIVENT_MIN_READABLE_STORAGE_SCHEMA=(\d+)')
+                .firstMatch(binaryText)?.group(1) ?? '',
+      );
       if (imageBytes.isEmpty ||
           imageBytes.first != 0xE9 ||
           chipId != 5 ||
@@ -417,19 +441,14 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
           '目标固件 v$version 低于当前 App 最低支持版本 v$_minimumFirmwareVersion，已阻止安装');
       return;
     }
-    final isDowngrade = _currentFirmwareVersion != null &&
-        _compareVersions(version, _currentFirmwareVersion!) < 0;
     final currentSchema = _currentStatisticsSchema;
-    if (isDowngrade &&
-        currentSchema != null &&
-        (statisticsSchema == null || statisticsSchema != currentSchema)) {
-      setState(() => _status = statisticsSchema == null
-          ? '目标固件未声明统计数据格式，无法确认降级兼容性，已阻止安装。请使用同数据格式固件或 USB 恢复。'
-          : '目标固件统计数据格式为 $statisticsSchema，当前设备为 $currentSchema。当前 App 尚无跨格式迁移方案，为保护配置和历史数据已阻止安装。');
-      return;
-    }
-    if (isDowngrade && currentSchema == null) {
-      setState(() => _status = '无法读取设备统计数据格式，不能安全确认降级兼容性，已阻止安装');
+    if (!canReadStorageSchema(
+      deviceSchema: currentSchema,
+      targetSchema: statisticsSchema,
+      minimumReadableSchema: minimumReadableSchema,
+    )) {
+      setState(() => _status = '目标固件无法确认兼容当前统计格式 $currentSchema，已阻止安装。'
+          '目标可读范围：${minimumReadableSchema ?? statisticsSchema}–$statisticsSchema；请使用兼容固件。');
       return;
     }
     final fileDigest = sha256.convert(bytes).toString();
@@ -498,6 +517,7 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
       _otaPackageSha256 = isDelta ? fileDigest : otaPackage?.packageSha256;
       _firmwareVersion = version;
       _firmwareStatisticsSchema = statisticsSchema;
+      _firmwareMinimumReadableSchema = minimumReadableSchema;
       _firmwarePartitionProfile = partitionProfile;
       _firmwareSha256 = imageDigest;
       _taskId = taskId;
@@ -616,6 +636,7 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
           _fullFallbackPackageSha256 = fallbackPackageSha256;
           _firmwareVersion = delta.targetVersion;
           _firmwareStatisticsSchema = delta.statisticsSchema;
+          _firmwareMinimumReadableSchema = delta.minReadableStorageSchema;
           _firmwarePartitionProfile = delta.partitionProfile;
           _firmwareSha256 = delta.targetSha256;
           _taskId = pendingTask.taskId;
@@ -650,6 +671,10 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
         _otaPackageSha256 = otaPackage.packageSha256;
         _firmwareVersion = pendingTask.version;
         _firmwareStatisticsSchema = pendingTask.statisticsSchema;
+        _firmwareMinimumReadableSchema = int.tryParse(
+          RegExp(r'MIMIVENT_MIN_READABLE_STORAGE_SCHEMA=(\d+)')
+                  .firstMatch(binaryText)?.group(1) ?? '',
+        );
         _firmwarePartitionProfile = partitionProfile;
         _firmwareSha256 = otaPackage.imageSha256;
         _taskId = pendingTask.taskId;
@@ -671,7 +696,32 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
     }
   }
 
+  /// 设备已经是目标版本时直接拦下：安装成功后设备会重启，
+  /// 再点一次或界面误触会重跑一遍完整上传（2 分钟），没有任何收益。
+  bool _isAlreadyRunningTarget() {
+    final target = _firmwareVersion;
+    final running = _currentFirmwareVersion;
+    if (target == null || running == null) return false;
+    return _compareVersions(target, running) == 0;
+  }
+
   Future<void> _startUpdateOnce() async {
+    // 安装指令已交给设备、正在等它重启：此时任何重传都会覆盖同一个 slot，
+    // 白白花两分钟且可能打断安装。
+    if (_installCommandPending) {
+      if (mounted) {
+        setState(() => _status =
+            '安装指令已发送，正在等待设备重启；请勿重复上传');
+      }
+      return;
+    }
+    if (_isAlreadyRunningTarget()) {
+      if (mounted) {
+        setState(() => _status =
+            '设备当前已是 v$_firmwareVersion，无需重复安装；如需重装请先改选其它机制');
+      }
+      return;
+    }
     _successNotified = false;
     final firmware = _firmware;
     final path = firmware?.path;
@@ -939,11 +989,12 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
       setState(() => _status = '设备未声明支持降级，已阻止安装');
       return;
     }
-    if (isDowngrade &&
-        (_currentStatisticsSchema == null ||
-            _firmwareStatisticsSchema == null ||
-            _currentStatisticsSchema != _firmwareStatisticsSchema)) {
-      setState(() => _status = '无法确认目标固件与设备统计数据格式兼容，已阻止降级');
+    if (!canReadStorageSchema(
+      deviceSchema: _currentStatisticsSchema,
+      targetSchema: _firmwareStatisticsSchema,
+      minimumReadableSchema: _firmwareMinimumReadableSchema,
+    )) {
+      setState(() => _status = '目标固件无法读取设备当前统计格式，已阻止安装');
       return;
     }
     if (!mounted) return;
@@ -993,6 +1044,7 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
               ? _fullFallbackPackageLength ?? _targetImageLength!
               : firmware.size);
       _transferStartedAt = DateTime.now();
+      _transferBaseBytes = null;
       _lastProgressUpdate = null;
       _transferBytesPerSecond = null;
       _transferRemaining = null;
@@ -1050,15 +1102,22 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
             if (last != null &&
                 now.difference(last).inMilliseconds < 200 &&
                 sent < totalBytes) return;
+            // 以第一次回调的字节数作为基准：续传时它等于设备已确认的进度，
+            // 本次增量才反映真实吞吐。
+            if (_transferBaseBytes == null) {
+              _transferBaseBytes = sent;
+              _transferStartedAt = now;
+            }
             final elapsed =
                 now.difference(_transferStartedAt ?? now).inMilliseconds;
-            if (elapsed > 0 && sent > 0) {
-              _transferBytesPerSecond = sent * 1000 / elapsed;
+            final delta = sent - _transferBaseBytes!;
+            // 采样窗口太短会把一次突发算成超高速度，累计 800ms 后再更新。
+            if (elapsed >= 800 && delta > 0) {
+              final speed = delta * 1000 / elapsed;
+              _transferBytesPerSecond = speed;
               final remainingBytes = totalBytes - sent;
-              _transferRemaining = _transferBytesPerSecond! > 0
-                  ? Duration(
-                      seconds:
-                          (remainingBytes / _transferBytesPerSecond!).ceil())
+              _transferRemaining = speed > 0
+                  ? Duration(seconds: (remainingBytes / speed).ceil())
                   : null;
             }
             _lastProgressUpdate = now;
@@ -1284,6 +1343,46 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
           body: ListView(
             padding: const EdgeInsets.all(20),
             children: [
+              if (_upgradeSucceeded) ...[
+                Container(
+                  padding: const EdgeInsets.fromLTRB(14, 12, 10, 12),
+                  decoration: BoxDecoration(
+                    color: MimiVentColors.mint.withOpacity(.10),
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(
+                        color: MimiVentColors.mint.withOpacity(.45)),
+                  ),
+                  child: Row(children: [
+                    const Icon(Icons.check_circle_rounded,
+                        color: MimiVentColors.mint, size: 20),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text('固件升级成功',
+                              style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w700)),
+                          const SizedBox(height: 2),
+                          Text('设备当前运行 v${_upgradeSucceededVersion ?? '未知'}',
+                              style: const TextStyle(
+                                  color: MimiVentColors.muted, fontSize: 11)),
+                        ],
+                      ),
+                    ),
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      icon: const Icon(Icons.close,
+                          color: MimiVentColors.muted, size: 18),
+                      onPressed: () =>
+                          setState(() => _upgradeSucceeded = false),
+                    ),
+                  ]),
+                ),
+                const SizedBox(height: 14),
+              ],
               _panel(
                 icon: Icons.bluetooth_connected_rounded,
                 title: '蓝牙连接状态',

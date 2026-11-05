@@ -6,6 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:mimivent_app/data/device_repository.dart';
 import 'package:mimivent_app/data/mimivent_controller.dart';
 import 'package:mimivent_app/data/models.dart';
+import 'package:mimivent_app/data/statistics_query.dart';
 import 'package:mimivent_app/ble/mimivent_ble_manager.dart';
 import 'package:mimivent_app/ble/ble_request_queue.dart';
 
@@ -13,6 +14,36 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   setUp(() => SharedPreferences.setMockInitialValues({}));
+
+  test('范围缓存隔离设备，批次变化后丢弃旧查询的迟到响应', () async {
+    final ble = _FakeBleManager()..connectionStatus = BleConnectionStatus.connected;
+    final repository = _FakeRepository();
+    final controller = MimiVentController(bleManager: ble, deviceRepository: repository);
+    controller.status = _status('0.7.0').copyWith(statsRangeApiVersion: 2, tzOffsetSeconds: 28800);
+    final query = StatisticsQuery.today(now: 1793287800, tzOffsetSeconds: 28800);
+    final other = StatisticsQuery.yesterday(now: 1793287800, tzOffsetSeconds: 28800);
+    repository.onRange = (_) async => {'apiVersion': 2, 'deviceId': 'physical-device', 'dataEpoch': 'old'};
+    await controller.refreshStatisticsRange(query);
+    expect(controller.statisticsRangeFor(query)?['dataEpoch'], 'old');
+    ble.deviceIdentity = 'device-b';
+    expect(controller.statisticsRangeFor(query), isNull);
+    // 同一硬件由另一个连接身份访问（例如 BLE/WiFi 切换）。
+    await controller.refreshStatisticsRange(query);
+    ble.deviceIdentity = 'device-a';
+    expect(controller.statisticsRangeFor(query)?['dataEpoch'], 'old');
+    final delayed = Completer<Map<String, dynamic>>();
+    repository.onRange = (_) => delayed.future;
+    final pending = controller.refreshStatisticsRange(other);
+    repository.onRange = (_) async => {'apiVersion': 2, 'deviceId': 'physical-device', 'dataEpoch': 'new'};
+    await controller.refreshStatisticsRange(query);
+    delayed.complete({'apiVersion': 2, 'deviceId': 'physical-device', 'dataEpoch': 'old'});
+    await pending;
+    expect(controller.statisticsRangeFor(query)?['dataEpoch'], 'new');
+    expect(controller.statisticsRangeFor(other), isNull);
+    ble.deviceIdentity = 'device-b';
+    expect(controller.statisticsRangeFor(query), isNull);
+    controller.dispose();
+  });
 
   test('OTA 传输层重连后先校时再恢复配置，后续轮询不重复校时', () async {
     final ble = _FakeBleManager();
@@ -319,7 +350,19 @@ class _FakeRepository implements DeviceRepository {
   Future<TimingSettings> Function(TimingProfile profile)? onGetSettings;
   Future<void> Function(TimingProfile profile)? onArmLockOff;
   Future<void> Function(TimingProfile profile)? onSyncClock;
+  Future<Map<String, dynamic>> Function(TimingProfile profile)? onRange;
   int settingsCalls = 0;
+
+  @override
+  Future<Map<String, dynamic>> getStatisticsRange(
+    TimingProfile profile, {
+    required int from,
+    required int to,
+    required int tzOffsetSeconds,
+  }) =>
+      onRange?.call(profile) ??
+      Future<Map<String, dynamic>>.error(
+          UnimplementedError('range 未在本用例启用'));
   int confirmLockOffCalls = 0;
   int setAutoCalls = 0;
 
@@ -401,6 +444,9 @@ class _FakeRepository implements DeviceRepository {
 
 class _FakeBleManager extends MimiVentBleManager {
   bool _disposed = false;
+  String deviceIdentity = 'device-a';
+  @override
+  String? get connectedDeviceId => isConnected ? deviceIdentity : null;
 
   void setConnected(bool connected) {
     connectionStatus = connected

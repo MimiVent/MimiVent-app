@@ -198,7 +198,10 @@ class WifiReadTransport {
     WifiBinding binding,
     String path,
   ) async {
-    if (!RegExp(r'^/api/[a-z]+(\?[A-Za-z0-9_=&.-]{0,120})?$').hasMatch(path)) {
+    // 允许两段式路径：/api/stats/range、/api/events 这类。
+    // 只放行小写字母段与受限查询串，避免被拼成任意 URL。
+    if (!RegExp(r'^/api/[a-z]+(/[a-z]+)?(\?[A-Za-z0-9_=&.-]{0,160})?$')
+        .hasMatch(path)) {
       throw const WifiReadException('INVALID_PATH', '读取路径无效');
     }
     WifiBinding.fromJson(binding.toJson());

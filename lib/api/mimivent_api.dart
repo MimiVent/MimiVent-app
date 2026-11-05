@@ -149,6 +149,30 @@ class MimiVentApi {
     );
   }
 
+  /// 统一范围统计：from/to 是 UTC 秒，tzOffsetSeconds 必须是设备固定偏移。
+  /// 粒度由固件按规则选择，客户端不传 bucketHours。
+  Future<Map<String, dynamic>> getStatisticsRange(
+    TimingProfile profile, {
+    required int from,
+    required int to,
+    required int tzOffsetSeconds,
+  }) async {
+    final parameters = {
+      'from': '$from',
+      'to': '$to',
+      'tzOffsetSeconds': '$tzOffsetSeconds',
+    };
+    return _request(
+      method: 'GET',
+      path: '/api/stats/range',
+      profile: profile,
+      query: parameters,
+      body: parameters.entries
+          .map((entry) => '${entry.key}=${entry.value}')
+          .join('&'),
+    );
+  }
+
   /// 按任意时间段、事件类型和页码读取原始事件，不在固件侧合并事件。
   Future<DeviceEventPage> queryEvents(
     TimingProfile profile,

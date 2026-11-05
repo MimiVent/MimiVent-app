@@ -286,7 +286,9 @@ class MimiVentBleManager extends ChangeNotifier
         try {
           await device.disconnect();
         } catch (_) {}
-        await Future<void>.delayed(Duration(milliseconds: 800 * (retry + 1)));
+        // 指数退避：133 通常是 GATT 缓存失效，立刻重试必然再失败，
+        // 给系统时间释放旧句柄比连续猛试更有效。
+        await Future<void>.delayed(Duration(milliseconds: 1500 * (1 << retry)));
         if (attempt != _connectionAttempt) throw Exception('连接已取消');
       }
     }
@@ -357,6 +359,18 @@ class MimiVentBleManager extends ChangeNotifier
         diagnostics?.info('BLE MTU', '系统协商 MTU=$negotiatedMtu');
       }
       if (attempt != _connectionAttempt) throw Exception('连接已取消');
+      if (Platform.isAndroid) {
+        // 统计响应已从 2.7 KB 涨到 5–8 KB：默认连接间隔（30–50 ms）下
+        // 20+ 个分片要等近一秒。高优先级把它压到 11–15 ms。
+        try {
+          await device.requestConnectionPriority(
+            connectionPriorityRequest: ConnectionPriority.high,
+          );
+          diagnostics?.info('BLE 链路', '已请求高优先级连接间隔');
+        } catch (error) {
+          diagnostics?.warning('BLE 链路', '连接优先级请求失败：$error');
+        }
+      }
       final services = await _gattScheduler.run(device.discoverServices);
       diagnostics?.info('BLE GATT',
           '发现 ${services.length} 个服务，累计耗时=${connectStopwatch.elapsedMilliseconds}ms：${services.map((item) => item.uuid.str).join(', ')}');

@@ -327,6 +327,10 @@ class DeviceStatus {
     this.minimumAppVersion,
     this.capabilities = const {},
     this.gattVersion,
+    this.statsRangeApiVersion,
+    this.storageSchema,
+    this.minReadableStorageSchema,
+    this.tzOffsetSeconds,
   });
 
   final bool fan;
@@ -348,6 +352,18 @@ class DeviceStatus {
   final String? minimumAppVersion;
   final Set<String> capabilities;
   final int? gattVersion;
+  /// >= 2 表示固件支持 /api/stats/range；缺省视为不支持。
+  final int? statsRangeApiVersion;
+  /// 内部落盘格式（5）。OTA 安装门槛用它，不是 statisticsSchema。
+  final int? storageSchema;
+  /// 本固件能读的最低落盘格式（4）。
+  final int? minReadableStorageSchema;
+  /// 设备固定时区偏移（秒）；范围查询必须原样带上。
+  final int? tzOffsetSeconds;
+
+  /// 固件是否支持新的范围统计接口。
+  bool get supportsStatisticsRange =>
+      (statsRangeApiVersion ?? 0) >= 2 && tzOffsetSeconds != null;
 
   DeviceStatus copyWith({
     bool? fan,
@@ -369,6 +385,10 @@ class DeviceStatus {
     String? minimumAppVersion,
     Set<String>? capabilities,
     int? gattVersion,
+    int? statsRangeApiVersion,
+    int? storageSchema,
+    int? minReadableStorageSchema,
+    int? tzOffsetSeconds,
   }) =>
       DeviceStatus(
         fan: fan ?? this.fan,
@@ -390,6 +410,11 @@ class DeviceStatus {
         minimumAppVersion: minimumAppVersion ?? this.minimumAppVersion,
         capabilities: capabilities ?? this.capabilities,
         gattVersion: gattVersion ?? this.gattVersion,
+        statsRangeApiVersion: statsRangeApiVersion ?? this.statsRangeApiVersion,
+        storageSchema: storageSchema ?? this.storageSchema,
+        minReadableStorageSchema:
+            minReadableStorageSchema ?? this.minReadableStorageSchema,
+        tzOffsetSeconds: tzOffsetSeconds ?? this.tzOffsetSeconds,
       );
 
   factory DeviceStatus.fromJson(Map<String, dynamic> json) {
@@ -430,6 +455,31 @@ class DeviceStatus {
         (gattVersion is! int || gattVersion < 0 || gattVersion > 255)) {
       throw const FormatException('设备状态字段 gattVersion 超出范围');
     }
+    // 能力字段全部可选：旧固件不返回，按"不支持范围查询"处理。
+    final statsRangeApiVersion = json['statsRangeApiVersion'];
+    if (statsRangeApiVersion != null &&
+        (statsRangeApiVersion is! int || statsRangeApiVersion < 0)) {
+      throw const FormatException('设备状态字段 statsRangeApiVersion 类型无效');
+    }
+    final storageSchema = json['storageSchema'];
+    if (storageSchema != null &&
+        (storageSchema is! int || storageSchema < 0 || storageSchema > 0xFFFF)) {
+      throw const FormatException('设备状态字段 storageSchema 类型无效');
+    }
+    final minReadableStorageSchema = json['minReadableStorageSchema'];
+    if (minReadableStorageSchema != null &&
+        (minReadableStorageSchema is! int ||
+            minReadableStorageSchema < 0 ||
+            minReadableStorageSchema > 0xFFFF)) {
+      throw const FormatException('设备状态字段 minReadableStorageSchema 类型无效');
+    }
+    final tzOffsetSeconds = json['tzOffsetSeconds'];
+    if (tzOffsetSeconds != null &&
+        (tzOffsetSeconds is! int ||
+            tzOffsetSeconds < -43200 ||
+            tzOffsetSeconds > 50400)) {
+      throw const FormatException('设备状态字段 tzOffsetSeconds 超出范围');
+    }
 
     return DeviceStatus(
       fan: _requiredBool(json, 'fan'),
@@ -458,6 +508,10 @@ class DeviceStatus {
           ? const {}
           : Set<String>.unmodifiable(rawCapabilities.cast<String>()),
       gattVersion: gattVersion as int?,
+      statsRangeApiVersion: statsRangeApiVersion as int?,
+      storageSchema: storageSchema as int?,
+      minReadableStorageSchema: minReadableStorageSchema as int?,
+      tzOffsetSeconds: tzOffsetSeconds as int?,
     );
   }
 }

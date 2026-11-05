@@ -5,6 +5,26 @@ import 'package:mimivent_app/features/firmware_update/ota_delta_package.dart';
 import 'package:mimivent_app/features/firmware_update/ota_package.dart';
 
 void main() {
+  test('差分包读取可读格式下限，旧包零值保守回退', () {
+    for (final minimum in [0, 6]) {
+      final header = _deltaHeader(baseLength: 1024, targetLength: 1024);
+      final view = ByteData.sublistView(header)
+        ..setUint16(153, 7, Endian.little)
+        ..setUint16(162, minimum, Endian.little);
+      view.setUint32(188, _crc32(header.sublist(0, 188)), Endian.little);
+      final raw = Uint8List(1024);
+      final record = ByteData(24)
+        ..setUint8(0, 2)
+        ..setUint32(8, raw.length, Endian.little)
+        ..setUint32(16, raw.length, Endian.little)
+        ..setUint32(20, _crc32(raw), Endian.little);
+      final parsed = OtaDeltaPackage.parse(Uint8List.fromList([
+        ...header, ...record.buffer.asUint8List(), ...raw,
+      ]));
+      expect(parsed.minReadableStorageSchema, minimum == 0 ? null : 6);
+    }
+  });
+
   test('rejects base and target images outside OTA partition limits', () {
     for (final invalidLength in [
       OtaPackage.minimumImageSize - 1,

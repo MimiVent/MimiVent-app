@@ -389,7 +389,7 @@ void main() {
     ));
     await tester.pump();
     expect(find.text('等待连接'), findsOneWidget);
-    expect(find.text('蓝牙未连接 · 可查看缓存数据'), findsOneWidget);
+    expect(find.text('设备未连接 · 可查看缓存数据'), findsOneWidget);
     expect(find.text('连接你的设备'), findsNothing);
     await tester.tap(find.text('临时排风'));
     await tester.pumpAndSettle();
@@ -436,9 +436,9 @@ void main() {
         scrollable: find.byType(Scrollable).first);
     expect(find.textContaining('同步时运行中'), findsOneWidget);
     expect(find.text('仅显示已缓存事件，连接设备可加载其余记录'), findsOneWidget);
-    await tester.scrollUntilVisible(find.text('昨日'), -180,
+    await tester.scrollUntilVisible(find.text('昨天'), -180,
         scrollable: find.byType(Scrollable).first);
-    await tester.tap(find.text('昨日'));
+    await tester.tap(find.text('昨天'));
     await tester.pump();
     expect(
         find.byKey(const ValueKey('offline-statistics-empty')), findsOneWidget);

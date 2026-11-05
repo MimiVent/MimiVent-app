@@ -14,9 +14,11 @@ import '../core/diagnostics/app_diagnostics_log.dart';
 import '../features/control/control_operation.dart';
 import '../features/wifi_control/wifi_binding.dart';
 import '../features/wifi_control/wifi_read_transport.dart';
+import '../features/wifi_control/wifi_serial_executor.dart';
 import 'ble_device_repository.dart';
 import 'device_repository.dart';
 import 'settings_draft.dart';
+import 'statistics_query.dart';
 import 'models.dart';
 import 'statistics_event_cache.dart';
 import '../transport/device_transport.dart';
@@ -34,6 +36,17 @@ class MimiVentController extends ChangeNotifier {
     ble.addListener(_onBleChanged);
     _pollTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (wifiActive && (status?.fan == true || displayRemainingMs > 0)) {
+        _notifyIfAlive();
+      }
+      // 连接 12 秒仍无状态：多半是 GATT 缓存失效（133），直接给出可操作提示。
+      if (ble.isConnected &&
+          !_offlineViewing &&
+          status == null &&
+          lastError == null &&
+          _bleConnectedSince != null &&
+          DateTime.now().difference(_bleConnectedSince!) >
+              const Duration(seconds: 12)) {
+        lastError = '设备长时间无响应，请关闭手机蓝牙开关后重新连接';
         _notifyIfAlive();
       }
       if (ble.isConnected &&
@@ -86,6 +99,9 @@ class MimiVentController extends ChangeNotifier {
   final Set<String> _statisticsRequests = {};
   final Set<String> _statisticsCachedRanges = {};
   final Map<String, DateTime> _statisticsCacheUpdatedAt = {};
+  // 范围查询缓存：键由 from/to（量化后）/tz 组成，设备身份与 dataEpoch 另行校验。
+  final Map<String, Map<String, dynamic>> _statisticsRangeByKey = {};
+  final Set<String> _statisticsRangeRequests = {};
   TimingSettings? settings;
   SettingsDraft? _settingsDraft;
   TimingSettings? get draftSettings => _settingsDraft?.value;
@@ -113,8 +129,7 @@ class MimiVentController extends ChangeNotifier {
   WifiBinding? _wifiBinding;
   WifiReadTransport? _wifiTransport;
   bool _wifiVersionCompatible = true;
-  final List<_WifiSerialTask> _wifiQueue = [];
-  bool _wifiPumping = false;
+  final _wifiExecutor = WifiSerialExecutor();
   Timer? _wifiHealthTimer;
   Timer? _wifiSyncTimer;
   bool _wifiHealthInFlight = false;
@@ -129,6 +144,53 @@ class MimiVentController extends ChangeNotifier {
   DateTime? _fanRunStartedAt;
 
   bool get wifiActive => _wifiBinding != null;
+
+  /// 固件是否支持 /api/stats/range（依据 /api/status 的能力字段）。
+  bool get supportsStatisticsRange {
+    _ensureRangeCapabilityScope();
+    final api = status?.statsRangeApiVersion;
+    if (api != null) _lastStatsRangeApiVersion = api;
+    final effective = api ?? _lastStatsRangeApiVersion;
+    return (effective ?? 0) >= 2 && deviceTimezoneOffsetSeconds != null;
+  }
+
+  /// 设备固定时区偏移（秒），范围查询必须原样带上。
+  /// 断线时 status 会被清空，但时区与范围能力应保持"最近一次已知值"：
+  /// 统计页靠它们构造查询命中缓存，否则断线瞬间整页变空。
+  int? _lastTzOffsetSeconds;
+  int? _lastStatsRangeApiVersion;
+
+  int? get deviceTimezoneOffsetSeconds {
+    _ensureRangeCapabilityScope();
+    final tz = status?.tzOffsetSeconds;
+    if (tz != null) _lastTzOffsetSeconds = tz;
+    return tz ?? _lastTzOffsetSeconds;
+  }
+
+  String _lastRangeScope = 'disconnected';
+  String? _rangeCapabilityScope;
+  void _ensureRangeCapabilityScope() {
+    final scope = _rangeScope;
+    if (_rangeCapabilityScope == scope) return;
+    _rangeCapabilityScope = scope;
+    _lastTzOffsetSeconds = null;
+    _lastStatsRangeApiVersion = null;
+  }
+  final Map<String, String> _rangeEpochByScope = {};
+
+  String get _rangeScope {
+    final identity = wifiActive
+        ? 'wifi:${_wifiBinding!.deviceId}'
+        : ble.connectedDeviceId == null ? null : 'ble:${ble.connectedDeviceId}';
+    if (identity != null) _lastRangeScope = identity;
+    return _lastRangeScope;
+  }
+
+  String _rangeKey(StatisticsQuery query) =>
+      '$_rangeScope|${_rangeEpochByScope[_rangeScope] ?? ''}|2|${query.cacheKey}';
+
+  Map<String, dynamic>? statisticsRangeFor(StatisticsQuery query) =>
+      _statisticsRangeByKey[_rangeKey(query)];
 
   bool get connected => ble.isConnected || wifiActive;
   bool get _connectionBootstrapInProgress =>
@@ -201,8 +263,17 @@ class MimiVentController extends ChangeNotifier {
     _notifyIfAlive();
   }
 
+  /// BLE 链路连上但迟迟拿不到 /api/status 的时刻。用于把"正在同步"变成
+  /// 用户能理解的"设备无响应"，而不是无限转圈。
+  DateTime? _bleConnectedSince;
+
   void _onBleChanged() {
     if (_disposed) return;
+    if (ble.isConnected) {
+      _bleConnectedSince ??= DateTime.now();
+    } else {
+      _bleConnectedSince = null;
+    }
     if (!ble.isConnected) {
       if (ble.lastError == '蓝牙连接已断开') {
         lastError = ble.lastError;
@@ -546,29 +617,7 @@ class MimiVentController extends ChangeNotifier {
       profile == this.profile;
 
   Future<T> _wifiSerial<T>(Future<T> Function() action,
-      {bool priority = false}) {
-    final result = Completer<T>();
-    _wifiQueue.add(_WifiSerialTask(() async {
-      try {
-        result.complete(await action());
-      } catch (error, stack) {
-        result.completeError(error, stack);
-      }
-    }, priority));
-    _pumpWifiQueue();
-    return result.future;
-  }
-
-  void _pumpWifiQueue() {
-    if (_wifiPumping || _wifiQueue.isEmpty) return;
-    final index = _wifiQueue.indexWhere((task) => task.priority);
-    final task = _wifiQueue.removeAt(index < 0 ? 0 : index);
-    _wifiPumping = true;
-    unawaited(task.run().whenComplete(() {
-      _wifiPumping = false;
-      _pumpWifiQueue();
-    }));
-  }
+      {bool priority = false}) => _wifiExecutor.run(action, priority: priority);
 
   Future<void> activateWifi(WifiBinding binding) async {
     _wifiBinding = binding;
@@ -584,6 +633,12 @@ class MimiVentController extends ChangeNotifier {
       }
       _startWifiHealth();
       _startWifiSync();
+      // WiFi 会话已建立：清掉上一次（可能是蓝牙）连接失败残留的错误，
+      // 否则顶部会一直挂着"设备操作失败"，与实际状态不符。
+      if (lastError != null) {
+        lastError = null;
+        _notifyIfAlive();
+      }
     } catch (error) {
       _wifiBinding = null;
       _wifiTransport = null;
@@ -795,7 +850,14 @@ class MimiVentController extends ChangeNotifier {
     return false;
   }
 
-  Future<Map<String, dynamic>> _wifiReadPath(String path) async {
+  /// 所有 WiFi 读取串行化：一次 TLS 会话在设备上约占 18 KB 堆，
+  /// 并发读取会让设备在握手阶段内存不足而断链。
+  Future<Map<String, dynamic>> _wifiReadPath(String path,
+      {bool priority = false}) {
+    return _wifiSerial(() => _wifiReadPathUnlocked(path), priority: priority);
+  }
+
+  Future<Map<String, dynamic>> _wifiReadPathUnlocked(String path) async {
     final binding = _wifiBinding;
     final transport = _wifiTransport;
     if (binding == null || transport == null) {
@@ -972,6 +1034,150 @@ class MimiVentController extends ChangeNotifier {
         '固件支持 WiFi 配网，但当前手机未发现 WiFi GATT 服务；可能需要清除旧 BLE 服务缓存后重新连接。',
       );
     }
+    _notifyIfAlive();
+  }
+
+  /// 统一范围查询。粒度由固件决定，App 不传 bucketHours。
+  ///
+  /// 查询键在今日刷新期间稳定；设备身份、数据批次和协议版本由控制器隔离。
+  Future<void> refreshStatisticsRange(StatisticsQuery query) async {
+    if (!query.valid) return;
+    if (_offlineViewing || (!ble.isConnected && !wifiActive)) return;
+    if (!supportsStatisticsRange) return;
+    final scope = _rangeScope;
+    final epochAtStart = _rangeEpochByScope[scope];
+    final key = _rangeKey(query);
+    if (!_statisticsRangeRequests.add(key)) return;
+    final generation = _sessionGeneration;
+    final selectedProfile = profile;
+    _notifyIfAlive();
+    try {
+      final Map<String, dynamic> loaded;
+      if (wifiActive) {
+        // 主数据插队：切 Tab 时图表/汇总要最先出来，事件明细可以稍后。
+        loaded = await _wifiReadPath(
+          '/api/stats/range?from=${query.from}&to=${query.to}'
+          '&tzOffsetSeconds=${query.tzOffsetSeconds}',
+          priority: true,
+        );
+      } else {
+        loaded = await repository.getStatisticsRange(
+          selectedProfile,
+          from: query.from,
+          to: query.to,
+          tzOffsetSeconds: query.tzOffsetSeconds,
+        );
+      }
+      if (generation != _sessionGeneration || scope != _rangeScope ||
+          (epochAtStart != _rangeEpochByScope[scope] &&
+              loaded['dataEpoch']?.toString() != _rangeEpochByScope[scope])) {
+        return;
+      }
+      if (!loaded.containsKey('apiVersion') || loaded['apiVersion'] != 2) {
+        diagnostics?.warning('统计范围', '固件返回的 apiVersion 不是 2，已忽略该响应');
+        return;
+      }
+      // 数据批次变化后，旧的按日快照不能再与新的下标混用。
+      final epoch = loaded['dataEpoch']?.toString();
+      final device = loaded['deviceId']?.toString();
+      if (epoch != null && epoch.isNotEmpty) {
+        _rangeEpochByScope[scope] = epoch;
+        final stale = _statisticsRangeByKey.entries
+            .where((entry) => (entry.key.startsWith('$scope|') ||
+                    (device != null && entry.value['deviceId']?.toString() == device)) &&
+                entry.value['dataEpoch']?.toString() != epoch)
+            .map((entry) => entry.key)
+            .toList();
+        for (final staleKey in stale) {
+          _rangeEpochByScope[staleKey.split('|').first] = epoch;
+          _statisticsRangeByKey.remove(staleKey);
+        }
+      }
+      _statisticsRangeByKey[_rangeKey(query)] = loaded;
+    } catch (error) {
+      diagnostics?.error('统计范围', '查询失败：$error');
+    } finally {
+      _statisticsRangeRequests.remove(key);
+      _notifyIfAlive();
+    }
+  }
+
+  /// 范围视图的事件明细：新接口不返回事件，单独拉一页并合并进范围缓存。
+  ///
+  /// 只用于单日范围；多日范围按文档不提供明细。
+  Future<void> refreshRangeEventPage(StatisticsQuery query,
+      {int? beforeId, int? windowStart, int? windowEnd}) async {
+    if (_offlineViewing || (!ble.isConnected && !wifiActive)) return;
+    if (!supportsStatisticsRange) return;
+    // 多日范围默认不按整段拉（32 条一页远远不够）；
+    // 点某根柱时会用 windowStart/windowEnd 只取那一段。
+    if (!query.singleDay && windowStart == null) return;
+    final queryFrom = windowStart ?? query.from;
+    final queryTo = windowEnd ?? query.to;
+    final key = _rangeKey(query);
+    final cached = _statisticsRangeByKey[key];
+    if (cached == null) return;
+    final generation = _sessionGeneration;
+    try {
+      final Map<String, dynamic> page;
+      if (wifiActive) {
+        final cursor = beforeId == null ? '' : '&beforeId=$beforeId';
+        page = await _wifiReadPath(
+          '/api/events?start=$queryFrom&end=$queryTo'
+          '&kind=all&limit=32$cursor',
+        );
+      } else {
+        final result = await repository.queryEvents(
+          profile,
+          DeviceEventQuery(
+            start: DateTime.fromMillisecondsSinceEpoch(queryFrom * 1000),
+            end: DateTime.fromMillisecondsSinceEpoch(queryTo * 1000),
+            beforeId: beforeId,
+          ),
+        );
+        page = {
+          'events': result.events.map((event) => event.toJson()).toList(),
+          'total': result.total,
+          'hasMore': result.hasMore,
+          'nextCursor': result.nextCursor,
+        };
+      }
+      if (generation != _sessionGeneration || key != _rangeKey(query) ||
+          !identical(cached, _statisticsRangeByKey[key])) {
+        return;
+      }
+      // 按柱窗口取到的事件单独存：整范围刷新会重写 'events'，
+      // 混在一起会导致用户点开的详情在每分钟刷新时被冲掉。
+      final slot = windowStart == null ? 'events' : 'intervalEvents';
+      final existing = cached[slot];
+      final incoming = (page['events'] as List?) ?? const [];
+      final merged = beforeId == null
+          ? List<dynamic>.from(incoming)
+          : <dynamic>[...(existing is List ? existing : const []), ...incoming];
+      cached[slot] = merged;
+      cached['${slot}HasMore'] = page['hasMore'] == true;
+      cached['${slot}NextCursor'] = page['nextCursor'];
+      cached['eventsTotal'] = page['total'];
+      // 事件接口的完整性判定与统计接口同源，优先用它覆盖 detail。
+      if (page['detailStatus'] != null) {
+        cached['detail'] = {
+          'status': page['detailStatus'],
+          'complete': page['detailComplete'] == true,
+          'timeUntrusted': page['timeUntrusted'] == true,
+        };
+      }
+      _notifyIfAlive();
+    } catch (error) {
+      diagnostics?.error('统计范围', '事件明细查询失败：$error');
+    }
+  }
+
+  /// 切换数据批次或断开连接时作废范围缓存。
+  void clearStatisticsRangeCache() {
+    if (_statisticsRangeByKey.isEmpty && _statisticsRangeRequests.isEmpty) return;
+    _statisticsRangeByKey.clear();
+    _rangeEpochByScope.clear();
+    _statisticsRangeRequests.clear();
     _notifyIfAlive();
   }
 
@@ -1815,8 +2021,3 @@ class MimiVentController extends ChangeNotifier {
   }
 }
 
-class _WifiSerialTask {
-  _WifiSerialTask(this.run, this.priority);
-  final Future<void> Function() run;
-  final bool priority;
-}

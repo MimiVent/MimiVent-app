@@ -3,6 +3,7 @@ import 'dart:math';
 import 'dart:ui' show PlatformDispatcher;
 
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 
 import 'app_identity.dart';
 import '../core/diagnostics/app_diagnostics_log.dart';
@@ -310,6 +311,27 @@ class _MimiVentAppState extends State<MimiVentApp> with WidgetsBindingObserver {
     await controller.openApp();
   }
 
+  /// 取消启动时的自动重连：收起遮罩、中止本次尝试，并**立即切到离线视图**。
+  /// 只停连接是不够的——缓存要等后台 openApp() 跑完才加载，
+  /// 用户会看到一个空页面等几十秒，误以为离线数据丢了。
+  Future<void> _cancelGlobalConnect() async {
+    _setGlobalLoading(false);
+    try {
+      await controller.ble.stopScan();
+      await controller.ble.disconnect();
+    } catch (error) {
+      diagnostics.info('连接取消', '取消自动连接时出错：$error');
+    }
+    await controller.enterOfflineViewing();
+    connection.update(wifi: _wifiSnapshot != null, connecting: false);
+  }
+
+  /// 后台连接：只收起遮罩，连接流程继续跑，用户可以立即操作界面。
+  void _sendConnectToBackground() {
+    _setGlobalLoading(false);
+    diagnostics.info('连接后台', '用户选择后台连接，继续在后台尝试');
+  }
+
   void _showChannelMessage(String text) {
     final context = _navigatorKey.currentContext;
     if (context == null) return;
@@ -362,6 +384,10 @@ class _MimiVentAppState extends State<MimiVentApp> with WidgetsBindingObserver {
               _showChannelMessage('WiFi 仍被另一台手机占用，请继续使用蓝牙或稍后重试');
             } else if (code == 'OTA_BUSY') {
               _showChannelMessage('设备正在升级，暂时不能切换 WiFi');
+            } else if (failure.message.contains('Connection refused') ||
+                failure.message.contains('SocketException')) {
+              // 设备在线但端口没监听：多半是 WiFi 服务没起来（重启后未恢复）。
+              _showChannelMessage('设备的 WiFi 服务未就绪，请给设备断电重启后再试；期间可继续用蓝牙');
             } else {
               _showChannelMessage('WiFi 连接失败：${failure.message}');
             }
@@ -489,6 +515,10 @@ class _MimiVentAppState extends State<MimiVentApp> with WidgetsBindingObserver {
         debugShowCheckedModeBanner: false,
         theme: buildMimiVentTheme()
             .copyWith(scaffoldBackgroundColor: Colors.transparent),
+        // 日期滚轮需要中文年月日；缺 delegate 时会退回英文月份。
+        localizationsDelegates: GlobalMaterialLocalizations.delegates,
+        supportedLocales: const [Locale('zh', 'CN'), Locale('en', 'US')],
+        locale: const Locale('zh', 'CN'),
         navigatorKey: _navigatorKey,
         home: DashboardPage(
           controller: controller,
@@ -497,6 +527,8 @@ class _MimiVentAppState extends State<MimiVentApp> with WidgetsBindingObserver {
           onConnectBluetooth: _connectBluetooth,
           onSwitchToWifi: _switchToWifi,
           globalLoadingLabel: _globalLoading ? _globalLoadingLabel : null,
+          onCancelGlobalLoading: _cancelGlobalConnect,
+          onBackgroundConnect: _sendConnectToBackground,
         ),
       );
 }

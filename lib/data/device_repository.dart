@@ -10,6 +10,12 @@ abstract interface class DeviceRepository {
     String range, {
     int offset = 0,
   });
+  Future<Map<String, dynamic>> getStatisticsRange(
+    TimingProfile profile, {
+    required int from,
+    required int to,
+    required int tzOffsetSeconds,
+  });
   Future<DeviceEventPage> queryEvents(
       TimingProfile profile, DeviceEventQuery query);
   Future<void> saveSettings(TimingProfile profile, TimingSettings settings);
