@@ -5,7 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:mimivent_app/features/firmware_update/ota_package.dart';
 
 void main() {
-  test('packages independent 16 KiB deflate blocks and identifies the image',
+  test('packages independent 4 KiB deflate blocks and identifies the image',
       () {
     final image = Uint8List.fromList(List<int>.generate(
       OtaPackage.blockSize + 173,

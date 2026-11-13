@@ -303,13 +303,13 @@ extension _DashboardStatusCards on _DashboardPageState {
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis),
                   const SizedBox(height: 10),
-                  Text(
+                  _countdownBuilder(() => Text(
                       DeviceStatusPresenter.phaseDescription(status,
                           remainingMs: c.displayRemainingMs),
                       style: const TextStyle(
                           color: MimiVentColors.muted, fontSize: 13, height: 1),
                       maxLines: 1,
-                      overflow: TextOverflow.ellipsis),
+                      overflow: TextOverflow.ellipsis)),
                 ])),
             AnimatedContainer(
               duration: const Duration(milliseconds: 1800),
@@ -345,13 +345,19 @@ extension _DashboardStatusCards on _DashboardPageState {
                         ? MimiVentColors.amber
                         : MimiVentColors.mint),
                 const SizedBox(width: 7),
-                _pill(
+                _countdownBuilder(() => _pill(
                     DeviceStatusPresenter.phaseTagText(status,
                         remainingMs: c.displayRemainingMs),
-                    MimiVentColors.muted),
+                    MimiVentColors.muted)),
                 const SizedBox(width: 7),
-                _pill(c.wifiActive ? 'WiFi 在线' : '蓝牙在线', MimiVentColors.mint,
-                    icon: c.wifiActive
+                _pill(
+                    c.nasMqttActive
+                        ? (c.nasStateStale ? 'NAS 状态缓存' : 'NAS MQTT 在线')
+                        : '蓝牙在线',
+                    c.nasMqttActive && c.nasStateStale
+                        ? MimiVentColors.amber
+                        : MimiVentColors.mint,
+                    icon: c.nasMqttActive
                         ? Icons.wifi
                         : Icons.bluetooth_connected_rounded),
               ],
@@ -493,16 +499,21 @@ extension _DashboardStatusCards on _DashboardPageState {
           ),
           SizedBox(
             width: 78,
-            child: Text(
-              config.$3,
-              textAlign: TextAlign.right,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
-                  color: MimiVentColors.mint,
-                  fontSize: 17,
-                  fontWeight: FontWeight.w800),
-            ),
+            child: _countdownBuilder(() {
+              final liveConfig = DeviceStatusPresenter.runtimeDescription(
+                  status,
+                  remainingMs: c.displayRemainingMs);
+              return Text(
+                liveConfig.$3,
+                textAlign: TextAlign.right,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                    color: MimiVentColors.mint,
+                    fontSize: 17,
+                    fontWeight: FontWeight.w800),
+              );
+            }),
           ),
         ]),
         const SizedBox(height: 9),
@@ -745,19 +756,36 @@ extension _DashboardStatusCards on _DashboardPageState {
 
   Widget _connectionErrorBanner() {
     final error = c.lastError?.toLowerCase() ?? '';
+    final pendingNasControl = c.hasPendingNasMqttRequest;
+    final nasMqttControl = c.nasMqttActive;
     final connectionLost = error.contains('not connected') ||
         error.contains('蓝牙未连接') ||
         error.contains('连接已断开');
-    final title = connectionLost
-        ? '蓝牙连接已断开'
-        : c.connected
-            ? '设备操作失败'
-            : '设备连接失败';
-    final detail = connectionLost
-        ? '本次操作未执行，请重新连接设备。'
-        : c.connected
-            ? '设备未能完成这次操作，请检查连接后重试。'
-            : '没有连接成功，请确认设备通电且蓝牙可用。';
+    final title = pendingNasControl
+        ? 'NAS MQTT 控制待确认'
+        : nasMqttControl
+            ? 'NAS MQTT 控制失败'
+            : connectionLost
+                ? '蓝牙连接已断开'
+                : c.connected
+                    ? '设备操作失败'
+                    : '设备连接失败';
+    final ageMs = c.pendingNasMqttRequestAgeMs;
+    final agePrefix = c.pendingNasMqttRequestAgeEstimated ? '至少已等待' : '已等待';
+    final ageText = ageMs == null
+        ? '等待时长未知'
+        : ageMs < 60000
+            ? '$agePrefix ${ageMs ~/ 1000} 秒'
+            : '$agePrefix ${ageMs ~/ 60000} 分 ${(ageMs % 60000) ~/ 1000} 秒';
+    final detail = pendingNasControl
+        ? '上一条控制结果尚未核实（$ageText）。本次新命令未发送；请核对设备状态后再结束确认。'
+        : nasMqttControl
+            ? c.lastError ?? 'NAS MQTT 控制未完成，请检查 NAS 网关和设备状态。'
+            : connectionLost
+                ? '本次操作未执行，请重新连接设备。'
+                : c.connected
+                    ? '设备未能完成这次操作，请检查连接后重试。'
+                    : '没有连接成功，请确认设备通电且蓝牙可用。';
 
     return Container(
       padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
@@ -768,8 +796,12 @@ extension _DashboardStatusCards on _DashboardPageState {
       ),
       child: Row(
         children: [
-          const Icon(Icons.bluetooth_disabled_rounded,
-              color: MimiVentColors.red, size: 19),
+          Icon(
+              (pendingNasControl || nasMqttControl)
+                  ? Icons.cloud_sync_outlined
+                  : Icons.bluetooth_disabled_rounded,
+              color: MimiVentColors.red,
+              size: 19),
           const SizedBox(width: 9),
           Expanded(
             child: Column(
@@ -792,8 +824,11 @@ extension _DashboardStatusCards on _DashboardPageState {
           ),
           const SizedBox(width: 6),
           OutlinedButton(
-            onPressed:
-                c.busy || _reconnectInProgress ? null : _showReconnectChoices,
+            onPressed: c.busy || _reconnectInProgress
+                ? null
+                : (pendingNasControl || nasMqttControl)
+                    ? _openNasControlRecovery
+                    : _showReconnectChoices,
             style: OutlinedButton.styleFrom(
               foregroundColor: MimiVentColors.red,
               side: BorderSide(color: MimiVentColors.red.withOpacity(.45)),
@@ -807,9 +842,14 @@ extension _DashboardStatusCards on _DashboardPageState {
                     dimension: 14,
                     child: CircularProgressIndicator(strokeWidth: 2),
                   )
-                : const Text('重新连接',
-                    style:
-                        TextStyle(fontSize: 10, fontWeight: FontWeight.w700)),
+                : Text(
+                    pendingNasControl
+                        ? '处理确认'
+                        : nasMqttControl
+                            ? '查看 NAS'
+                            : '重新连接',
+                    style: const TextStyle(
+                        fontSize: 10, fontWeight: FontWeight.w700)),
           ),
         ],
       ),

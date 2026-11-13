@@ -11,7 +11,7 @@ class VersionCompatibilityNotice extends StatelessWidget {
     super.key,
   });
 
-  static const recommendedFirmwareVersion = '0.5.1';
+  static const recommendedFirmwareVersion = '0.7.0';
 
   final String appVersion;
   final String firmwareVersion;
@@ -31,7 +31,8 @@ class VersionCompatibilityNotice extends StatelessWidget {
       );
     }
 
-    final firmware = _compareVersions(firmwareVersion, '0.2.0');
+    final firmware =
+        _compareVersions(firmwareVersion, recommendedFirmwareVersion);
     if (firmware == null) {
       return _notice(
         icon: Icons.help_outline_rounded,
@@ -44,7 +45,8 @@ class VersionCompatibilityNotice extends StatelessWidget {
       return _notice(
         icon: Icons.warning_amber_rounded,
         title: '固件版本过旧',
-        detail: '当前 v$firmwareVersion 低于 App 控制接口最低要求 v0.2.0，请先更新固件。',
+        detail:
+            '当前 v$firmwareVersion 低于 App 最低支持版本 v$recommendedFirmwareVersion，请先更新固件。',
         color: MimiVentColors.red,
       );
     }

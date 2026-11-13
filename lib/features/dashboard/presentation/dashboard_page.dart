@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -30,6 +31,7 @@ import '../../diagnostics/diagnostics_page.dart';
 import '../../statistics/presentation/statistics_page.dart';
 import '../../firmware_update/firmware_update_page.dart';
 import '../../wifi_provisioning/wifi_provisioning_page.dart';
+import '../../local_network/wifi_binding_and_nas_page.dart';
 import '../../../shared/widgets/version_compatibility_notice.dart';
 
 part 'dashboard_connection.part.dart';
@@ -43,7 +45,7 @@ enum _TopBarMenuAction {
   firmwareUpdate,
   connectDevice,
   connectBluetooth,
-  switchToWifi,
+  switchToNasMqtt,
   offline,
   closeApp
 }
@@ -53,8 +55,11 @@ class DashboardPage extends StatefulWidget {
     required this.controller,
     required this.diagnostics,
     this.connection,
+    this.channelSwitchNotice,
     this.onConnectBluetooth,
-    this.onSwitchToWifi,
+    this.onBluetoothConnectCancelled,
+    this.onBluetoothConnected,
+    this.onSwitchToNasMqtt,
     this.globalLoadingLabel,
     this.onCancelGlobalLoading,
     this.onBackgroundConnect,
@@ -64,8 +69,11 @@ class DashboardPage extends StatefulWidget {
   final MimiVentController controller;
   final AppDiagnosticsLog diagnostics;
   final DeviceConnectionManager? connection;
+  final ValueListenable<(int, String)?>? channelSwitchNotice;
   final Future<void> Function()? onConnectBluetooth;
-  final Future<void> Function()? onSwitchToWifi;
+  final VoidCallback? onBluetoothConnectCancelled;
+  final Future<void> Function()? onBluetoothConnected;
+  final Future<void> Function()? onSwitchToNasMqtt;
   final String? globalLoadingLabel;
 
   /// 启动自动重连可能持续十几秒，期间整屏遮罩会让人误以为卡死。
@@ -79,6 +87,8 @@ class DashboardPage extends StatefulWidget {
 
 class _DashboardPageState extends State<DashboardPage> {
   final ModalCoordinator _modalCoordinator = ModalCoordinator();
+  final ValueNotifier<int> _countdownTick = ValueNotifier(0);
+  Timer? _countdownTimer;
   MimiVentController get c => widget.controller;
   bool get _deviceReady =>
       c.connected &&
@@ -100,11 +110,26 @@ class _DashboardPageState extends State<DashboardPage> {
   bool _wifiPromptShowing = false;
   String _appVersion = '读取中';
   String _appBuildNumber = '';
+  int _lastChannelSwitchNoticeId = 0;
 
   @override
   void initState() {
     super.initState();
     c.addListener(_syncDeviceUi);
+    widget.channelSwitchNotice?.addListener(_onChannelSwitchNotice);
+    // 计时文字用本地节拍更新，不触发整个 Dashboard 的 controller rebuild。
+    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      final status = c.status;
+      if (!mounted ||
+          ModalRoute.of(context)?.isCurrent == false ||
+          _activeTab != 0 ||
+          !c.nasMqttActive ||
+          status == null ||
+          (!status.fan && c.displayRemainingMs <= 0)) {
+        return;
+      }
+      _countdownTick.value++;
+    });
     // 路由依赖在首帧之后读取，避免 initState 中访问 ModalRoute 的继承状态。
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) _syncDeviceUi();
@@ -121,13 +146,36 @@ class _DashboardPageState extends State<DashboardPage> {
       widget.controller.addListener(_syncDeviceUi);
       _syncDeviceUi();
     }
+    if (oldWidget.channelSwitchNotice != widget.channelSwitchNotice) {
+      oldWidget.channelSwitchNotice?.removeListener(_onChannelSwitchNotice);
+      widget.channelSwitchNotice?.addListener(_onChannelSwitchNotice);
+      _onChannelSwitchNotice();
+    }
   }
 
   @override
   void dispose() {
     c.removeListener(_syncDeviceUi);
+    widget.channelSwitchNotice?.removeListener(_onChannelSwitchNotice);
+    _countdownTimer?.cancel();
+    _countdownTick.dispose();
     super.dispose();
   }
+
+  void _onChannelSwitchNotice() {
+    final notice = widget.channelSwitchNotice?.value;
+    if (!mounted || notice == null || notice.$1 <= _lastChannelSwitchNoticeId) {
+      return;
+    }
+    _lastChannelSwitchNoticeId = notice.$1;
+    _toast(notice.$2);
+  }
+
+  Widget _countdownBuilder(Widget Function() builder) =>
+      ValueListenableBuilder<int>(
+        valueListenable: _countdownTick,
+        builder: (context, _, __) => builder(),
+      );
 
   bool _handleScrollNotification(ScrollNotification notification) {
     if (notification is! ScrollUpdateNotification &&
@@ -177,7 +225,10 @@ class _DashboardPageState extends State<DashboardPage> {
                             padding: const EdgeInsets.fromLTRB(18, 4, 18, 0),
                             child: _connectionStatusBanner(),
                           ),
-                        if (c.lastError != null &&
+                        if ((c.lastError != null ||
+                                (c.hasPendingNasMqttRequest &&
+                                    !c.nasMqttWriteInFlight &&
+                                    c.pendingNasMqttAction == null)) &&
                             c.connected &&
                             !c.offlineViewing)
                           Padding(
@@ -212,7 +263,7 @@ class _DashboardPageState extends State<DashboardPage> {
           );
           final content = Stack(fit: StackFit.expand, children: [
             page,
-            if (c.pendingWifiAction != null ||
+            if (c.pendingNasMqttAction != null ||
                 widget.globalLoadingLabel != null)
               Positioned.fill(
                 child: Stack(children: [
@@ -235,15 +286,15 @@ class _DashboardPageState extends State<DashboardPage> {
                                   color: MimiVentColors.mint)),
                           const SizedBox(height: 14),
                           Text(
-                              c.pendingWifiAction != null
-                                  ? '正在执行：${c.pendingWifiAction}'
+                              c.pendingNasMqttAction != null
+                                  ? '正在执行：${c.pendingNasMqttAction}'
                                   : widget.globalLoadingLabel!,
                               style: const TextStyle(
                                   color: Colors.white,
                                   fontSize: 14,
                                   fontWeight: FontWeight.w600)),
                           if (widget.globalLoadingLabel != null &&
-                              c.pendingWifiAction == null) ...[
+                              c.pendingNasMqttAction == null) ...[
                             const SizedBox(height: 16),
                             Row(
                               mainAxisSize: MainAxisSize.min,
@@ -252,14 +303,12 @@ class _DashboardPageState extends State<DashboardPage> {
                                   onPressed: widget.onCancelGlobalLoading ==
                                           null
                                       ? null
-                                      : () =>
-                                          widget.onCancelGlobalLoading!(),
+                                      : () => widget.onCancelGlobalLoading!(),
                                   child: const Text('取消'),
                                 ),
                                 const SizedBox(width: 4),
                                 TextButton(
-                                  onPressed:
-                                      widget.onBackgroundConnect,
+                                  onPressed: widget.onBackgroundConnect,
                                   child: const Text('后台连接'),
                                 ),
                               ],
@@ -416,8 +465,8 @@ class _DashboardPageState extends State<DashboardPage> {
                 _leaveOfflineAndConnect();
               case _TopBarMenuAction.connectBluetooth:
                 widget.onConnectBluetooth?.call();
-              case _TopBarMenuAction.switchToWifi:
-                widget.onSwitchToWifi?.call();
+              case _TopBarMenuAction.switchToNasMqtt:
+                widget.onSwitchToNasMqtt?.call();
               case _TopBarMenuAction.offline:
                 _enterOfflineViewing();
               case _TopBarMenuAction.closeApp:
@@ -425,19 +474,19 @@ class _DashboardPageState extends State<DashboardPage> {
             }
           },
           itemBuilder: (context) => [
-            if (widget.onSwitchToWifi != null &&
+            if (widget.onSwitchToNasMqtt != null &&
                 (widget.connection?.channel == DeviceChannel.ble ||
-                    !c.wifiActive))
+                    !c.nasMqttActive))
               const PopupMenuItem(
-                value: _TopBarMenuAction.switchToWifi,
+                value: _TopBarMenuAction.switchToNasMqtt,
                 child: Row(children: [
-                  Icon(Icons.wifi_rounded,
+                  Icon(Icons.cloud_sync_outlined,
                       color: MimiVentColors.mint, size: 19),
                   SizedBox(width: 11),
-                  Text('切换回 WiFi 控制'),
+                  Text('切换回 NAS MQTT 控制'),
                 ]),
               ),
-            if (c.wifiActive && widget.onConnectBluetooth != null)
+            if (c.nasMqttActive && widget.onConnectBluetooth != null)
               const PopupMenuItem(
                 value: _TopBarMenuAction.connectBluetooth,
                 child: Row(children: [
@@ -487,7 +536,7 @@ class _DashboardPageState extends State<DashboardPage> {
                   Text('WiFi 配网'),
                 ]),
               ),
-            if (!c.wifiActive)
+            if (!c.nasMqttActive)
               PopupMenuItem(
                 value: _TopBarMenuAction.firmwareUpdate,
                 enabled: c.connected && !c.offlineViewing,

@@ -1,7 +1,7 @@
 import 'dart:async';
 
 /// 外部任务串行执行；只有当前任务自身的异步调用链可以重入。
-class WifiSerialExecutor {
+class NasGatewaySerialExecutor {
   final Object _zoneKey = Object();
   final List<_Task> _tasks = [];
   _Owner? _activeOwner;
@@ -29,7 +29,8 @@ class WifiSerialExecutor {
     final task = _tasks.removeAt(index < 0 ? 0 : index);
     final owner = _Owner();
     _activeOwner = owner;
-    unawaited(runZoned(task.run, zoneValues: {_zoneKey: owner}).whenComplete(() {
+    unawaited(
+        runZoned(task.run, zoneValues: {_zoneKey: owner}).whenComplete(() {
       _activeOwner = null;
       _pump();
     }));

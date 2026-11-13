@@ -1,10 +1,10 @@
 import 'dart:async';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:mimivent_app/features/wifi_control/wifi_serial_executor.dart';
+import 'package:mimivent_app/features/local_network/nas_gateway_serial_executor.dart';
 
 void main() {
   test('外部请求不能因已有任务运行而绕过队列，内部读取可重入', () async {
-    final queue = WifiSerialExecutor();
+    final queue = NasGatewaySerialExecutor();
     final release = Completer<void>();
     final started = Completer<void>();
     final order = <String>[];
@@ -25,7 +25,7 @@ void main() {
   });
 
   test('失败后继续执行，优先任务插在等待队列前面', () async {
-    final queue = WifiSerialExecutor();
+    final queue = NasGatewaySerialExecutor();
     final release = Completer<void>();
     final order = <String>[];
     final failed = queue.run<void>(() async {

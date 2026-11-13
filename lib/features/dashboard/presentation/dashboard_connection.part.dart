@@ -42,12 +42,14 @@ extension _DashboardConnectionSection on _DashboardPageState {
     await _scanAndConnect();
   }
 
-  Future<void> _openDiagnostics() => Navigator.of(context).push<void>(
-        MaterialPageRoute(
-          builder: (_) =>
-              DiagnosticsPage(log: widget.diagnostics, controller: c),
-        ),
-      );
+  Future<void> _openDiagnostics() async {
+    final switchToMqtt = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder: (_) => DiagnosticsPage(log: widget.diagnostics, controller: c),
+      ),
+    );
+    if (switchToMqtt == true) await widget.onSwitchToNasMqtt?.call();
+  }
 
   Future<void> _openFirmwareUpdate() => Navigator.of(context).push<void>(
         MaterialPageRoute(
@@ -55,11 +57,38 @@ extension _DashboardConnectionSection on _DashboardPageState {
         ),
       );
 
-  Future<void> _openWifiProvisioning() => Navigator.of(context).push<void>(
-        MaterialPageRoute(
-          builder: (_) => WifiProvisioningPage(ble: c.ble),
+  Future<void> _openWifiProvisioning() async {
+    final switchToMqtt = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder: (_) => WifiProvisioningPage(ble: c.ble),
+      ),
+    );
+    if (switchToMqtt == true) await widget.onSwitchToNasMqtt?.call();
+  }
+
+  Future<void> _openNasControlRecovery() async {
+    final switchToMqtt = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder: (_) => WifiBindingAndNasPage(
+          ble: c.ble,
+          onOpenWifiProvisioning: () {
+            final navigator = Navigator.of(context);
+            unawaited(navigator
+                .push<bool>(MaterialPageRoute(
+              builder: (_) => WifiProvisioningPage(ble: c.ble),
+            ))
+                .then((shouldSwitch) {
+              if (shouldSwitch == true && mounted && navigator.canPop()) {
+                navigator.pop(true);
+              }
+            }));
+          },
         ),
-      );
+      ),
+    );
+    if (switchToMqtt == true) await widget.onSwitchToNasMqtt?.call();
+    await c.refreshPendingNasMqttRequest();
+  }
 
   Future<void> _showReconnectChoices() async {
     if (c.busy || _reconnectInProgress) return;
@@ -326,28 +355,29 @@ extension _DashboardConnectionSection on _DashboardPageState {
                                     Padding(
                                       padding: const EdgeInsets.only(top: 12),
                                       child: SizedBox(
-                                      height: 34,
-                                      child: Row(
-                                        children: [
-                                          const Spacer(),
-                                          IconButton(
-                                            tooltip: '关闭',
-                                            onPressed: isConnecting
-                                                ? null
-                                                : () => Navigator.pop(context),
-                                            icon: const Icon(
-                                                Icons.close_rounded,
-                                                size: 21),
-                                            padding: EdgeInsets.zero,
-                                            constraints:
-                                                const BoxConstraints.tightFor(
-                                                    width: 34, height: 34),
-                                            visualDensity:
-                                                VisualDensity.compact,
-                                          ),
-                                        ],
+                                        height: 34,
+                                        child: Row(
+                                          children: [
+                                            const Spacer(),
+                                            IconButton(
+                                              tooltip: '关闭',
+                                              onPressed: isConnecting
+                                                  ? null
+                                                  : () =>
+                                                      Navigator.pop(context),
+                                              icon: const Icon(
+                                                  Icons.close_rounded,
+                                                  size: 21),
+                                              padding: EdgeInsets.zero,
+                                              constraints:
+                                                  const BoxConstraints.tightFor(
+                                                      width: 34, height: 34),
+                                              visualDensity:
+                                                  VisualDensity.compact,
+                                            ),
+                                          ],
+                                        ),
                                       ),
-                                    ),
                                     ),
                                     Center(
                                       child: Text(
@@ -526,6 +556,11 @@ extension _DashboardConnectionSection on _DashboardPageState {
       );
     } finally {
       _scanSheetOpen = false;
+      // 用户关闭扫描面板或离开连接流程时，通知上层撤销待切换意图；
+      // 控制器初始化已完成则说明连接成功，不应走取消分支。
+      if (!c.bluetoothControlReady) {
+        widget.onBluetoothConnectCancelled?.call();
+      }
       // 点空白或关闭按钮只关闭界面，不会取消 BLE 扫描；记住用户的关闭操作，
       // 避免后续扫描结果通知再次把同一个弹窗自动打开。
       if (c.ble.isScanning) _scanSheetDismissedDuringScan = true;
@@ -628,6 +663,7 @@ extension _DashboardConnectionSection on _DashboardPageState {
     BuildContext modalContext,
     ScanResult result,
   ) async {
+    final wasNasMqttActive = c.nasMqttActive;
     c.diagnostics?.info('蓝牙连接', '用户开始连接 ${result.device.remoteId.str}');
     try {
       if (mounted) {
@@ -638,9 +674,12 @@ extension _DashboardConnectionSection on _DashboardPageState {
         });
       }
       await c.connect(result.device);
-      if (!c.connected) {
+      if (!c.bluetoothControlReady) {
         throw StateError(c.lastError ?? '设备连接已中断，请重新连接');
       }
+      // 等待上层完成 make-before-break 收尾；之后再显示本地通道提示，
+      // 避免 App 根层提示被连接弹窗的通用“已连接”提示覆盖。
+      await widget.onBluetoothConnected?.call();
       c.diagnostics?.info('蓝牙连接', '控制器初始化完成，准备关闭搜索弹窗');
       if (!modalContext.mounted) return;
       final route = ModalRoute.of(modalContext);
@@ -653,7 +692,9 @@ extension _DashboardConnectionSection on _DashboardPageState {
           _deviceConnectActionBusy = false;
         });
       }
-      _toast(c.lastError ?? '${AppIdentity.productName} 已连接');
+      _toast(wasNasMqttActive
+          ? '已切换到蓝牙控制'
+          : (c.lastError ?? '${AppIdentity.productName} 已连接'));
     } catch (error, stackTrace) {
       c.diagnostics?.error('连接页面', error.toString(), stackTrace: stackTrace);
       if (mounted) {

@@ -1,5 +1,7 @@
 # MimiVent 统计查询与存储 v2.1
 
+> NAS 归档、传输分页、容量交叉检查及连接校时见[蓝牙、MQTT 与 NAS 优化方案 v1.2](ble-mqtt-nas-optimization-v1.md)。本文件仍定义设备统计的冻结时区、批次、完整性和存储迁移语义；传输通道变化不改变这些规则。校时首次回填与已有 UTC 的后续跳变分别处理，补充目标约束见优化方案 §14.2.2；该段包含待实现改造，不表示当前活动合并已全部改用单调时间。
+
 状态：可实现规格（取代 v2 的"设计定稿"；已吸收多轮评审，见附录 B）
 范围：MimiVent 固件、MimiVent Android App
 目标版本：App `0.5.1+9` 之后、固件 `0.5.1` 之后的统计重构版本
@@ -2136,7 +2138,7 @@ FormatException: BLE V2 响应长度超过上限
 
 **上限改为 24576**（覆盖 30 天满载）。同时连接建立后请求 `ConnectionPriority.high`，把连接间隔从 30–50 ms 压到 11–15 ms，分片吞吐翻倍。
 
-### D.4 WiFi 通道的两道资源门槛
+### D.4 旧固件 WiFi HTTPS 通道的两道资源门槛（现已移除）
 
 **门槛一：服务启动的堆下限。** `WifiHttpsServer::start()` 原本要求空闲堆 ≥ 56 KB，但 schema 5 的常驻统计缓冲（`daily[30]` 9.4 KB + `events[512]` 10 KB，见 D.6 已降到 256 条）把空闲堆压到约 50 KB，WiFi 服务永远起不来：
 
@@ -2217,3 +2219,48 @@ local.eventCount > kEventCapacity → return false;   // 旧快照 eventCount=51
 `events[512]` 占用的 10 KB 连续块会把堆切得很碎；缩到 5 KB 后碎片合并，`largest` 涨了约 25 KB。`minimum` 从 160 字节升到 39 KB，说明设备不再贴着内存悬崖运行——这才是 WiFi 握手稳定的根本原因，而不只是「省了 5 KB」。
 
 **连带影响**：事件明细的实际覆盖范围收窄到约 3 天，App 的明细入口同步收敛为「今天 / 昨天 / 前天」；近 7 天与「更多时间」不再拉取事件，只展示图表与按日概览。
+
+### D.7 控制去重记录不能放 NVS
+
+**现象**：App 通过 MQTT 通道下发控制时，设备稳定返回 `503 DEDUP_UNAVAILABLE`，风机不动作；同一设备经 BLE 控制正常。
+
+**根因**：去重记录（32 条 `WriteRecord` 打包成 2,696 字节的 `PersistSlot`）用 `nvs_set_blob` 存在 `mv-p4req` 里，`req-a` / `req-b` 双槽交替写入。NVS 的磨损均衡不会原地覆盖：每次写入都落到新页，旧页标记失效。累计若干次控制后分区耗尽：
+
+```
+nvs_set_blob(...) == ESP_ERR_NVS_NOT_ENOUGH_SPACE
+→ saveWrites() 返回 false → beginWrite() 返回 -1
+→ 503 DEDUP_UNAVAILABLE（App 显示"设备存储不足，无法安全去重"）
+```
+
+**为什么会误判成内存问题**：`saveWrites()` 里 `new(std::nothrow) PersistSlot{}` 和 `nvs_set_blob` 失败共用同一个静默 `return false`，而 `new` 那条路径没有日志。串口只看到 503、看不到失败原因，于是被当成堆碎片导致的分配失败——实测 `largest` 有 31 KB，远超 2.7 KB 需求，不是内存问题。
+
+**规则**：NVS 只存**低频、小块、配置类**数据（绑定、时序设置、broker 配置）。高频改写、大块、需要双槽切换的数据一律放 SPIFFS/LittleFS 文件：
+
+| 数据类型 | 存放位置 | 理由 |
+|---|---|---|
+| 统计快照（19,656 B / 14,536 B） | SPIFFS 双槽 + CRC | 频繁写、大块 |
+| 控制去重记录（2,696 B） | 独立双槽文件 | 每次控制都写 |
+| WiFi 绑定、时序、broker | NVS | 低频、小块 |
+
+**配套要求**：去重记录写入必须**校验通过后才执行控制**，否则会出现「控制已执行但记录没落盘」，重启后同一条命令可能被重复执行。MQTT 发件箱也要为控制回执预留空间，否则 ack 被丢弃会让 App 卡在 `REQUEST_UNKNOWN`（"上次控制结果仍待确认"）。
+
+### D.8 关闭板载 HTTPS 换取内存余量
+
+**D.4 的三项措施（降低堆门槛、缩小 TLS 栈、精简响应）只是在争取余量，不是终点。** ESP32-C3 长期运行后堆碎片使最大连续块停在约 12 KB，而一次 TLS 握手需要 16–18 KB，`GET /api/status` 因此稳定失败（能取到证书，HTTP 返回 `000`）。真正的解法是关掉这条通道。
+
+编译期关闭 HTTPS（`MIMIVENT_HTTPS_ENABLED=0`，见 `AppConfig.h`；`build_firmware.sh` 的 `read4k` 模式带此宏）后的实测：
+
+```
+静态内存: 75,032 → 70,784
+heap:     25,148 → 46,376
+largest:  12,276 → 36,852
+minimum:     196 → 41,184
+```
+
+**关闭 HTTPS 时的三个必要改动**，缺一个都会让通道半死不活：
+
+1. `start()` 里 `commandMutex` 与 `loadWrites()` 必须在 `#if` **之前**执行——MQTT 命令通道复用这套设施，提前 return 会让 `wifiHttpsMqttCommand` 因 mutex 为空直接返回 503；
+2. `wifiHttpsServerReady()` 必须**如实**返回 `server != nullptr`。谎报 true 会让旧版 App 去连一个不存在的端口，最终报「设备未完成 NAS MQTT 控制」，比如实拒绝更难排查；
+3. MQTT 的启动条件改用独立的 `controlChannelReady()`：关闭 HTTPS 时只检查设备身份与绑定，不再要求 HTTP 服务存在。
+
+**读通路迁移**：设备 HTTPS 关闭后，App 的状态读取改走 `App → NAS gateway → MQTT state 快照`。网关需要在订阅里加上 `mimivent/v1/+/state`，并对外提供 `GET /api/v1/devices/{id}/state`；`deviceId` / `bindingState` / `protocolVersion` 这几个字段原本只由 HTTPS 响应追加，MQTT 的 state 里没有，网关返回时要补齐。

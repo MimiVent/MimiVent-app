@@ -8,12 +8,34 @@ extension _DashboardActionSection on _DashboardPageState {
     if (_deviceReady) return true;
     final accepted = await _confirm(
       title: '需要连接蓝牙',
-      message: '连接 MimiVent 后才能控制风机和修改设置。',
+      message: '通过蓝牙连接 MimiVent 后才能控制风机和修改设置。',
       detail: '连接后请重新选择操作，当前操作不会自动执行。',
       confirm: '连接设备',
     );
     if (accepted && mounted) await _scanAndConnect();
     return false;
+  }
+
+  Future<OperationResult> _executeWithReplacementConfirmation(
+      ControlOperation action,
+      {required bool replace}) async {
+    final result = await c.executeOperation(action, replace: replace);
+    if (result is! OperationNeedsReplacement) return result;
+    // NAS 快照可能落后于设备；以明确拒绝为准补出确认，不能静默覆盖任务。
+    if (!mounted || replace) {
+      return OperationRejected(action, '设备状态已变化，请刷新后重试');
+    }
+    final accepted = await _confirm(
+      title: '停止当前流程并切换？',
+      message: '设备正在执行限时任务，当前显示的状态尚未同步。',
+      detail: '确认后会取消设备当前计时，并执行刚才选择的操作。',
+      confirm: '停止并切换',
+    );
+    if (!accepted || !mounted) return OperationRejected(action, '已取消切换');
+    final confirmed = await c.executeOperation(action, replace: true);
+    return confirmed is OperationNeedsReplacement
+        ? OperationRejected(action, '设备状态再次变化，请刷新后重试')
+        : confirmed;
   }
 
   Future<void> _runAction(ControlOperation action,
@@ -51,7 +73,8 @@ extension _DashboardActionSection on _DashboardPageState {
     try {
       switch (action) {
         case ControlOperation.automatic:
-          final result = await c.executeOperation(action, replace: replace);
+          final result = await _executeWithReplacementConfirmation(action,
+              replace: replace);
           if (result is OperationRejected) {
             _toast('操作失败：${result.reason}');
             break;
@@ -59,7 +82,8 @@ extension _DashboardActionSection on _DashboardPageState {
           _toast('自动感应已恢复，风机已停止');
           break;
         case ControlOperation.exhaust:
-          final result = await c.executeOperation(action, replace: replace);
+          final result = await _executeWithReplacementConfirmation(action,
+              replace: replace);
           if (result is OperationRejected) {
             _toast('操作失败：${result.reason}');
             break;
@@ -67,7 +91,8 @@ extension _DashboardActionSection on _DashboardPageState {
           _toast(sameTask ? '临时排风时间已重置' : '临时排风已启动');
           break;
         case ControlOperation.pause:
-          final result = await c.executeOperation(action, replace: replace);
+          final result = await _executeWithReplacementConfirmation(action,
+              replace: replace);
           if (result is OperationRejected) {
             _toast('操作失败：${result.reason}');
             break;
@@ -75,7 +100,8 @@ extension _DashboardActionSection on _DashboardPageState {
           _toast(sameTask ? '临时暂停时间已重置' : '临时暂停已启动');
           break;
         case ControlOperation.forceExhaust:
-          final result = await c.executeOperation(action, replace: replace);
+          final result = await _executeWithReplacementConfirmation(action,
+              replace: replace);
           if (result is OperationRejected) {
             _toast('操作失败：${result.reason}');
             break;

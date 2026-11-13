@@ -4,7 +4,7 @@ import 'package:flutter/services.dart';
 import '../../app/theme/mimivent_theme.dart';
 import '../../core/diagnostics/app_diagnostics_log.dart';
 import '../../data/mimivent_controller.dart';
-import '../wifi_control/wifi_control_page.dart';
+import '../local_network/wifi_binding_and_nas_page.dart';
 import '../../shared/widgets/top_toast.dart';
 
 /// 显示可在断开蓝牙时读取的本地 BLE 与设备接口事务记录。
@@ -38,10 +38,17 @@ class DiagnosticsPage extends StatelessWidget {
             if (controller != null)
               IconButton(
                 tooltip: 'WiFi 绑定与状态',
-                onPressed: () => Navigator.of(context).push<void>(
-                  MaterialPageRoute(
-                      builder: (_) => WifiControlPage(ble: controller!.ble)),
-                ),
+                onPressed: () async {
+                  final switchToMqtt = await Navigator.of(context).push<bool>(
+                    MaterialPageRoute(
+                      builder: (_) =>
+                          WifiBindingAndNasPage(ble: controller!.ble),
+                    ),
+                  );
+                  if (switchToMqtt == true && context.mounted) {
+                    Navigator.of(context).pop(true);
+                  }
+                },
                 icon: const Icon(Icons.wifi_rounded),
               ),
             IconButton(

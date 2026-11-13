@@ -12,9 +12,11 @@ import '../api/mimivent_api.dart';
 import '../ble/mimivent_ble_manager.dart';
 import '../core/diagnostics/app_diagnostics_log.dart';
 import '../features/control/control_operation.dart';
-import '../features/wifi_control/wifi_binding.dart';
-import '../features/wifi_control/wifi_read_transport.dart';
-import '../features/wifi_control/wifi_serial_executor.dart';
+import '../features/local_network/wifi_binding.dart';
+import '../features/local_network/nas_gateway_transport.dart';
+import '../features/local_network/nas_gateway_models.dart';
+import '../features/local_network/nas_gateway_serial_executor.dart';
+import '../features/local_network/nas_pending_request_store.dart';
 import 'ble_device_repository.dart';
 import 'device_repository.dart';
 import 'settings_draft.dart';
@@ -28,15 +30,27 @@ class MimiVentController extends ChangeNotifier {
       {MimiVentBleManager? bleManager,
       DeviceRepository? deviceRepository,
       this.appVersionOverride,
-      this.diagnostics})
+      this.diagnostics,
+      NasGatewayTransport? nasGatewayTransport})
       : ble = bleManager ?? MimiVentBleManager(diagnostics: diagnostics) {
+    _nasGatewayTransport = nasGatewayTransport ?? NasGatewayTransport();
     // 默认 Repository 与扫描/连接共用同一个 BLE 实例；测试可注入替身。
     repository = deviceRepository ??
         BleDeviceRepository(MimiVentApi(ble, diagnostics: diagnostics));
+    _lastBleConnected = ble.isConnected;
     ble.addListener(_onBleChanged);
-    _pollTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (wifiActive && (status?.fan == true || displayRemainingMs > 0)) {
-        _notifyIfAlive();
+    // MQTT 状态有独立采样和年龄；本地显示倒计时每秒刷新即可，不额外发网络请求。
+    _pollTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      if (hasPendingNasMqttRequest &&
+          _pendingNasMqttRequestCreatedAtMs != null) {
+        final nextAge = (DateTime.now().millisecondsSinceEpoch -
+                _pendingNasMqttRequestCreatedAtMs!)
+            .clamp(0, 0x7fffffffffffffff)
+            .toInt();
+        if (nextAge != pendingNasMqttRequestAgeMs) {
+          pendingNasMqttRequestAgeMs = nextAge;
+          _notifyIfAlive();
+        }
       }
       // 连接 12 秒仍无状态：多半是 GATT 缓存失效（133），直接给出可操作提示。
       if (ble.isConnected &&
@@ -69,25 +83,26 @@ class MimiVentController extends ChangeNotifier {
   late DeviceRepository repository;
   DeviceStatus? status;
 
-  /// 两次 WiFi 状态采样之间本地插值，让运行时间每秒推进。
+  /// 两次 NAS 状态采样之间本地插值，让运行时间每秒推进。
   int get displayFanRunMs {
     final current = status;
     if (current == null) return 0;
-    if (!wifiActive || !current.fan) return current.fanRunMs;
+    if (!nasMqttActive || !current.fan) return current.fanRunMs;
     final started = _fanRunStartedAt;
     if (started == null) return current.fanRunMs;
     final elapsed = DateTime.now().difference(started).inMilliseconds;
     return elapsed > 0 ? elapsed : 0;
   }
 
-  /// 两次 WiFi 状态采样之间本地推进倒计时，避免倒计时每 3–6 秒才跳一次。
+  /// 两次 NAS 状态采样之间本地推进倒计时，避免倒计时每 3–6 秒才跳一次。
   int get displayRemainingMs {
     final current = status;
     if (current == null) return 0;
     final remaining = current.remainingMs;
-    if (!wifiActive || _wifiStatusAt == null || remaining <= 0)
+    if (!nasMqttActive || _nasStatusAt == null || remaining <= 0) {
       return remaining;
-    final elapsed = DateTime.now().difference(_wifiStatusAt!).inMilliseconds;
+    }
+    final elapsed = DateTime.now().difference(_nasStatusAt!).inMilliseconds;
     final value = remaining - elapsed;
     return value > 0 ? value : 0;
   }
@@ -101,7 +116,19 @@ class MimiVentController extends ChangeNotifier {
   final Map<String, DateTime> _statisticsCacheUpdatedAt = {};
   // 范围查询缓存：键由 from/to（量化后）/tz 组成，设备身份与 dataEpoch 另行校验。
   final Map<String, Map<String, dynamic>> _statisticsRangeByKey = {};
-  final Set<String> _statisticsRangeRequests = {};
+  final Map<String, Future<void>> _statisticsRangeRequests = {};
+  final Map<String, bool Function()> _statisticsRangeReadGuards = {};
+  final Map<String, String> _statisticsDatasetByScope = {};
+  final Map<String, Future<String?>> _statisticsDatasetLoadsByScope = {};
+  final Map<String, String> _statisticsPeerScopeByScope = {};
+  final Map<String, DateTime> _statisticsRangeUpdatedAt = {};
+  static const _statisticsRangeCachePrefix = 'mimivent.statistics.range.v2.';
+  static const _statisticsDatasetScopePrefix =
+      'mimivent.statistics.dataset-scope.v1.';
+  static const _statisticsPeerScopePrefix =
+      'mimivent.statistics.peer-scope.v1.';
+  static const _statisticsDatasetEpochPrefix =
+      'mimivent.statistics.dataset-epoch.v1.';
   TimingSettings? settings;
   SettingsDraft? _settingsDraft;
   TimingSettings? get draftSettings => _settingsDraft?.value;
@@ -120,6 +147,8 @@ class MimiVentController extends ChangeNotifier {
   int _sessionGeneration = 0;
   int _connectAttempt = 0;
   int? _connectionBootstrapAttempt;
+  bool _bluetoothControlReady = false;
+  bool _lastBleConnected = false;
   Future<void>? _closingBluetoothSession;
   String? _appVersionCache;
   static const _profileKey = 'mimivent.selected_profile';
@@ -127,23 +156,44 @@ class MimiVentController extends ChangeNotifier {
   static const _statisticsCacheKeyPrefix = 'mimivent.statistics.cache.';
   String? lastError;
   WifiBinding? _wifiBinding;
-  WifiReadTransport? _wifiTransport;
-  bool _wifiVersionCompatible = true;
-  final _wifiExecutor = WifiSerialExecutor();
-  Timer? _wifiHealthTimer;
-  Timer? _wifiSyncTimer;
-  bool _wifiHealthInFlight = false;
-  bool wifiLost = false;
-  bool wifiBusy = false;
-  String? pendingWifiAction;
-  int _wifiHealthFailures = 0;
-  bool _wifiStatsSerialized = false;
-  int _wifiSyncFailures = 0;
+  bool _nasMqttSessionReady = false;
+  int _nasMqttSessionGeneration = 0;
+  int _nasSnapshotRevision = 0;
+  int _nasFastSyncUntilMs = 0;
+  // 最近一次控制落地的时间戳。控制后几秒内到达的"陈旧"快照要丢弃：
+  // 它们出发于控制之前，回来时控制已经生效，直接应用会把 UI 拉回旧状态。
+  // 蓝牙路径用 refresh(expectedGeneration:) 规避同一问题，NAS 路径靠这个时间窗。
+  int _nasControlAppliedAtMs = 0;
+  late final NasGatewayTransport _nasGatewayTransport;
+  bool _nasVersionCompatible = true;
+  int _nasWritesInFlight = 0;
+  bool get nasMqttWriteInFlight => _nasWritesInFlight > 0;
+  TimingProfile? _nasExpectedProfile;
+  TimingSettings? _nasExpectedSettings;
+  DateTime? _nasConfigurationDeadline;
+
+  final _nasGatewayExecutor = NasGatewaySerialExecutor();
+  final _nasControlExecutor = NasGatewaySerialExecutor();
+  Timer? _nasSyncTimer;
+  bool nasMqttLost = false;
+  bool nasMqttBusy = false;
+  bool nasStateStale = false;
+  int nasStateAgeMs = 0;
+  bool hasPendingNasMqttRequest = false;
+  int? pendingNasMqttRequestAgeMs;
+  bool pendingNasMqttRequestAgeEstimated = false;
+  int? _pendingNasMqttRequestCreatedAtMs;
+  String? _lastNasPendingDeviceId;
+  String? _lastNasPendingTokenId;
+  String? pendingNasMqttAction;
+  bool _nasStatsSerialized = false;
+  int _nasSyncFailures = 0;
   bool _appForeground = true;
-  DateTime? _wifiStatusAt;
+  bool _nasRefreshInFlight = false;
+  DateTime? _nasStatusAt;
   DateTime? _fanRunStartedAt;
 
-  bool get wifiActive => _wifiBinding != null;
+  bool get nasMqttActive => _wifiBinding != null && _nasMqttSessionReady;
 
   /// 固件是否支持 /api/stats/range（依据 /api/status 的能力字段）。
   bool get supportsStatisticsRange {
@@ -176,28 +226,61 @@ class MimiVentController extends ChangeNotifier {
     _lastTzOffsetSeconds = null;
     _lastStatsRangeApiVersion = null;
   }
+
   final Map<String, String> _rangeEpochByScope = {};
 
   String get _rangeScope {
-    final identity = wifiActive
+    final identity = nasMqttActive
         ? 'wifi:${_wifiBinding!.deviceId}'
-        : ble.connectedDeviceId == null ? null : 'ble:${ble.connectedDeviceId}';
+        : ble.connectedDeviceId == null
+            ? null
+            : 'ble:${ble.connectedDeviceId}';
     if (identity != null) _lastRangeScope = identity;
     return _lastRangeScope;
   }
 
-  String _rangeKey(StatisticsQuery query) =>
-      '$_rangeScope|${_rangeEpochByScope[_rangeScope] ?? ''}|2|${query.cacheKey}';
+  String _rangeKeyFor(String scope, StatisticsQuery query) =>
+      '$scope|${_rangeEpochByScope[scope] ?? ''}|2|${query.cacheKey}';
 
-  Map<String, dynamic>? statisticsRangeFor(StatisticsQuery query) =>
-      _statisticsRangeByKey[_rangeKey(query)];
+  String _rangeKey(StatisticsQuery query) => _rangeKeyFor(_rangeScope, query);
 
-  bool get connected => ble.isConnected || wifiActive;
+  String? _statisticsPeerRangeKey(String scope, StatisticsQuery query) {
+    final peerScope = _statisticsPeerScopeByScope[scope];
+    return peerScope == null ? null : _rangeKeyFor(peerScope, query);
+  }
+
+  Map<String, dynamic>? statisticsRangeFor(StatisticsQuery query) {
+    final scope = _rangeScope;
+    final own = _statisticsRangeByKey[_rangeKeyFor(scope, query)];
+    if (own != null) return own;
+    final peerKey = _statisticsPeerRangeKey(scope, query);
+    return peerKey == null ? null : _statisticsRangeByKey[peerKey];
+  }
+
+  DateTime? statisticsRangeUpdatedAtFor(StatisticsQuery query) {
+    final scope = _rangeScope;
+    final ownKey = _rangeKeyFor(scope, query);
+    final own = _statisticsRangeUpdatedAt[ownKey];
+    if (own != null) return own;
+    final peerKey = _statisticsPeerRangeKey(scope, query);
+    return peerKey == null ? null : _statisticsRangeUpdatedAt[peerKey];
+  }
+
+  bool get connected => ble.isConnected || nasMqttActive;
   bool get _connectionBootstrapInProgress =>
       _connectionBootstrapAttempt != null;
+  bool get bluetoothBootstrapInProgress => _connectionBootstrapInProgress;
+  bool get bluetoothControlReady =>
+      _bluetoothControlReady &&
+      ble.isConnected &&
+      !_connectionBootstrapInProgress &&
+      !deviceOtaBusy &&
+      ble.appVersionCompatible &&
+      status != null &&
+      settings != null;
   bool get deviceOtaBusy => ble.deviceOtaBusy;
   bool get appVersionCompatible =>
-      wifiActive ? _wifiVersionCompatible : ble.appVersionCompatible;
+      nasMqttActive ? _nasVersionCompatible : ble.appVersionCompatible;
 
   /// 离线只读是独立的页面模式，不能由一次短暂断连自动开启控制能力。
   bool get offlineViewing => _offlineViewing;
@@ -269,34 +352,41 @@ class MimiVentController extends ChangeNotifier {
 
   void _onBleChanged() {
     if (_disposed) return;
-    if (ble.isConnected) {
+    final bleConnected = ble.isConnected;
+    if (bleConnected) {
       _bleConnectedSince ??= DateTime.now();
     } else {
       _bleConnectedSince = null;
     }
-    if (!ble.isConnected) {
+    final linkChanged = bleConnected != _lastBleConnected;
+    _lastBleConnected = bleConnected;
+    if (!bleConnected && linkChanged) {
       if (ble.lastError == '蓝牙连接已断开') {
         lastError = ble.lastError;
       }
       // 让断开前正在进行的状态读取失效，避免异步结果重新写入旧会话。
       _sessionGeneration++;
-      status = null;
       wifiGattCacheStale = false;
-      statistics = null;
-      for (final range in _statisticsByRange.keys) {
-        _statisticsCachedRanges.add(range);
-        final updatedAt = _statisticsCacheUpdatedAt[range];
-        if (updatedAt != null) {
-          _statisticsByRange[range]!['_cacheUpdatedAt'] =
-              updatedAt.millisecondsSinceEpoch;
+      // BLE 扫描/广播变化也会触发 listener。只在真实断链时清理会话；
+      // NAS MQTT 仍在线时保留其状态和设置，切换过程中不让控制页闪空。
+      if (!nasMqttActive) {
+        status = null;
+        statistics = null;
+        for (final range in _statisticsByRange.keys) {
+          _statisticsCachedRanges.add(range);
+          final updatedAt = _statisticsCacheUpdatedAt[range];
+          if (updatedAt != null) {
+            _statisticsByRange[range]!['_cacheUpdatedAt'] =
+                updatedAt.millisecondsSinceEpoch;
+          }
         }
+        _statisticsLoadingRanges.clear();
+        _statisticsFailedRanges.clear();
+        _statisticsRequests.clear();
+        settings = null;
+        _settingsDraft = null;
       }
-      _statisticsLoadingRanges.clear();
-      _statisticsFailedRanges.clear();
-      _statisticsRequests.clear();
       _statusInvalid = false;
-      settings = null;
-      _settingsDraft = null;
     }
     _notifyIfAlive();
   }
@@ -308,11 +398,11 @@ class MimiVentController extends ChangeNotifier {
   Future<void> scan() => ble.scan();
 
   /// 恢复用户上次选择的页面环境，再开始扫描，避免重开 App 时错用正式环境。
-  Future<void> openApp() async {
+  Future<void> openApp({bool scanIfNeeded = true}) async {
     await _loadSelectedProfile();
     await _ensureStatisticsCache();
     if (_disposed || _offlineViewing) return;
-    if (!ble.isConnected && !ble.isScanning) await scan();
+    if (scanIfNeeded && !ble.isConnected && !ble.isScanning) await scan();
   }
 
   /// 取消扫描和旧连接尝试，再读取缓存；离线操作不会排队留待下次连接执行。
@@ -431,6 +521,255 @@ class MimiVentController extends ChangeNotifier {
     }
   }
 
+  String _statisticsDatasetScopeKey(String scope) =>
+      '$_statisticsDatasetScopePrefix${Uri.encodeComponent(scope)}';
+
+  String _statisticsPeerScopeKey(String scope) =>
+      '$_statisticsPeerScopePrefix${Uri.encodeComponent(scope)}';
+
+  String _statisticsDatasetEpochKey(String deviceId) =>
+      '$_statisticsDatasetEpochPrefix$deviceId';
+
+  String _statisticsRangeSnapshotKey(String deviceId, StatisticsQuery query) =>
+      '$_statisticsRangeCachePrefix$deviceId.${query.cacheKey}';
+
+  Future<String?> _statisticsDatasetForScope(String scope) {
+    final known = _statisticsDatasetByScope[scope];
+    if (known != null) return Future.value(known);
+    final pending = _statisticsDatasetLoadsByScope[scope];
+    if (pending != null) return pending;
+    final completion = Completer<String?>();
+    _statisticsDatasetLoadsByScope[scope] = completion.future;
+    unawaited(() async {
+      try {
+        final preferences = await SharedPreferences.getInstance();
+        var datasetId =
+            preferences.getString(_statisticsDatasetScopeKey(scope));
+        if (datasetId == null || datasetId.isEmpty) {
+          final peer = _statisticsPeerScopeByScope[scope] ??
+              preferences.getString(_statisticsPeerScopeKey(scope));
+          if (peer != null && peer.isNotEmpty) {
+            _statisticsPeerScopeByScope[scope] = peer;
+            datasetId = preferences.getString(_statisticsDatasetScopeKey(peer));
+          }
+        }
+        if (datasetId != null && datasetId.isNotEmpty) {
+          _statisticsDatasetByScope[scope] = datasetId;
+          await preferences.setString(
+              _statisticsDatasetScopeKey(scope), datasetId);
+        }
+        completion.complete(datasetId);
+      } catch (error, stack) {
+        completion.completeError(error, stack);
+      } finally {
+        _statisticsDatasetLoadsByScope.remove(scope);
+      }
+    }());
+    return completion.future;
+  }
+
+  Future<void> _registerStatisticsScopePeer(
+      String bleScope, String wifiScope) async {
+    _statisticsPeerScopeByScope[bleScope] = wifiScope;
+    _statisticsPeerScopeByScope[wifiScope] = bleScope;
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      await preferences.setString(_statisticsPeerScopeKey(bleScope), wifiScope);
+      await preferences.setString(_statisticsPeerScopeKey(wifiScope), bleScope);
+      final bleDataset = _statisticsDatasetByScope[bleScope] ??
+          preferences.getString(_statisticsDatasetScopeKey(bleScope));
+      final wifiDataset = _statisticsDatasetByScope[wifiScope] ??
+          preferences.getString(_statisticsDatasetScopeKey(wifiScope));
+      final dataset = bleDataset ?? wifiDataset;
+      if (dataset != null && dataset.isNotEmpty) {
+        _statisticsDatasetByScope[bleScope] = dataset;
+        _statisticsDatasetByScope[wifiScope] = dataset;
+        await preferences.setString(
+            _statisticsDatasetScopeKey(bleScope), dataset);
+        await preferences.setString(
+            _statisticsDatasetScopeKey(wifiScope), dataset);
+      }
+    } catch (error) {
+      diagnostics?.warning('统计缓存', '保存 BLE 与 NAS 设备映射失败：$error');
+    }
+  }
+
+  /// 从 NAS 切回 BLE 前确认两个连接身份对应同一设备，使统计页立即复用对端缓存。
+  /// 已有映射时不增加 BLE 往返；首次建立映射失败不影响控制通道切换。
+  Future<void> prepareBluetoothStatisticsCacheScope() async {
+    final binding = _wifiBinding;
+    final bleDeviceId = ble.connectedDeviceId;
+    if (binding == null || bleDeviceId == null || !ble.isConnected) return;
+    final bleScope = 'ble:$bleDeviceId';
+    final wifiScope = 'wifi:${binding.deviceId}';
+    if (_statisticsPeerScopeByScope[bleScope] == wifiScope) return;
+
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      final savedPeer =
+          preferences.getString(_statisticsPeerScopeKey(bleScope));
+      if (savedPeer == wifiScope) {
+        _statisticsPeerScopeByScope[bleScope] = wifiScope;
+        _statisticsPeerScopeByScope[wifiScope] = bleScope;
+        return;
+      }
+    } catch (error) {
+      diagnostics?.info('统计缓存', '读取 BLE/NAS 缓存映射失败，尝试重新确认：$error');
+    }
+
+    try {
+      final identity = await ble.requestWifi({'op': 'wifi.status'}).timeout(
+          const Duration(seconds: 2));
+      final body = jsonDecode(identity.body);
+      if (identity.statusCode == 200 &&
+          body is Map<String, dynamic> &&
+          body['deviceId'] == binding.deviceId) {
+        await _registerStatisticsScopePeer(bleScope, wifiScope);
+      } else {
+        diagnostics?.info('统计缓存', 'BLE 与 NAS 设备身份未匹配，切回时跳过缓存共享');
+      }
+    } catch (error) {
+      diagnostics?.info('统计缓存', '无法建立 BLE/NAS 缓存映射，仍继续蓝牙切换：$error');
+    }
+  }
+
+  /// 先按当前连接身份找出统计数据集，再恢复匹配的协议 v2 快照。
+  /// BLE 地址、NAS 绑定 ID 与统计 deviceId 不同，必须使用已验证的映射。
+  Future<void> _restoreStatisticsRangeCache(
+      StatisticsQuery query, String scope) async {
+    final currentKey = _rangeKey(query);
+    if (_statisticsRangeByKey.containsKey(currentKey)) return;
+    try {
+      if (_disposed || scope != _rangeScope) return;
+      final datasetId = await _statisticsDatasetForScope(scope);
+      if (datasetId == null || datasetId.isEmpty) return;
+      final preferences = await SharedPreferences.getInstance();
+      _statisticsDatasetByScope[scope] = datasetId;
+      final raw =
+          preferences.getString(_statisticsRangeSnapshotKey(datasetId, query));
+      if (raw == null) return;
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map<String, dynamic> ||
+          decoded['version'] != 1 ||
+          decoded['cacheKey'] != query.cacheKey ||
+          decoded['deviceId'] != datasetId ||
+          decoded['from'] != query.from ||
+          decoded['tzOffsetSeconds'] != query.tzOffsetSeconds ||
+          decoded['updatedAt'] is! int ||
+          decoded['dataEpoch'] is! String ||
+          decoded['data'] is! Map) {
+        return;
+      }
+      final data = Map<String, dynamic>.from(decoded['data'] as Map);
+      final epoch = decoded['dataEpoch'] as String;
+      if (data['apiVersion'] != 2 ||
+          data['deviceId'] != datasetId ||
+          data['dataEpoch'] != epoch ||
+          epoch.isEmpty) {
+        return;
+      }
+      final knownEpoch = _rangeEpochByScope[scope] ??
+          preferences.getString(_statisticsDatasetEpochKey(datasetId));
+      if (knownEpoch != null && knownEpoch != epoch) return;
+      final updatedAtMs = decoded['updatedAt'] as int;
+      final updatedAt = DateTime.fromMillisecondsSinceEpoch(updatedAtMs);
+      data['_cacheUpdatedAt'] = updatedAtMs;
+      _rangeEpochByScope[scope] = epoch;
+      final key = _rangeKey(query);
+      _statisticsRangeByKey[key] = data;
+      _statisticsRangeUpdatedAt[key] = updatedAt;
+      _notifyIfAlive();
+    } catch (error) {
+      diagnostics?.warning('统计缓存', '恢复范围快照失败：$error');
+    }
+  }
+
+  Future<void> _persistStatisticsRangeCache(
+    StatisticsQuery query,
+    String scope,
+    String deviceId,
+    Map<String, dynamic> data, {
+    required DateTime updatedAt,
+  }) async {
+    final epoch = data['dataEpoch']?.toString();
+    if (deviceId.isEmpty || epoch == null || epoch.isEmpty) return;
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      final snapshotKey = _statisticsRangeSnapshotKey(deviceId, query);
+      await preferences.setString(_statisticsDatasetScopeKey(scope), deviceId);
+      await preferences.setString(_statisticsDatasetEpochKey(deviceId), epoch);
+      _statisticsDatasetByScope[scope] = deviceId;
+      final peer = _statisticsPeerScopeByScope[scope] ??
+          preferences.getString(_statisticsPeerScopeKey(scope));
+      if (peer != null && peer.isNotEmpty) {
+        _statisticsPeerScopeByScope[scope] = peer;
+        _statisticsPeerScopeByScope[peer] = scope;
+        _statisticsDatasetByScope[peer] = deviceId;
+        await preferences.setString(_statisticsDatasetScopeKey(peer), deviceId);
+      }
+      await preferences.setString(
+        snapshotKey,
+        jsonEncode({
+          'version': 1,
+          'cacheKey': query.cacheKey,
+          'from': query.from,
+          'to': query.to,
+          'tzOffsetSeconds': query.tzOffsetSeconds,
+          'deviceId': deviceId,
+          'dataEpoch': epoch,
+          'updatedAt': updatedAt.millisecondsSinceEpoch,
+          'data': data,
+        }),
+      );
+      // 范围快照有固定上限，避免自定义日期查询无限增长本地偏好存储。
+      final keys = preferences
+          .getKeys()
+          .where((key) => key.startsWith(_statisticsRangeCachePrefix))
+          .toList();
+      if (keys.length <= 20) return;
+      final entries = <(String, int)>[];
+      for (final key in keys) {
+        if (key == snapshotKey) continue;
+        try {
+          final value = preferences.getString(key);
+          final map = value == null ? null : jsonDecode(value);
+          final timestamp = map is Map ? map['updatedAt'] : null;
+          entries.add((key, timestamp is int ? timestamp : 0));
+        } catch (_) {
+          entries.add((key, 0));
+        }
+      }
+      entries.sort((a, b) => a.$2.compareTo(b.$2));
+      for (final entry in entries.take(keys.length - 20)) {
+        await preferences.remove(entry.$1);
+      }
+    } catch (error) {
+      diagnostics?.warning('统计缓存', '保存范围快照失败：$error');
+    }
+  }
+
+  Future<void> _purgeStatisticsSnapshotsForEpoch(
+      String deviceId, String currentEpoch) async {
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      final prefix = '$_statisticsRangeCachePrefix$deviceId.';
+      for (final key
+          in preferences.getKeys().where((key) => key.startsWith(prefix))) {
+        try {
+          final raw = preferences.getString(key);
+          final value = raw == null ? null : jsonDecode(raw);
+          if (value is! Map || value['dataEpoch'] != currentEpoch) {
+            await preferences.remove(key);
+          }
+        } catch (_) {
+          await preferences.remove(key);
+        }
+      }
+    } catch (error) {
+      diagnostics?.warning('统计缓存', '清理旧数据批次失败：$error');
+    }
+  }
+
   /// App 退到后台时释放 BLE，避免占用设备连接。
   Future<void> closeBluetoothSession() {
     // hidden/paused/detached 和 dispose 可能几乎同时触发；合并清理任务，
@@ -450,6 +789,7 @@ class MimiVentController extends ChangeNotifier {
   }
 
   Future<void> _closeBluetoothSession() async {
+    _bluetoothControlReady = false;
     try {
       await ble.stopScan();
     } catch (_) {
@@ -470,6 +810,7 @@ class MimiVentController extends ChangeNotifier {
       throw StateError('连接请求已取消');
     }
     _connectionBootstrapAttempt = attempt;
+    _bluetoothControlReady = false;
     lastError = null;
     _notifyIfAlive();
     int? sessionGeneration;
@@ -495,6 +836,7 @@ class MimiVentController extends ChangeNotifier {
         loadedStatus = await repository.getStatus(selectedProfile);
         ble.setDeviceOtaBusy(false);
       } on DeviceBusyException catch (error) {
+        _bluetoothControlReady = false;
         ble.setDeviceOtaBusy(true);
         status = null;
         settings = null;
@@ -514,6 +856,7 @@ class MimiVentController extends ChangeNotifier {
           (appVersion != null && _compareVersions(appVersion, minimumApp) >= 0);
       ble.setFirmwareAppCompatible(compatible);
       if (!compatible) {
+        _bluetoothControlReady = false;
         status = loadedStatus;
         settings = null;
         _settingsDraft = null;
@@ -542,6 +885,7 @@ class MimiVentController extends ChangeNotifier {
       _settingsDraft =
           SettingsDraft(saved: loadedSettings, value: loadedSettings);
       _offlineViewing = false;
+      _bluetoothControlReady = true;
       unawaited(_persistOfflineViewing());
       lastError = null;
       _notifyIfAlive();
@@ -553,7 +897,9 @@ class MimiVentController extends ChangeNotifier {
         return;
       }
       if (attempt == _connectAttempt) {
+        _bluetoothControlReady = false;
         if (error is DeviceBusyException) {
+          _bluetoothControlReady = false;
           ble.setDeviceOtaBusy(true);
           status = null;
           settings = null;
@@ -612,204 +958,314 @@ class MimiVentController extends ChangeNotifier {
 
   bool _isCurrentSession(int generation, TimingProfile profile) =>
       !_disposed &&
-      (ble.isConnected || wifiActive) &&
+      (ble.isConnected || nasMqttActive) &&
       generation == _sessionGeneration &&
       profile == this.profile;
 
-  Future<T> _wifiSerial<T>(Future<T> Function() action,
-      {bool priority = false}) => _wifiExecutor.run(action, priority: priority);
+  Future<T> _nasSerial<T>(Future<T> Function() action,
+          {bool priority = false}) =>
+      _nasGatewayExecutor.run(action, priority: priority);
 
-  Future<void> activateWifi(WifiBinding binding) async {
+  Future<void> activateNasMqtt(WifiBinding binding) async {
+    final generation = ++_nasMqttSessionGeneration;
+    final bleDeviceId = ble.connectedDeviceId;
+    _nasConfigurationDeadline = null;
+    _nasExpectedProfile = null;
+    _nasExpectedSettings = null;
     _wifiBinding = binding;
-    _wifiTransport = WifiReadTransport();
-    wifiLost = false;
-    wifiBusy = false;
-    _wifiSyncFailures = 0;
+    _nasMqttSessionReady = false;
+    nasStateStale = false;
+    nasStateAgeMs = 0;
+    _lastNasPendingDeviceId = binding.deviceId;
+    _lastNasPendingTokenId = binding.tokenId;
+    nasMqttLost = false;
+    nasMqttBusy = false;
+    _nasSyncFailures = 0;
     try {
-      await _wifiSerial(_refreshWifi, priority: true);
-      // WiFi 已成为控制通道时主动断开 BLE，释放设备广播/连接槽，避免第二台手机连不上。
-      if (ble.isConnected) {
-        await ble.disconnect();
+      await _nasSerial(() => _refreshNasSnapshot(requireFresh: true),
+          priority: true);
+      if (_disposed ||
+          generation != _nasMqttSessionGeneration ||
+          !identical(_wifiBinding, binding)) {
+        return;
       }
-      _startWifiHealth();
-      _startWifiSync();
-      // WiFi 会话已建立：清掉上一次（可能是蓝牙）连接失败残留的错误，
+      if (nasStateStale) {
+        throw const NasGatewayException(
+          'DEVICE_MQTT_UNAVAILABLE',
+          '设备尚未通过 NAS MQTT 上报实时状态，请检查设备 MQTT 配置和连接',
+        );
+      }
+      // BLE 尚连着时，直接向固件确认 Broker 会话；单独的新鲜快照不足以
+      // 证明此刻 MQTT 仍在线。未确认前绝不释放 BLE，失败可继续蓝牙控制。
+      if (ble.isConnected) {
+        final response = await ble.requestWifi({'op': 'wifi.mqtt.status'});
+        final mqttStatus = jsonDecode(response.body);
+        if (response.statusCode != 200 || mqttStatus is! Map<String, dynamic>) {
+          throw const NasGatewayException(
+            'DEVICE_MQTT_STATUS_UNAVAILABLE',
+            '无法通过蓝牙确认设备 MQTT 连接状态，蓝牙连接保持不变',
+          );
+        }
+        if (mqttStatus['configured'] != true ||
+            mqttStatus['connected'] != true) {
+          throw const NasGatewayException(
+            'DEVICE_MQTT_UNAVAILABLE',
+            '设备尚未连接 NAS MQTT Broker；请检查 MQTT 配置，蓝牙连接保持不变',
+          );
+        }
+        // 只在同一条 BLE 会话里验证 WiFi 身份后建立跨通道缓存映射。
+        // 这是尽力操作：读不到身份时不影响已经验证成功的 MQTT 控制切换。
+        try {
+          final identity = await ble.requestWifi({'op': 'wifi.status'});
+          final identityBody = jsonDecode(identity.body);
+          if (identity.statusCode == 200 &&
+              identityBody is Map<String, dynamic> &&
+              identityBody['deviceId'] == binding.deviceId &&
+              bleDeviceId != null) {
+            await _registerStatisticsScopePeer(
+                'ble:$bleDeviceId', 'wifi:${binding.deviceId}');
+          } else {
+            diagnostics?.info('统计缓存', 'BLE 与 NAS 设备身份未匹配，跳过跨通道缓存共享');
+          }
+        } catch (error) {
+          diagnostics?.info('统计缓存', '无法确认 BLE 与 NAS 设备映射：$error');
+        }
+      }
+      // 新通道已通过网关实时状态和设备 MQTT 状态校验，先标记 NAS 会话可用，
+      // 再释放 BLE，避免 BLE 断开与 NAS 会话生效之间出现双通道都不可用的空档。
+      _nasMqttSessionReady = true;
+      _notifyIfAlive();
+      _startNasSync();
+      // NAS MQTT 会话已建立：清掉上一次（可能是蓝牙）连接失败残留的错误，
       // 否则顶部会一直挂着"设备操作失败"，与实际状态不符。
       if (lastError != null) {
         lastError = null;
         _notifyIfAlive();
       }
-    } catch (error) {
-      _wifiBinding = null;
-      _wifiTransport = null;
-      if (error is WifiReadException && error.code == 'WIFI_IN_USE') {
-        wifiBusy = true;
+      // 断开 BLE 只是释放连接槽的收尾动作；即使它失败，也不能撤销已验证可用的 NAS。
+      if (ble.isConnected) {
+        try {
+          await ble.disconnect();
+        } catch (error) {
+          diagnostics?.warning('NAS MQTT 切换', 'NAS 已可用，但断开 BLE 收尾失败：$error');
+        }
       }
-      lastError = error is WifiReadException ? error.message : error.toString();
+    } catch (error) {
+      if (_disposed ||
+          generation != _nasMqttSessionGeneration ||
+          !identical(_wifiBinding, binding)) {
+        return;
+      }
+      _nasMqttSessionReady = false;
+      _wifiBinding = null;
+      if (error is NasGatewayException && error.code == 'WIFI_IN_USE') {
+        nasMqttBusy = true;
+      }
+      // 用户仍有 BLE 控制可用时，通道切换失败由切换弹窗表达；不能混成设备
+      // 操作失败横幅，否则看起来像刚才的蓝牙控制也失败了。
+      lastError = ble.isConnected
+          ? null
+          : error is NasGatewayException
+              ? error.message
+              : error.toString();
       _notifyIfAlive();
       rethrow;
     }
   }
 
-  Future<void> releaseWifiLease() async {
+  Future<void> releaseNasMqttLease() async {
     final binding = _wifiBinding;
-    final transport = _wifiTransport;
-    if (binding == null || transport == null || !wifiActive) return;
+    if (binding == null || !nasMqttActive) return;
     try {
-      await transport.releaseLease(binding).timeout(const Duration(seconds: 2));
-      diagnostics?.info('WiFi 租约', '已释放 WiFi 主控');
+      final result = await _nasGatewayTransport
+          .tryWrite(
+            binding,
+            path: '/api/lease',
+            body: 'action=release',
+            requestId: _requestId(),
+          )
+          .timeout(const Duration(seconds: 4));
+      if (result?.statusCode != 200) {
+        throw StateError('NAS 未确认释放 MQTT 控制租约');
+      }
+      diagnostics?.info('NAS MQTT 租约', '已释放 NAS MQTT 主控');
     } catch (error) {
-      diagnostics?.warning('WiFi 租约', '释放失败，等待租约过期：$error');
+      diagnostics?.warning('NAS MQTT 租约', '释放失败，等待租约过期：$error');
     }
   }
 
-  void deactivateWifi() {
-    _wifiHealthTimer?.cancel();
-    _wifiHealthTimer = null;
-    _wifiSyncTimer?.cancel();
-    _wifiSyncTimer = null;
+  void deactivateNasMqtt() {
+    _nasMqttSessionGeneration++;
+    _nasSyncTimer?.cancel();
+    _nasSyncTimer = null;
+    _nasFastSyncUntilMs = 0;
+    _nasMqttSessionReady = false;
     _wifiBinding = null;
-    _wifiTransport = null;
-    _wifiStatusAt = null;
+    _nasStatusAt = null;
     _fanRunStartedAt = null;
-    wifiLost = false;
-    wifiBusy = false;
-    _wifiSyncFailures = 0;
+    nasMqttLost = false;
+    nasMqttBusy = false;
+    nasStateStale = false;
+    nasStateAgeMs = 0;
+    _nasSyncFailures = 0;
     _notifyIfAlive();
   }
 
-  void _startWifiHealth() {
-    // 用户优先：不再后台轮询，避免健康检查占用单 HTTPS 连接阻塞控制。
-    // 断线由写操作/手动刷新/启动探测发现，或回到前台时重新探测。
-    _wifiHealthTimer?.cancel();
-    _wifiHealthTimer = null;
-    _wifiHealthFailures = 0;
-  }
-
-  void _startWifiSync() {
-    _wifiSyncTimer?.cancel();
-    _scheduleWifiSync();
+  void _startNasSync() {
+    _nasSyncTimer?.cancel();
+    _scheduleNasSync();
   }
 
   void setAppForeground(bool value) {
     if (_appForeground == value) return;
     _appForeground = value;
-    if (wifiActive) _startWifiSync();
+    if (nasMqttActive) _startNasSync();
   }
 
-  void _scheduleWifiSync() {
-    final delay = _appForeground
-        ? 3000 + Random().nextInt(2000)
-        : 8000 + Random().nextInt(4000);
-    _wifiSyncTimer = Timer(Duration(milliseconds: delay), () {
-      if (!wifiActive || _disposed) return;
-      if (pendingWifiAction == null) {
-        unawaited(_wifiSerial(_refreshWifi).then((_) {
-          _wifiSyncFailures = 0;
+  void _scheduleNasSync() {
+    if (!_appForeground || !nasMqttActive || _disposed) return;
+    final fastSync =
+        DateTime.now().millisecondsSinceEpoch < _nasFastSyncUntilMs;
+    final delay = Duration(seconds: fastSync ? 1 : 2);
+    _nasSyncTimer = Timer(delay, () {
+      if (!nasMqttActive || _disposed) return;
+      if (pendingNasMqttAction == null && !_nasRefreshInFlight) {
+        _nasRefreshInFlight = true;
+        unawaited(_refreshNasSnapshot().then((_) {
+          _nasSyncFailures = 0;
         }).catchError((Object error) {
-          if (error is WifiReadException && error.code == 'WIFI_IN_USE') {
-            _handleWifiBusy(error);
+          if (error is NasGatewayException && error.code == 'WIFI_IN_USE') {
+            _handleNasMqttBusy(error);
             return;
           }
-          _wifiSyncFailures++;
-          diagnostics?.warning('WiFi 同步', '状态同步失败：$error');
-          if (_wifiSyncFailures >= 2) _handleWifiLost(error);
-        }));
+          _nasSyncFailures++;
+          diagnostics?.warning('NAS MQTT 同步', '状态同步失败：$error');
+          if (_nasSyncFailures >= 2) _handleNasMqttLost(error);
+        }).whenComplete(() => _nasRefreshInFlight = false));
       }
-      if (wifiActive) _scheduleWifiSync();
+      if (nasMqttActive) _scheduleNasSync();
     });
   }
 
-  void _scheduleWifiHealth() {
-    // 多手机场景加抖动，避免两台手机在同一秒同时重试造成单连接互踢。
-    final jitter = 12000 + Random().nextInt(6000);
-    _wifiHealthTimer = Timer(Duration(milliseconds: jitter), () {
-      if (!wifiActive || _disposed) return;
-      if (_wifiHealthInFlight) {
-        _scheduleWifiHealth();
-        return;
-      }
-      _wifiHealthInFlight = true;
-      unawaited(
-          _wifiSerial(_refreshWifi, priority: true).catchError((Object error) {
-        _wifiHealthFailures++;
-        if (_wifiHealthFailures >= 2) {
-          _handleWifiLost(error);
-        } else {
-          diagnostics?.warning('WiFi 连接', '健康检查失败，等待下次重试：$error');
-        }
-      }).whenComplete(() {
-        _wifiHealthInFlight = false;
-        if (wifiActive) _scheduleWifiHealth();
-      }));
-    });
-  }
-
-  void _handleWifiLost(Object error) {
-    if (!wifiActive) return;
-    wifiLost = true;
-    lastError = 'WiFi 连接已断开';
-    _wifiHealthTimer?.cancel();
-    _wifiHealthTimer = null;
-    _wifiSyncTimer?.cancel();
-    _wifiSyncTimer = null;
+  void _handleNasMqttLost(Object error) {
+    if (!nasMqttActive) return;
+    _nasMqttSessionGeneration++;
+    nasMqttLost = true;
+    lastError = 'NAS MQTT 状态连接已断开';
+    _nasSyncTimer?.cancel();
+    _nasSyncTimer = null;
+    _nasFastSyncUntilMs = 0;
+    _nasMqttSessionReady = false;
     _wifiBinding = null;
-    _wifiTransport = null;
-    _wifiStatusAt = null;
+    _nasStatusAt = null;
     _fanRunStartedAt = null;
     status = null;
     settings = null;
     _settingsDraft = null;
-    diagnostics?.warning('WiFi 连接', '状态同步失败：$error');
+    diagnostics?.warning('NAS MQTT 连接', '状态同步失败：$error');
     _notifyIfAlive();
   }
 
-  void _handleWifiBusy(Object error) {
-    if (!wifiActive) return;
-    wifiBusy = true;
-    lastError = 'WiFi 正被另一台手机控制';
-    _wifiHealthTimer?.cancel();
-    _wifiHealthTimer = null;
-    _wifiSyncTimer?.cancel();
-    _wifiSyncTimer = null;
+  void _handleNasMqttBusy(Object error) {
+    if (!nasMqttActive) return;
+    _nasMqttSessionGeneration++;
+    nasMqttBusy = true;
+    lastError = 'NAS MQTT 控制权已被另一台手机占用';
+    _nasSyncTimer?.cancel();
+    _nasSyncTimer = null;
+    _nasFastSyncUntilMs = 0;
+    _nasMqttSessionReady = false;
     _wifiBinding = null;
-    _wifiTransport = null;
-    _wifiStatusAt = null;
+    _nasStatusAt = null;
     _fanRunStartedAt = null;
     status = null;
     settings = null;
     _settingsDraft = null;
-    diagnostics?.warning('WiFi 租约', 'WiFi 已被其他手机占用：$error');
+    diagnostics?.warning('NAS MQTT 租约', 'NAS MQTT 主控已被其他手机占用：$error');
     _notifyIfAlive();
   }
 
-  Future<void> _refreshWifi() async {
+  Future<void> _refreshNasSnapshot({bool requireFresh = false}) async {
     final binding = _wifiBinding;
-    final transport = _wifiTransport;
-    if (binding == null || transport == null) return;
+    if (binding == null) return;
+    final generation = _nasMqttSessionGeneration;
+    final snapshotRevision = _nasSnapshotRevision;
+    final readStartedAtMs = DateTime.now().millisecondsSinceEpoch;
     Map<String, dynamic> data;
-    for (var attempt = 0;; attempt++) {
-      try {
-        data = await transport.read(binding);
-        break;
-      } catch (error) {
-        if (attempt == 0 && _wifiTransient(error)) {
-          await Future<void>.delayed(const Duration(milliseconds: 200));
-          continue;
-        }
-        rethrow;
-      }
+    final result = await _nasGatewayTransport.tryReadState(binding);
+    if (_disposed ||
+        generation != _nasMqttSessionGeneration ||
+        snapshotRevision != _nasSnapshotRevision ||
+        !identical(_wifiBinding, binding)) {
+      return;
     }
-    if (pendingWifiAction != null) return;
+    if (result == null) {
+      throw const NasGatewayException(
+          'GATEWAY_UNAVAILABLE', 'NAS 网关未启用或不可达，请改用蓝牙读取设备状态');
+    }
+    if (result.statusCode != 200) {
+      throw NasGatewayException(
+        result.body['error']?.toString() ??
+            'NAS_GATEWAY_HTTP_${result.statusCode}',
+        'NAS 网关暂时无法读取设备状态，请检查网关连接或改用蓝牙',
+      );
+    }
+    data = result.body;
+    if (data['deviceId'] != binding.deviceId ||
+        data['tokenId'] != binding.tokenId ||
+        data['bindingState'] != 'active') {
+      throw const NasGatewayException(
+          'GATEWAY_IDENTITY_MISMATCH', 'NAS 返回的设备或绑定身份不匹配');
+    }
+    final rawAge = data['stateAgeMs'];
+    final reportedAgeMs = rawAge is num && rawAge >= 0
+        ? rawAge
+            .toInt()
+            .clamp(0, const Duration(days: 1).inMilliseconds)
+            .toInt()
+        : 0;
+    // 网关在生成响应时计算 stateAgeMs。用请求发起时的控制年龄作比较，
+    // 避免 HTTP 返回延迟掩盖“状态快照早于本次控制”的事实。
+    final controlAgeAtReadStart = _nasControlAppliedAtMs == 0
+        ? 1 << 30
+        : readStartedAtMs - _nasControlAppliedAtMs;
+    final ageMs = reportedAgeMs;
+    nasStateAgeMs = ageMs;
+    nasStateStale = data['stale'] != false || data['stateFreshness'] != 'fresh';
+    if (requireFresh && nasStateStale) {
+      throw const NasGatewayException(
+        'DEVICE_MQTT_UNAVAILABLE',
+        '设备尚未通过 NAS MQTT 上报实时状态，请检查设备 MQTT 配置和连接',
+      );
+    }
+    if (pendingNasMqttAction != null) return;
+    // 控制刚落地时丢弃出发于控制之前的陈旧快照，避免 UI 回退再跳回。
+    if (controlAgeAtReadStart >= 0 &&
+        controlAgeAtReadStart < 3000 &&
+        ageMs > controlAgeAtReadStart) {
+      return;
+    }
     final loaded = DeviceStatus.fromJson(data);
     final loadedSettings = TimingSettings.fromJson(data);
+    final deadline = _nasConfigurationDeadline;
+    if (deadline != null) {
+      final matches = (_nasExpectedProfile == null ||
+              loaded.activeProfile == _nasExpectedProfile) &&
+          (_nasExpectedSettings == null ||
+              loadedSettings.toFormBody() ==
+                  _nasExpectedSettings!.toFormBody());
+      if (!matches && DateTime.now().isBefore(deadline)) return;
+      _nasConfigurationDeadline = null;
+      _nasExpectedProfile = null;
+      _nasExpectedSettings = null;
+    }
     final wasFanOn = status?.fan == true;
     status = loaded;
-    _wifiStatusAt = DateTime.now();
+    _nasStatusAt = DateTime.now().subtract(Duration(milliseconds: ageMs));
     if (loaded.fan) {
       if (!wasFanOn || _fanRunStartedAt == null) {
-        _fanRunStartedAt =
-            DateTime.now().subtract(Duration(milliseconds: loaded.fanRunMs));
+        _fanRunStartedAt = DateTime.now()
+            .subtract(Duration(milliseconds: loaded.fanRunMs + ageMs));
       }
     } else {
       _fanRunStartedAt = null;
@@ -821,8 +1277,7 @@ class MimiVentController extends ChangeNotifier {
           SettingsDraft(saved: loadedSettings, value: loadedSettings);
     }
     _statusInvalid = false;
-    _wifiVersionCompatible = true;
-    _wifiHealthFailures = 0;
+    _nasVersionCompatible = true;
     lastError = null;
     _notifyIfAlive();
   }
@@ -837,37 +1292,51 @@ class MimiVentController extends ChangeNotifier {
         '${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}';
   }
 
-  bool _wifiTransient(Object error) {
+  bool _nasTransient(Object error) {
     if (error is TimeoutException || error is SocketException) return true;
-    if (error is WifiReadException) {
+    if (error is NasGatewayException) {
       return const {
         'HTTP_INCOMPLETE',
         'HTTP_FORMAT',
         'RESOURCE_BUSY',
         'RATE_LIMITED',
+        'QUERY_BUSY',
       }.contains(error.code);
     }
     return false;
   }
 
-  /// 所有 WiFi 读取串行化：一次 TLS 会话在设备上约占 18 KB 堆，
-  /// 并发读取会让设备在握手阶段内存不足而断链。
-  Future<Map<String, dynamic>> _wifiReadPath(String path,
-      {bool priority = false}) {
-    return _wifiSerial(() => _wifiReadPathUnlocked(path), priority: priority);
+  /// 所有 WiFi MQTT 查询串行化，限制设备查询响应与控制 ACK 争抢队列。
+  Future<Map<String, dynamic>> _nasReadPath(String path,
+      {bool priority = false, bool Function()? shouldRead}) {
+    final generation = _nasMqttSessionGeneration;
+    final queued = Stopwatch()..start();
+    return _nasSerial(() async {
+      if (generation != _nasMqttSessionGeneration ||
+          (shouldRead != null && !shouldRead())) {
+        throw _ObsoleteStatisticsQuery();
+      }
+      final queueMs = queued.elapsedMilliseconds;
+      final request = Stopwatch()..start();
+      try {
+        return await _nasReadPathUnlocked(path);
+      } finally {
+        diagnostics?.info('NAS MQTT 耗时',
+            'query path=$path queueMs=$queueMs requestMs=${request.elapsedMilliseconds}');
+      }
+    }, priority: priority);
   }
 
-  Future<Map<String, dynamic>> _wifiReadPathUnlocked(String path) async {
+  Future<Map<String, dynamic>> _nasReadPathUnlocked(String path) async {
     final binding = _wifiBinding;
-    final transport = _wifiTransport;
-    if (binding == null || transport == null) {
-      throw StateError('WiFi 控制通道不可用');
+    if (binding == null) {
+      throw StateError('NAS MQTT 控制通道不可用');
     }
     for (var attempt = 0;; attempt++) {
       try {
-        return await transport.readPath(binding, path);
+        return await _nasGatewayTransport.readPath(binding, path);
       } catch (error) {
-        if (attempt == 0 && _wifiTransient(error)) {
+        if (attempt == 0 && _nasTransient(error)) {
           await Future<void>.delayed(const Duration(milliseconds: 200));
           continue;
         }
@@ -876,43 +1345,129 @@ class MimiVentController extends ChangeNotifier {
     }
   }
 
-  Future<void> _wifiWrite(String path, String body) =>
-      _wifiSerial(() => _wifiWriteUnlocked(path, body), priority: true);
-
-  Future<void> _wifiWriteUnlocked(String path, String body) async {
-    // WiFi 控制期间释放 BLE 连接，避免占用设备唯一的 BLE 槽导致第二台手机无法连接。
-    if (ble.isConnected) {
-      await ble.disconnect();
-    }
+  Future<void> _nasMqttWrite(String path, String body) {
     final binding = _wifiBinding;
-    final transport = _wifiTransport;
-    if (binding == null || transport == null) {
-      throw StateError('WiFi 控制通道不可用');
+    final generation = _nasMqttSessionGeneration;
+    final queued = Stopwatch()..start();
+    // 控制保持独立串行；设备允许控制与只读查询共存，不能被统计整页传输挡住。
+    return _nasControlExecutor.run(() async {
+      if (generation != _nasMqttSessionGeneration ||
+          !identical(binding, _wifiBinding)) {
+        throw StateError('NAS MQTT 会话已变化，本次控制未发送');
+      }
+      final queueMs = queued.elapsedMilliseconds;
+      final request = Stopwatch()..start();
+      _nasWritesInFlight++;
+      _notifyIfAlive();
+      try {
+        await _nasMqttWriteUnlocked(path, body);
+      } finally {
+        _nasWritesInFlight--;
+        _notifyIfAlive();
+        diagnostics?.info('NAS MQTT 耗时',
+            'control path=$path queueMs=$queueMs requestMs=${request.elapsedMilliseconds}');
+      }
+    });
+  }
+
+  Future<void> _nasMqttWriteUnlocked(String path, String body) async {
+    final binding = _wifiBinding;
+    if (binding == null) {
+      throw StateError('NAS MQTT 控制通道不可用');
+    }
+    final preferences = await SharedPreferences.getInstance();
+    final priorRequestId =
+        await NasPendingRequestStore.read(preferences, binding);
+    if (priorRequestId != null) {
+      final prior =
+          await _nasGatewayTransport.queryRequest(binding, priorRequestId);
+      if (prior?.statusCode == 200 &&
+          ['applied', 'rejected'].contains(prior?.body['status'])) {
+        final cleared = await NasPendingRequestStore.clear(preferences, binding,
+            expectedRequestId: priorRequestId);
+        if (!cleared) {
+          _setPendingNasMqttRequest(
+              pending: true,
+              ageMs: NasPendingRequestStore.ageMs(preferences, binding),
+              ageEstimated:
+                  NasPendingRequestStore.isAgeEstimated(preferences, binding));
+          throw StateError('上次控制已确认，但本机记录未清理；请在 NAS 页面结束确认');
+        }
+        _setPendingNasMqttRequest(pending: false);
+        diagnostics?.info(
+            'NAS MQTT 控制核对', '旧请求已确认 ${prior?.body['status']} 并清理；继续发送本次新操作');
+      } else {
+        final ageMs = NasPendingRequestStore.ageMs(preferences, binding);
+        _setPendingNasMqttRequest(
+            pending: true,
+            ageMs: ageMs,
+            ageEstimated:
+                NasPendingRequestStore.isAgeEstimated(preferences, binding));
+        if (prior == null) {
+          diagnostics?.warning('NAS MQTT 控制核对',
+              '查询上次 requestId 失败；pendingRequestAgeMs=${ageMs ?? 'unknown'}；原请求保留，本次新控制未发送');
+          throw StateError('NAS 网关查询失败，无法确认上次控制结果；原请求已保留，本次新控制未发送');
+        }
+        final priorStatus = prior.body['status']?.toString();
+        if (prior.statusCode == 200 && priorStatus == 'pending') {
+          throw StateError('设备仍在处理上次控制；原请求已保留，本次新控制未发送');
+        }
+        if ((prior.statusCode == 200 && priorStatus == 'unknown') ||
+            prior.statusCode == 404 ||
+            prior.body['error'] == 'UNKNOWN') {
+          diagnostics?.warning('NAS MQTT 控制核对',
+              '设备结果 unknown；pendingRequestAgeMs=${ageMs ?? 'unknown'}；原请求保留');
+          throw StateError('设备无法确认上次控制是否执行；原请求已保留，请核对设备状态后在 NAS 页面结束确认');
+        }
+        throw StateError(
+            '查询上次控制结果失败（HTTP ${prior.statusCode}）；原请求已保留，本次新控制未发送');
+      }
     }
     final requestId = _requestId();
-    WifiHttpResult result;
-    for (var attempt = 0;; attempt++) {
-      try {
-        result = await transport.write(binding,
-            path: path, body: body, requestId: requestId);
-        break;
-      } catch (error) {
-        if (attempt == 0 && _wifiTransient(error)) {
-          await Future<void>.delayed(const Duration(milliseconds: 200));
-          continue;
-        }
-        if (error is WifiReadException && error.code == 'WIFI_IN_USE') {
-          _handleWifiBusy(error);
-          rethrow;
-        }
-        throw StateError('WiFi 写请求失败：$error');
-      }
+    if (!await NasPendingRequestStore.save(preferences, binding, requestId)) {
+      throw StateError('无法保存待确认请求，控制未发送');
+    }
+    _setPendingNasMqttRequest(pending: true, ageMs: 0);
+    final result = await _nasGatewayTransport.tryWrite(binding,
+        path: path, body: body, requestId: requestId);
+    if (result == null) {
+      final cleared = await NasPendingRequestStore.clear(preferences, binding,
+          expectedRequestId: requestId);
+      if (cleared) _setPendingNasMqttRequest(pending: false);
+      throw StateError('NAS 网关未启用，请连接蓝牙控制设备');
     }
     if (result.statusCode != 200) {
       final code =
           result.body['error']?.toString() ?? 'HTTP_${result.statusCode}';
+      final outcomeKnown = result.commandOutcomeKnown ||
+          result.body['commandPublished'] == false;
+      if (result.body['resultUnknown'] != true && outcomeKnown) {
+        final cleared = await NasPendingRequestStore.clear(preferences, binding,
+            expectedRequestId: requestId);
+        if (cleared) {
+          _setPendingNasMqttRequest(pending: false);
+        } else {
+          _setPendingNasMqttRequest(
+              pending: true,
+              ageMs: NasPendingRequestStore.ageMs(preferences, binding));
+          diagnostics?.warning(
+              'NAS MQTT 控制核对', '设备结果已明确但本机 pending 清理失败 requestId=$requestId');
+        }
+      }
       diagnostics?.warning(
-          'WiFi 控制拒绝', 'POST $path HTTP ${result.statusCode} $code');
+          'NAS MQTT 控制拒绝', 'POST $path HTTP ${result.statusCode} $code');
+      if (result.body['resultUnknown'] == true) {
+        throw StateError('控制结果未知，已保留请求编号并阻止重复操作；请刷新状态或连接蓝牙核实');
+      }
+      if (result.statusCode == 409 && code == 'DEVICE_CONTROL_BUSY') {
+        throw StateError('设备正在处理另一条控制请求，请刷新状态后再操作');
+      }
+      if (result.statusCode == 409 && code == 'COMMAND_EXPIRED') {
+        throw StateError('控制指令到达过慢，设备已拒绝执行，请重试');
+      }
+      if (result.statusCode == 409 && code == '当前有限时任务，请先确认停止并切换') {
+        throw const _ControlReplacementRequired();
+      }
       if (result.statusCode == 409) {
         throw StateError('设备正在执行其他流程，请先确认“停止并切换”后再试');
       }
@@ -925,18 +1480,60 @@ class MimiVentController extends ChangeNotifier {
       if (code.contains('DEDUP_UNAVAILABLE')) {
         throw StateError('设备请求记录已满，请重启设备后再试');
       }
-      throw StateError('设备未完成 WiFi 控制（$code）');
+      throw StateError('设备未完成 NAS MQTT 控制（$code）');
+    }
+    final cleared = await NasPendingRequestStore.clear(preferences, binding,
+        expectedRequestId: requestId);
+    if (cleared) {
+      _setPendingNasMqttRequest(pending: false);
+    } else {
+      _setPendingNasMqttRequest(
+          pending: true,
+          ageMs: NasPendingRequestStore.ageMs(preferences, binding));
     }
     // 写请求成功后立即返回，状态刷新排队在后台完成，避免控制按钮等待两次 TLS。
-    unawaited(
-        _wifiSerial(_refreshWifi, priority: true).catchError((Object error) {
-      diagnostics?.warning('WiFi 状态', '写后刷新失败：$error');
+    unawaited(_refreshNasSnapshot().catchError((Object error) {
+      diagnostics?.warning('NAS MQTT 状态', '写后刷新失败：$error');
     }));
   }
 
+  void _setPendingNasMqttRequest(
+      {required bool pending, int? ageMs, bool ageEstimated = false}) {
+    hasPendingNasMqttRequest = pending;
+    pendingNasMqttRequestAgeMs = ageMs;
+    pendingNasMqttRequestAgeEstimated = pending && ageEstimated;
+    _pendingNasMqttRequestCreatedAtMs =
+        ageMs == null ? null : DateTime.now().millisecondsSinceEpoch - ageMs;
+    _notifyIfAlive();
+  }
+
+  Future<void> refreshPendingNasMqttRequest() async {
+    final deviceId = _lastNasPendingDeviceId;
+    final tokenId = _lastNasPendingTokenId;
+    if (deviceId == null || tokenId == null) return;
+    final preferences = await SharedPreferences.getInstance();
+    final current =
+        preferences.getString(NasPendingRequestStore.keyFor(deviceId, tokenId));
+    final legacy = preferences
+        .getString(NasPendingRequestStore.legacyKeyFor(deviceId, tokenId));
+    final pending = current != null || legacy != null;
+    final createdAt = preferences
+        .getInt(NasPendingRequestStore.createdAtKeyFor(deviceId, tokenId));
+    final ageMs = !pending || createdAt == null
+        ? null
+        : (DateTime.now().millisecondsSinceEpoch - createdAt)
+            .clamp(0, 0x7fffffffffffffff)
+            .toInt();
+    final ageEstimated = preferences.getBool(
+            NasPendingRequestStore.estimatedAgeKeyFor(deviceId, tokenId)) ??
+        false;
+    _setPendingNasMqttRequest(
+        pending: pending, ageMs: ageMs, ageEstimated: ageEstimated);
+  }
+
   Future<void> refresh({int? expectedGeneration}) async {
-    if (wifiActive) {
-      await _wifiSerial(_refreshWifi, priority: true);
+    if (nasMqttActive) {
+      await _nasSerial(_refreshNasSnapshot, priority: true);
       return;
     }
     if (_offlineViewing ||
@@ -1040,25 +1637,60 @@ class MimiVentController extends ChangeNotifier {
   /// 统一范围查询。粒度由固件决定，App 不传 bucketHours。
   ///
   /// 查询键在今日刷新期间稳定；设备身份、数据批次和协议版本由控制器隔离。
-  Future<void> refreshStatisticsRange(StatisticsQuery query) async {
-    if (!query.valid) return;
-    if (_offlineViewing || (!ble.isConnected && !wifiActive)) return;
-    if (!supportsStatisticsRange) return;
+  Future<void> refreshStatisticsRange(StatisticsQuery query,
+      {bool priority = true, bool Function()? shouldRead}) {
+    if (!query.valid ||
+        _offlineViewing ||
+        (!ble.isConnected && !nasMqttActive) ||
+        !supportsStatisticsRange) {
+      return Future<void>.value();
+    }
+    final key = _rangeKey(query);
+    // 新的页面调用接管读取意愿；相同范围共享真正完成的 Future。
+    _statisticsRangeReadGuards[key] = shouldRead ?? () => true;
+    final existing = _statisticsRangeRequests[key];
+    if (existing != null) return existing;
+    final completion = Completer<void>();
+    _statisticsRangeRequests[key] = completion.future;
+    unawaited(() async {
+      try {
+        await _refreshStatisticsRange(query,
+            priority: priority,
+            shouldRead: () => _statisticsRangeReadGuards[key]?.call() ?? false);
+        completion.complete();
+      } catch (error, stack) {
+        completion.completeError(error, stack);
+      } finally {
+        if (identical(_statisticsRangeRequests[key], completion.future)) {
+          _statisticsRangeRequests.remove(key);
+          _statisticsRangeReadGuards.remove(key);
+        }
+        _notifyIfAlive();
+      }
+    }());
+    return completion.future;
+  }
+
+  Future<void> _refreshStatisticsRange(StatisticsQuery query,
+      {required bool priority, required bool Function() shouldRead}) async {
     final scope = _rangeScope;
     final epochAtStart = _rangeEpochByScope[scope];
-    final key = _rangeKey(query);
-    if (!_statisticsRangeRequests.add(key)) return;
     final generation = _sessionGeneration;
     final selectedProfile = profile;
+    await _restoreStatisticsRangeCache(query, scope);
+    if (_disposed) return;
+    if (scope != _rangeScope) throw _ObsoleteStatisticsQuery();
+    if (!shouldRead()) throw _ObsoleteStatisticsQuery();
     _notifyIfAlive();
     try {
       final Map<String, dynamic> loaded;
-      if (wifiActive) {
+      if (nasMqttActive) {
         // 主数据插队：切 Tab 时图表/汇总要最先出来，事件明细可以稍后。
-        loaded = await _wifiReadPath(
+        loaded = await _nasReadPath(
           '/api/stats/range?from=${query.from}&to=${query.to}'
           '&tzOffsetSeconds=${query.tzOffsetSeconds}',
-          priority: true,
+          priority: priority,
+          shouldRead: shouldRead,
         );
       } else {
         loaded = await repository.getStatisticsRange(
@@ -1068,7 +1700,8 @@ class MimiVentController extends ChangeNotifier {
           tzOffsetSeconds: query.tzOffsetSeconds,
         );
       }
-      if (generation != _sessionGeneration || scope != _rangeScope ||
+      if (generation != _sessionGeneration ||
+          scope != _rangeScope ||
           (epochAtStart != _rangeEpochByScope[scope] &&
               loaded['dataEpoch']?.toString() != _rangeEpochByScope[scope])) {
         return;
@@ -1080,24 +1713,40 @@ class MimiVentController extends ChangeNotifier {
       // 数据批次变化后，旧的按日快照不能再与新的下标混用。
       final epoch = loaded['dataEpoch']?.toString();
       final device = loaded['deviceId']?.toString();
-      if (epoch != null && epoch.isNotEmpty) {
-        _rangeEpochByScope[scope] = epoch;
-        final stale = _statisticsRangeByKey.entries
-            .where((entry) => (entry.key.startsWith('$scope|') ||
-                    (device != null && entry.value['deviceId']?.toString() == device)) &&
-                entry.value['dataEpoch']?.toString() != epoch)
-            .map((entry) => entry.key)
-            .toList();
-        for (final staleKey in stale) {
-          _rangeEpochByScope[staleKey.split('|').first] = epoch;
-          _statisticsRangeByKey.remove(staleKey);
-        }
+      if (device == null || device.isEmpty || epoch == null || epoch.isEmpty) {
+        diagnostics?.warning('统计范围', '响应缺少 deviceId 或 dataEpoch，未缓存该快照');
+        return;
       }
-      _statisticsRangeByKey[_rangeKey(query)] = loaded;
+      _rangeEpochByScope[scope] = epoch;
+      _statisticsDatasetByScope[scope] = device;
+      final stale = _statisticsRangeByKey.entries
+          .where((entry) =>
+              (entry.key.startsWith('$scope|') ||
+                  entry.value['deviceId']?.toString() == device) &&
+              entry.value['dataEpoch']?.toString() != epoch)
+          .map((entry) => entry.key)
+          .toList();
+      for (final staleKey in stale) {
+        _rangeEpochByScope[staleKey.split('|').first] = epoch;
+        _statisticsRangeByKey.remove(staleKey);
+        _statisticsRangeUpdatedAt.remove(staleKey);
+      }
+      unawaited(_purgeStatisticsSnapshotsForEpoch(device, epoch));
+      final key = _rangeKey(query);
+      final updatedAt = DateTime.now();
+      loaded['_cacheUpdatedAt'] = updatedAt.millisecondsSinceEpoch;
+      _statisticsRangeByKey[key] = loaded;
+      _statisticsRangeUpdatedAt[key] = updatedAt;
+      unawaited(_persistStatisticsRangeCache(query, scope, device, loaded,
+          updatedAt: updatedAt));
     } catch (error) {
-      diagnostics?.error('统计范围', '查询失败：$error');
+      if (error is _ObsoleteStatisticsQuery) {
+        diagnostics?.info('统计范围', '已取消切走页面的排队查询');
+      } else {
+        diagnostics?.error('统计范围', '查询失败：$error');
+      }
+      rethrow;
     } finally {
-      _statisticsRangeRequests.remove(key);
       _notifyIfAlive();
     }
   }
@@ -1106,25 +1755,33 @@ class MimiVentController extends ChangeNotifier {
   ///
   /// 只用于单日范围；多日范围按文档不提供明细。
   Future<void> refreshRangeEventPage(StatisticsQuery query,
-      {int? beforeId, int? windowStart, int? windowEnd}) async {
-    if (_offlineViewing || (!ble.isConnected && !wifiActive)) return;
+      {int? beforeId,
+      int? windowStart,
+      int? windowEnd,
+      bool priority = true,
+      bool Function()? shouldRead}) async {
+    if (_offlineViewing || (!ble.isConnected && !nasMqttActive)) return;
     if (!supportsStatisticsRange) return;
     // 多日范围默认不按整段拉（32 条一页远远不够）；
     // 点某根柱时会用 windowStart/windowEnd 只取那一段。
     if (!query.singleDay && windowStart == null) return;
     final queryFrom = windowStart ?? query.from;
-    final queryTo = windowEnd ?? query.to;
+    final queryTo = windowEnd ??
+        (_statisticsRangeByKey[_rangeKey(query)]?['to'] as num?)?.toInt() ??
+        query.to;
     final key = _rangeKey(query);
     final cached = _statisticsRangeByKey[key];
     if (cached == null) return;
     final generation = _sessionGeneration;
     try {
       final Map<String, dynamic> page;
-      if (wifiActive) {
+      if (nasMqttActive) {
         final cursor = beforeId == null ? '' : '&beforeId=$beforeId';
-        page = await _wifiReadPath(
+        page = await _nasReadPath(
           '/api/events?start=$queryFrom&end=$queryTo'
-          '&kind=all&limit=32$cursor',
+          '&kind=all&limit=8$cursor',
+          priority: priority,
+          shouldRead: shouldRead,
         );
       } else {
         final result = await repository.queryEvents(
@@ -1142,13 +1799,19 @@ class MimiVentController extends ChangeNotifier {
           'nextCursor': result.nextCursor,
         };
       }
-      if (generation != _sessionGeneration || key != _rangeKey(query) ||
+      if (generation != _sessionGeneration ||
+          key != _rangeKey(query) ||
           !identical(cached, _statisticsRangeByKey[key])) {
         return;
       }
       // 按柱窗口取到的事件单独存：整范围刷新会重写 'events'，
       // 混在一起会导致用户点开的详情在每分钟刷新时被冲掉。
       final slot = windowStart == null ? 'events' : 'intervalEvents';
+      final next = page['nextCursor'];
+      if (page['hasMore'] == true &&
+          (next is! num || (beforeId != null && next.toInt() >= beforeId))) {
+        throw const FormatException('事件分页游标没有前进，请刷新统计后重试');
+      }
       final existing = cached[slot];
       final incoming = (page['events'] as List?) ?? const [];
       final merged = beforeId == null
@@ -1166,18 +1829,40 @@ class MimiVentController extends ChangeNotifier {
           'timeUntrusted': page['timeUntrusted'] == true,
         };
       }
+      final datasetId = cached['deviceId']?.toString();
+      final updatedAt = DateTime.now();
+      cached['_cacheUpdatedAt'] = updatedAt.millisecondsSinceEpoch;
+      _statisticsRangeUpdatedAt[key] = updatedAt;
+      if (datasetId != null && datasetId.isNotEmpty) {
+        unawaited(_persistStatisticsRangeCache(
+          query,
+          _rangeScope,
+          datasetId,
+          cached,
+          updatedAt: updatedAt,
+        ));
+      }
       _notifyIfAlive();
     } catch (error) {
-      diagnostics?.error('统计范围', '事件明细查询失败：$error');
+      if (error is _ObsoleteStatisticsQuery) {
+        diagnostics?.info('统计范围', '已取消切走页面的事件查询');
+      } else {
+        diagnostics?.error('统计范围', '事件明细查询失败：$error');
+      }
+      rethrow;
     }
   }
 
   /// 切换数据批次或断开连接时作废范围缓存。
   void clearStatisticsRangeCache() {
-    if (_statisticsRangeByKey.isEmpty && _statisticsRangeRequests.isEmpty) return;
+    if (_statisticsRangeByKey.isEmpty && _statisticsRangeRequests.isEmpty) {
+      return;
+    }
     _statisticsRangeByKey.clear();
+    _statisticsRangeUpdatedAt.clear();
     _rangeEpochByScope.clear();
     _statisticsRangeRequests.clear();
+    _statisticsRangeReadGuards.clear();
     _notifyIfAlive();
   }
 
@@ -1185,17 +1870,17 @@ class MimiVentController extends ChangeNotifier {
       {int? expectedGeneration,
       int eventOffset = 0,
       int? eventBeforeId}) async {
-    if (_offlineViewing || (!ble.isConnected && !wifiActive)) return;
-    if (wifiActive && !_wifiStatsSerialized) {
-      await _wifiSerial(() async {
-        _wifiStatsSerialized = true;
+    if (_offlineViewing || (!ble.isConnected && !nasMqttActive)) return;
+    if (nasMqttActive && !_nasStatsSerialized) {
+      await _nasSerial(() async {
+        _nasStatsSerialized = true;
         try {
           await refreshStatistics(range,
               expectedGeneration: expectedGeneration,
               eventOffset: eventOffset,
               eventBeforeId: eventBeforeId);
         } finally {
-          _wifiStatsSerialized = false;
+          _nasStatsSerialized = false;
         }
       });
       return;
@@ -1210,9 +1895,9 @@ class MimiVentController extends ChangeNotifier {
     _notifyIfAlive();
     try {
       final Map<String, dynamic> loaded;
-      if (wifiActive) {
+      if (nasMqttActive) {
         if (eventOffset == 0 && eventBeforeId == null) {
-          loaded = await _wifiReadPath('/api/stats?mode=$range');
+          loaded = await _nasReadPath('/api/stats?mode=$range&limit=4');
           _validateStatisticsSnapshot(range, loaded);
         } else {
           final previous = _statisticsByRange[range];
@@ -1222,9 +1907,9 @@ class MimiVentController extends ChangeNotifier {
           if (start <= 0 || end <= start) return;
           final cursor =
               eventBeforeId == null ? '' : '&beforeId=$eventBeforeId';
-          final query = 'start=$start&end=$end&offset=$eventOffset&limit=32'
+          final query = 'start=$start&end=$end&offset=$eventOffset&limit=4'
               '&kind=all$cursor${epoch == null ? '' : '&dataEpoch=${Uri.encodeQueryComponent(epoch)}'}';
-          final page = await _wifiReadPath('/api/events?$query');
+          final page = await _nasReadPath('/api/events?$query');
           loaded = {
             'events': page['events'],
             'eventsOffset': page['offset'],
@@ -1292,7 +1977,7 @@ class MimiVentController extends ChangeNotifier {
         };
       }
       if (_disposed ||
-          (!ble.isConnected && !wifiActive) ||
+          (!ble.isConnected && !nasMqttActive) ||
           generation != _sessionGeneration ||
           selectedProfile != profile) return;
       await _invalidateOlderStatisticsDatasets(
@@ -1338,7 +2023,7 @@ class MimiVentController extends ChangeNotifier {
     }
     if (restartAfterDatasetChange &&
         !_disposed &&
-        (ble.isConnected || wifiActive)) {
+        (ble.isConnected || nasMqttActive)) {
       // 旧游标属于已清除的数据批次；从当前数据集首屏重新开始。
       unawaited(refreshStatistics(range, expectedGeneration: generation));
     }
@@ -1590,12 +2275,21 @@ class MimiVentController extends ChangeNotifier {
   }
 
   Future<void> loadSettings({int? expectedGeneration}) async {
-    if (wifiActive) {
-      await _wifiSerial(() async {
-        final binding = _wifiBinding!;
-        final data = await _wifiTransport!
-            .readPath(binding, '/api/settings?profile=${profile.wireValue}');
-        final loaded = TimingSettings.fromJson(data);
+    if (nasMqttActive) {
+      final generation = _nasMqttSessionGeneration;
+      await _nasSerial(() async {
+        // MQTT 状态快照已经包含当前生效设置；本地网络页面不得再直连设备 HTTPS。
+        await _refreshNasSnapshot();
+        if (_disposed ||
+            generation != _nasMqttSessionGeneration ||
+            !nasMqttActive) {
+          return;
+        }
+        final loaded = settings;
+        if (loaded == null) {
+          throw const NasGatewayException(
+              'SETTINGS_UNAVAILABLE', 'NAS 状态快照没有可用的设备设置');
+        }
         settings = loaded;
         _settingsDraft = SettingsDraft(saved: loaded, value: loaded);
         _notifyIfAlive();
@@ -1630,18 +2324,37 @@ class MimiVentController extends ChangeNotifier {
     _notifyIfAlive();
   }
 
-  Future<void> switchProfile(TimingProfile next) async {
-    if (next == profile) return;
+  Future<void> switchProfile(TimingProfile next, {bool force = false}) async {
+    if (next == profile && !force) return;
     if (busy) throw StateError('操作正在执行，请稍后重试');
-    if (wifiActive) {
+    if (nasMqttActive) {
+      busy = true;
       _beginPending('切换环境');
       try {
-        await _wifiWrite(
+        await _nasMqttWrite(
             '/api/auto', 'profile=${next.wireValue}&switchProfile=1&replace=1');
+        // ACK 已确认设备切换成功；一起更新页面与状态，防止短暂环境不一致。
+        final loaded = TimingSettings.fromJson(
+            await _nasReadPath('/api/status', priority: true));
         profile = next;
+        status = status?.copyWith(
+            activeProfile: next,
+            viewProfile: next,
+            mode: 'auto',
+            phase: 'armed',
+            fan: false,
+            remainingMs: 0,
+            startupCooldownMs: loaded.startupCooldownMs,
+            leaveConfirmMs: loaded.leaveConfirmMs,
+            autoExhaustMs: loaded.autoExhaustMs,
+            manualExhaustMs: loaded.manualExhaustMs,
+            pauseMs: loaded.pauseMs);
+        settings = loaded;
+        _settingsDraft = SettingsDraft(saved: loaded, value: loaded);
+        _guardNasConfiguration(next, loaded);
         await _persistSelectedProfile();
-        await _refreshWifi();
       } finally {
+        busy = false;
         _endPending();
       }
       return;
@@ -1676,6 +2389,10 @@ class MimiVentController extends ChangeNotifier {
 
   /// 将设备切换到 App 当前选中的环境；即使两者页面选择相同，也允许修正设备状态。
   Future<void> switchDeviceToSelectedProfile() async {
+    if (nasMqttActive) {
+      await switchProfile(profile, force: true);
+      return;
+    }
     if (busy) throw StateError('操作正在执行，请稍后重试');
     if (!ble.isConnected) throw StateError('蓝牙未连接，请先连接设备');
     await _perform((generation) async {
@@ -1699,14 +2416,31 @@ class MimiVentController extends ChangeNotifier {
   }
 
   void _beginPending(String label) {
-    pendingWifiAction = label;
+    lastError = null;
+    pendingNasMqttAction = label;
+    // 使控制开始前发出的状态读取失效，不能让迟到的旧响应回滚乐观状态。
+    _nasSnapshotRevision++;
+    _nasControlAppliedAtMs = DateTime.now().millisecondsSinceEpoch;
     _notifyIfAlive();
   }
 
   void _endPending() {
-    if (pendingWifiAction == null) return;
-    pendingWifiAction = null;
+    if (pendingNasMqttAction == null) return;
+    // 控制期间发出的读取也可能在 ACK 后才返回；让它们失效，随后立即补读。
+    _nasSnapshotRevision++;
+    pendingNasMqttAction = null;
     _notifyIfAlive();
+    _boostNasSyncAfterControl();
+  }
+
+  /// 控制请求结束后短暂加快缓存读取，尽快确认设备最终状态。
+  /// 设备状态仍由 MQTT 主动上报；这里仅缩短 App 读取 NAS 缓存的间隔。
+  void _boostNasSyncAfterControl() {
+    if (!nasMqttActive || !_appForeground || _disposed) return;
+    _nasFastSyncUntilMs = DateTime.now().millisecondsSinceEpoch +
+        const Duration(seconds: 5).inMilliseconds;
+    _nasSyncTimer?.cancel();
+    _scheduleNasSync();
   }
 
   void _applyWifiOptimistic({
@@ -1716,9 +2450,10 @@ class MimiVentController extends ChangeNotifier {
     int? remainingMs,
     int? durationMs,
   }) {
-    // 控制已经在设备上成功；先撤掉 pending 遮罩，再同时更新状态，
-    // 避免遮罩仍显示“正在排风”时底层计时器已经跑起来。
-    pendingWifiAction = null;
+    // 标记控制起点：此刻之前出发的读取结果都已经过时。
+    _nasControlAppliedAtMs = DateTime.now().millisecondsSinceEpoch;
+    // 请求可能仍在等待 ACK；pending 保护由调用方 finally 中的 _endPending 负责清理。
+    // 快照在 ACK 前返回时仍应被 pendingNasMqttAction 拦住。
     final current = status;
     if (current == null) {
       _notifyIfAlive();
@@ -1744,17 +2479,22 @@ class MimiVentController extends ChangeNotifier {
       fanRunMs: 0,
     );
     // 乐观状态从收到 ACK 的这一刻开始插值，不能沿用上一次状态的时间戳。
-    _wifiStatusAt = DateTime.now();
+    _nasStatusAt = DateTime.now();
     _notifyIfAlive();
   }
 
   Future<void> setAuto({bool replace = false}) async {
-    if (wifiActive) {
+    if (nasMqttActive) {
       _beginPending('恢复自动感应');
+      // 先落本地状态再发请求：两阶段往返要 1.2-1.9 秒，等回来再切 UI
+      // 会让卡片迟滞一整秒。失败时用服务端快照校正。
+      _applyWifiOptimistic(mode: 'auto', phase: 'armed', fan: false);
       try {
-        await _wifiWrite('/api/auto',
+        await _nasMqttWrite('/api/auto',
             'profile=${profile.wireValue}&switchProfile=1&replace=${replace ? 1 : 0}');
-        _applyWifiOptimistic(mode: 'auto', phase: 'armed', fan: false);
+      } catch (_) {
+        unawaited(_refreshNasSnapshot().catchError((_) {}));
+        rethrow;
       } finally {
         _endPending();
       }
@@ -1786,24 +2526,29 @@ class MimiVentController extends ChangeNotifier {
           return OperationRejected(operation, '持续关闭需要二次确认');
       }
       return OperationSucceeded(operation);
+    } on _ControlReplacementRequired {
+      return OperationNeedsReplacement(operation);
     } catch (error) {
       return OperationRejected(operation, error.toString());
     }
   }
 
   Future<void> exhaust({bool replace = false}) async {
-    if (wifiActive) {
+    if (nasMqttActive) {
       final duration = settings?.manualExhaustMs ?? 180000;
       _beginPending('启动临时排风');
+      _applyWifiOptimistic(
+          mode: 'timed_on',
+          phase: 'exhausting',
+          fan: true,
+          remainingMs: duration,
+          durationMs: duration);
       try {
-        await _wifiWrite('/api/timed',
+        await _nasMqttWrite('/api/timed',
             'profile=${profile.wireValue}&mode=on&replace=${replace ? 1 : 0}');
-        _applyWifiOptimistic(
-            mode: 'timed_on',
-            phase: 'exhausting',
-            fan: true,
-            remainingMs: duration,
-            durationMs: duration);
+      } catch (_) {
+        unawaited(_refreshNasSnapshot().catchError((_) {}));
+        rethrow;
       } finally {
         _endPending();
       }
@@ -1815,19 +2560,45 @@ class MimiVentController extends ChangeNotifier {
     });
   }
 
+  /// 乐观更新：点下控制按钮的瞬间就把本地状态切到目标模式，
+  /// 让卡片立刻高亮，不必等 1-2 秒的 prepare/execute 两阶段往返。
+  /// 请求失败时由调用方刷新校正；请求成功时服务端返回的真实值会覆盖它。
+  void applyOptimisticMode(String mode, {int? remainingMs}) {
+    final current = status;
+    if (current == null) return;
+    status = current.copyWith(
+      mode: mode,
+      phase: mode == 'auto'
+          ? 'armed'
+          : (current.phase == 'startup_cooldown' ? current.phase : 'running'),
+      remainingMs: remainingMs ?? current.remainingMs,
+      fanRunMs: mode == 'auto' ? 0 : current.fanRunMs,
+      fan: mode != 'auto',
+    );
+    if (mode == 'auto') {
+      _fanRunStartedAt = null;
+    } else {
+      _fanRunStartedAt ??= DateTime.now();
+    }
+    _notifyIfAlive();
+  }
+
   Future<void> pause({bool replace = false}) async {
-    if (wifiActive) {
+    if (nasMqttActive) {
       final duration = settings?.pauseMs ?? 600000;
       _beginPending('启动临时暂停');
+      _applyWifiOptimistic(
+          mode: 'timed_off',
+          phase: 'armed',
+          fan: false,
+          remainingMs: duration,
+          durationMs: duration);
       try {
-        await _wifiWrite('/api/timed',
+        await _nasMqttWrite('/api/timed',
             'profile=${profile.wireValue}&mode=off&replace=${replace ? 1 : 0}');
-        _applyWifiOptimistic(
-            mode: 'timed_off',
-            phase: 'armed',
-            fan: false,
-            remainingMs: duration,
-            durationMs: duration);
+      } catch (_) {
+        unawaited(_refreshNasSnapshot().catchError((_) {}));
+        rethrow;
       } finally {
         _endPending();
       }
@@ -1840,18 +2611,21 @@ class MimiVentController extends ChangeNotifier {
   }
 
   Future<void> forceTest({bool replace = false}) async {
-    if (wifiActive) {
+    if (nasMqttActive) {
       final duration = settings?.manualExhaustMs ?? 180000;
       _beginPending('启动强制排风');
+      _applyWifiOptimistic(
+          mode: 'force_test',
+          phase: 'exhausting',
+          fan: true,
+          remainingMs: duration,
+          durationMs: duration);
       try {
-        await _wifiWrite('/api/test-fan',
+        await _nasMqttWrite('/api/test-fan',
             'profile=${profile.wireValue}&replace=${replace ? 1 : 0}');
-        _applyWifiOptimistic(
-            mode: 'force_test',
-            phase: 'exhausting',
-            fan: true,
-            remainingMs: duration,
-            durationMs: duration);
+      } catch (_) {
+        unawaited(_refreshNasSnapshot().catchError((_) {}));
+        rethrow;
       } finally {
         _endPending();
       }
@@ -1865,12 +2639,12 @@ class MimiVentController extends ChangeNotifier {
 
   /// 把持续关闭的 prepare/confirm 两条命令绑定在同一 BLE 会话中。
   Future<void> enableLockOff({bool replace = false}) async {
-    if (wifiActive) {
+    if (nasMqttActive) {
       _beginPending('持续关闭');
       try {
-        await _wifiWrite('/api/lockoff',
+        await _nasMqttWrite('/api/lockoff',
             'profile=${profile.wireValue}&stage=prepare&replace=${replace ? 1 : 0}');
-        await _wifiWrite('/api/lockoff',
+        await _nasMqttWrite('/api/lockoff',
             'profile=${profile.wireValue}&stage=confirm&replace=${replace ? 1 : 0}');
         _applyWifiOptimistic(mode: 'lock_off', phase: 'armed', fan: false);
       } finally {
@@ -1892,8 +2666,8 @@ class MimiVentController extends ChangeNotifier {
     if (_offlineViewing || !connected) {
       throw StateError('离线模式无法操作设备，请先连接蓝牙');
     }
-    if (wifiActive) {
-      await _wifiWrite('/api/lockoff',
+    if (nasMqttActive) {
+      await _nasMqttWrite('/api/lockoff',
           'profile=${profile.wireValue}&stage=cancel&replace=1');
       return;
     }
@@ -1948,11 +2722,8 @@ class MimiVentController extends ChangeNotifier {
     final draft = draftSettings;
     if (draft == null) throw StateError('时序配置尚未加载');
     if (!profileMatches) throw StateError('环境与设备不一致，请先切换到正确环境');
-    if (wifiActive) {
-      await _wifiWrite('/api/settings',
-          'profile=${profile.wireValue}&${draft.toFormBody()}');
-      settings = draft;
-      _settingsDraft = _settingsDraft?.markSaved(draft);
+    if (nasMqttActive) {
+      await _saveNasSettings(draft, '保存时间设置');
       return;
     }
     await _perform((generation) async {
@@ -1968,11 +2739,57 @@ class MimiVentController extends ChangeNotifier {
 
   Future<void> resetSettings() async {
     if (!profileMatches) throw StateError('环境与设备不一致，请先切换到正确环境');
+    if (nasMqttActive) {
+      // 与 SettingsStore.cpp 的 production/dev 默认时序保持一致。
+      final defaults = profile == TimingProfile.dev
+          ? const TimingSettings(
+              startupCooldownMs: 5000,
+              leaveConfirmMs: 0,
+              autoExhaustMs: 10000,
+              manualExhaustMs: 10000,
+              pauseMs: 10000)
+          : const TimingSettings(
+              startupCooldownMs: 30000,
+              leaveConfirmMs: 30000,
+              autoExhaustMs: 120000,
+              manualExhaustMs: 60000,
+              pauseMs: 300000);
+      await _saveNasSettings(defaults, '重置时间设置');
+      return;
+    }
     await _perform((generation) async {
       await repository.resetSettings(profile);
       await loadSettings(expectedGeneration: generation);
       await refresh(expectedGeneration: generation);
     });
+  }
+
+  void _guardNasConfiguration(TimingProfile selected, TimingSettings loaded) {
+    _nasExpectedProfile = selected;
+    _nasExpectedSettings = loaded;
+    _nasConfigurationDeadline = DateTime.now().add(const Duration(seconds: 15));
+  }
+
+  Future<void> _saveNasSettings(TimingSettings value, String label) async {
+    if (busy) throw StateError('操作正在执行，请稍后重试');
+    busy = true;
+    _beginPending(label);
+    try {
+      await _nasMqttWrite('/api/settings',
+          'profile=${profile.wireValue}&${value.toFormBody()}');
+      settings = value;
+      _settingsDraft = SettingsDraft(saved: value, value: value);
+      status = status?.copyWith(
+          startupCooldownMs: value.startupCooldownMs,
+          leaveConfirmMs: value.leaveConfirmMs,
+          autoExhaustMs: value.autoExhaustMs,
+          manualExhaustMs: value.manualExhaustMs,
+          pauseMs: value.pauseMs);
+      _guardNasConfiguration(profile, value);
+    } finally {
+      busy = false;
+      _endPending();
+    }
   }
 
   Future<void> _perform(Future<void> Function(int generation) action,
@@ -2013,7 +2830,8 @@ class MimiVentController extends ChangeNotifier {
     _connectAttempt++;
     _sessionGeneration++;
     _pollTimer?.cancel();
-    _wifiHealthTimer?.cancel();
+    _nasSyncTimer?.cancel();
+    _nasGatewayTransport.dispose();
     ble.removeListener(_onBleChanged);
     unawaited(closeBluetoothSession());
     ble.dispose();
@@ -2021,3 +2839,10 @@ class MimiVentController extends ChangeNotifier {
   }
 }
 
+class _ControlReplacementRequired implements Exception {
+  const _ControlReplacementRequired();
+}
+
+class _ObsoleteStatisticsQuery extends StateError {
+  _ObsoleteStatisticsQuery() : super('统计页面已切换，已取消尚未发送的查询');
+}

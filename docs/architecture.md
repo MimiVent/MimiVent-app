@@ -1,6 +1,6 @@
 # MimiVent App 架构说明
 
-当前 App 以一个共享的 `MimiVentController` 协调 BLE 会话、WiFi HTTPS 会话、设备快照、控制操作与设置草稿。设备 API 通过 `DeviceRepository` 注入，BLE 具体实现由 `BleDeviceRepository` 适配。BLE 插件只在 `MimiVentBleManager` 中使用；WiFi HTTPS 由 `WifiReadTransport` 封装；页面不直接操作 GATT 或 TLS。
+当前 App 以一个共享的 `MimiVentController` 协调 BLE 会话、NAS Gateway 会话、设备快照、控制操作与设置草稿。BLE 负责近场控制、WiFi 配网、绑定、校时与 OTA；远程控制和状态读取经固定证书指纹校验的 NAS Gateway HTTPS，再由 NAS 通过 MQTT 与设备通信。界面将这条通道称为“NAS MQTT 控制”，避免与设备 WiFi 联网混淆。设备侧不提供 HTTPS 控制服务。`DeviceRepository` 与 `BleDeviceRepository` 管理 BLE API；`NasGatewayTransport` 管理 App 到 NAS 的 HTTPS 请求及证书固定。页面不直接操作 GATT 或 TLS。
 
 ## 目录职责
 
@@ -22,7 +22,7 @@ lib/
 │   └── layout/app_layout.dart             # 短屏、大字号等响应式断点
 ├── data/
 │   ├── background_ble_lifecycle.dart      # 后台宽限期与会话恢复
-│   ├── device_connection_manager.dart     # WiFi/BLE 实际通道与顶部状态
+│   ├── device_connection_manager.dart     # NAS MQTT/BLE 实际通道与顶部状态
 │   ├── mimivent_controller.dart           # App 级设备状态和操作协调
 │   ├── device_repository.dart             # 控制器使用的设备 API 契约
 │   ├── ble_device_repository.dart         # 固件 API 的 BLE Repository 适配器
@@ -32,7 +32,7 @@ lib/
 │   ├── diagnostics/                       # 本地诊断日志页面
 │   ├── control/                           # 控制意图、操作规则和状态 Presenter
 │   ├── connection/                        # 通道徽标与连接 UI 呈现状态
-│   ├── wifi_control/                      # WiFi 绑定、HTTPS 传输、主页通道
+│   ├── local_network/                      # WiFi 绑定、NAS Gateway HTTPS 传输与 MQTT 控制
 │   ├── wifi_provisioning/                 # BLE 配网与手机侧网络选择
 │   └── dashboard/presentation/            # 连接、控制和时序设置 UI
 └── shared/
@@ -48,8 +48,8 @@ Dashboard presentation 采用 part 文件把一组紧密耦合的 State 辅助�
 ## 状态流
 
 1. `MimiVentApp` 创建唯一 `MimiVentController`，并连接 Flutter App 生命周期。
-2. 启动先探测本机 WiFi 绑定；成功则 `activateWifi` 进入主页 WiFi 控制，失败则延迟 6 秒再探测一次，仍未恢复才进入 BLE 扫描。
-3. `DeviceConnectionManager` 根据实际可用通道显示 `WiFi 控制`/`蓝牙控制`/`设备未连接`；BLE 断开回到 WiFi，WiFi 断开进入重试。
+2. 启动先探测本机 WiFi 绑定；成功则建立 NAS Gateway 会话并进入“NAS MQTT 控制”，失败则延迟 6 秒再探测一次，仍未恢复才进入 BLE 扫描。
+3. `DeviceConnectionManager` 根据实际可用通道显示 `NAS MQTT 控制`/`蓝牙控制`/`设备未连接`；蓝牙断开后可回到 NAS MQTT，NAS 通道断开则重试。
 4. `BackgroundBleLifecycle` 处理后台 10 分钟宽限期；在宽限期内回前台保留 BLE，超时后释放连接，回前台重新扫描。
 5. `MimiVentBleManager` 唯一拥有扫描订阅、设备连接、GATT 特征和 BLE 命令队列。
 6. `MimiVentApi` 以 BLE 请求承载固件 `/api/*` 路径、环境和模式参数。
@@ -69,7 +69,7 @@ Dashboard presentation 采用 part 文件把一组紧密耦合的 State 辅助�
 - 控制写请求保持串行；这保证 BLE 协议顺序，不代表用户操作要排队等待计时结束。
 - 相同的限时操作允许替换当前任务并重新计时；覆盖不同任务时先让用户确认。
 - 正式与 DEV 是设备侧独立时序配置。App 选择环境和固件当前环境必须明确比对，未同步时禁止发送控制命令。
-- WiFi 请求集中在 `WifiReadTransport`（沿用早期命名，当前支持读写）；页面不直接调用 TLS，写请求通过请求 ID 对账。
+- NAS Gateway HTTPS 请求集中在 `NasGatewayTransport`；设备控制和查询由 Gateway 通过 MQTT 转发，页面不直接调用 TLS，写请求通过请求 ID 对账。
 - 新状态/协议转换优先放在 `data/models.dart`、API 层或 Presenter，避免把固件 wire 字符串判断散落到多个 Widget。
 - 新设备命令通过 `DeviceRepository` 与 BLE 适配器扩展；页面不直接依赖 `MimiVentApi` 或 BLE 插件。
 - 新控制入口先加入 `ControlOperation`，并为冷静期、同类重置和可打断规则添加纯单元测试。

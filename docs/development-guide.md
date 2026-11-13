@@ -1,6 +1,6 @@
 # MimiVent App 开发维护指南
 
-本文说明常见改动应落在哪一层，以及改动后要核对哪些边界。项目当前是 Android BLE/WiFi HTTPS 控制端，安全配网经 BLE 完成，OTA 仍只走 BLE；其他平台不属于当前交付。
+本文说明常见改动应落在哪一层，以及改动后要核对哪些边界。项目当前是 Android BLE 与 NAS MQTT 控制端：App 经固定指纹校验的 HTTPS 访问 NAS Gateway，再由 NAS 通过 MQTT 与设备通信；设备安全配网经 BLE 完成，OTA 仍只走 BLE。其他平台不属于当前交付。
 
 ## 日常修改流程
 
@@ -62,8 +62,8 @@ flutter build apk --debug
 
 - 新页面放入相应 `lib/features/<feature>/`；主 Dashboard 目前用 `IndexedStack` 保留控制与设置页面状态。新增导航时同时维护当前 Tab、断连行为、滚动状态与底部导航。
 - 一个 App 会话只保留一套 `MimiVentController` 和设备 Repository；不要在新页面内创建第二个 BLE 管理器或并行轮询。
-- 新传输方式应实现 Repository 能力并明确平台生命周期、权限和错误语义。修改 WiFi 时须保持现有连接选择、租约、写请求去重及状态同步语义，网络实现集中在 `lib/features/wifi_control/`。
-- 当前交付平台为 Android，设备通信已支持 BLE 与 WiFi HTTPS。新增其他平台前分别验证插件、原生权限、安全存储和真实设备链路。
+- 新传输方式应实现 Repository 能力并明确平台生命周期、权限和错误语义。修改 NAS MQTT 控制时须保持通道选择、租约、写请求去重及状态同步语义；修改 WiFi 配网或绑定时须保持 BLE 配网及设备授权语义。网络实现集中在 `lib/features/local_network/`。
+- 当前交付平台为 Android。设备侧使用 BLE 与 WiFi/MQTT；App 到 NAS Gateway 使用固定指纹的 HTTPS。设备 HTTPS 控制已关闭。新增其他平台前分别验证插件、原生权限、安全存储和真实设备链路。
 
 ## 命名、注释与版本
 

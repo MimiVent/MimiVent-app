@@ -3,6 +3,17 @@ allprojects {
         google()
         mavenCentral()
     }
+    // ML Kit 扫码依赖 Kotlin 1.8 标准库；统一旧 jdk7/jdk8 兼容模块版本，
+    // 避免与 Kotlin 1.7 的兼容 jar 同时打包而产生重复 class。
+    configurations.configureEach {
+        resolutionStrategy.eachDependency { details ->
+            if (details.requested.group == "org.jetbrains.kotlin" &&
+                (details.requested.name == "kotlin-stdlib-jdk7" ||
+                    details.requested.name == "kotlin-stdlib-jdk8")) {
+                details.useVersion("1.8.22")
+            }
+        }
+    }
 }
 
 rootProject.buildDir = "../build"

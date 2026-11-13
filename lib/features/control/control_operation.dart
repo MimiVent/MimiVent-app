@@ -40,3 +40,9 @@ class OperationRejected extends OperationResult {
   final ControlOperation operation;
   final String reason;
 }
+
+/// 设备明确拒绝了切换；必须取得用户确认后才能发送覆盖操作。
+class OperationNeedsReplacement extends OperationResult {
+  const OperationNeedsReplacement(this.operation);
+  final ControlOperation operation;
+}

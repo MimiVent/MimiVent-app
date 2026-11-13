@@ -7,31 +7,34 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../data/device_connection_manager.dart';
 import '../connection/connection_status_badge.dart';
-import 'wifi_read_transport.dart';
-import 'wifi_startup_probe.dart';
+import 'nas_gateway_transport.dart';
+import 'nas_gateway_startup_probe.dart';
+import 'nas_gateway_models.dart';
 
-class WifiReadOnlyPage extends StatefulWidget {
-  const WifiReadOnlyPage({
+final NasGatewayTransport _readOnlyGateway = NasGatewayTransport();
+
+class NasGatewayPage extends StatefulWidget {
+  const NasGatewayPage({
     required this.initial,
     required this.onConnectBluetooth,
-    required this.onOpenWifiControl,
+    required this.onOpenNetworkSettings,
     required this.onRefresh,
     required this.connection,
     super.key,
   });
 
-  final WifiStartupSnapshot initial;
+  final NasGatewaySnapshot initial;
   final Future<void> Function() onConnectBluetooth;
-  final Future<void> Function() onOpenWifiControl;
-  final Future<WifiStartupSnapshot?> Function() onRefresh;
+  final Future<void> Function() onOpenNetworkSettings;
+  final Future<NasGatewaySnapshot?> Function() onRefresh;
   final DeviceConnectionManager connection;
 
   @override
-  State<WifiReadOnlyPage> createState() => _WifiReadOnlyPageState();
+  State<NasGatewayPage> createState() => _NasGatewayPageState();
 }
 
-class _WifiReadOnlyPageState extends State<WifiReadOnlyPage> {
-  late WifiStartupSnapshot _snapshot = widget.initial;
+class _NasGatewayPageState extends State<NasGatewayPage> {
+  late NasGatewaySnapshot _snapshot = widget.initial;
   bool _refreshing = false;
   bool _writing = false;
   String? _error;
@@ -90,7 +93,7 @@ class _WifiReadOnlyPageState extends State<WifiReadOnlyPage> {
       final next = await widget.onRefresh();
       if (!mounted) return;
       if (next == null) {
-        setState(() => _error = 'WiFi 暂不可达，请确认手机与设备在同一局域网');
+        setState(() => _error = 'NAS 状态暂不可达，请确认手机与 NAS 在同一局域网');
       } else {
         setState(() => _snapshot = next);
       }
@@ -119,16 +122,20 @@ class _WifiReadOnlyPageState extends State<WifiReadOnlyPage> {
       _writeNotice = null;
     });
     try {
-      final result = await WifiReadTransport().write(
+      final result = await _readOnlyGateway.tryWrite(
         _snapshot.binding,
         path: path,
         body: body,
         requestId: id,
       );
+      if (result == null) {
+        throw const NasGatewayException(
+            'GATEWAY_UNAVAILABLE', 'NAS 网关不可达，请连接蓝牙操作');
+      }
       if (result.statusCode != 200) {
         final code =
             result.body['error']?.toString() ?? 'HTTP_${result.statusCode}';
-        throw WifiReadException(code, _controlError(code));
+        throw NasGatewayException(code, _controlError(code));
       }
       if (mounted) {
         setState(() => _writeNotice =
@@ -137,10 +144,10 @@ class _WifiReadOnlyPageState extends State<WifiReadOnlyPage> {
       final next = await widget.onRefresh();
       if (!mounted) return;
       if (next != null) setState(() => _snapshot = next);
-    } on WifiReadException catch (e) {
+    } on NasGatewayException catch (e) {
       if (mounted) setState(() => _writeError = e.message);
     } catch (_) {
-      if (mounted) setState(() => _writeError = '操作未完成，请检查 WiFi 后重试');
+      if (mounted) setState(() => _writeError = '操作未完成，请检查 NAS 连接后重试');
     } finally {
       if (mounted) setState(() => _writing = false);
     }
@@ -155,7 +162,7 @@ class _WifiReadOnlyPageState extends State<WifiReadOnlyPage> {
         'REQUEST_ID_CONFLICT': '请求标识冲突，请重试',
         'RATE_LIMITED': '操作过于频繁，请稍后重试',
       }[code] ??
-      '设备未完成 WiFi 控制（$code）';
+      '设备未完成 NAS MQTT 控制（$code）';
 
   @override
   Widget build(BuildContext context) {
@@ -201,9 +208,9 @@ class _WifiReadOnlyPageState extends State<WifiReadOnlyPage> {
                 children: [
                   const Row(
                     children: [
-                      Icon(Icons.wifi, color: Color(0xFF6FE3C1)),
+                      Icon(Icons.cloud_sync_outlined, color: Color(0xFF6FE3C1)),
                       SizedBox(width: 8),
-                      Text('WiFi 已连接 · 已核验',
+                      Text('NAS MQTT 状态快照',
                           style: TextStyle(
                               color: Colors.white,
                               fontSize: 18,
@@ -213,8 +220,10 @@ class _WifiReadOnlyPageState extends State<WifiReadOnlyPage> {
                   const SizedBox(height: 14),
                   Text('设备：$shortDevice',
                       style: const TextStyle(color: Colors.white70)),
-                  Text('地址：${_snapshot.binding.host}:8443',
-                      style: const TextStyle(color: Colors.white70)),
+                  // 设备 HTTPS 已下线，host 只作历史遗留展示；为空时不再显示这一行。
+                  if (_snapshot.binding.host.isNotEmpty)
+                    Text('设备局域网地址（历史）：${_snapshot.binding.host}',
+                        style: const TextStyle(color: Colors.white70)),
                   Text('固件：${s['firmware'] ?? '未知'}',
                       style: const TextStyle(color: Colors.white70)),
                   Text('风机：${s['fan'] == true ? '运行' : '关闭'}',
@@ -244,7 +253,7 @@ class _WifiReadOnlyPageState extends State<WifiReadOnlyPage> {
           FilledButton.icon(
             onPressed: _refreshing ? null : _refresh,
             icon: const Icon(Icons.refresh),
-            label: Text(_refreshing ? '正在刷新…' : '刷新 WiFi 状态'),
+            label: Text(_refreshing ? '正在刷新…' : '刷新 NAS 状态'),
           ),
           const SizedBox(height: 10),
           Wrap(spacing: 8, runSpacing: 8, children: [
@@ -284,9 +293,9 @@ class _WifiReadOnlyPageState extends State<WifiReadOnlyPage> {
           ],
           const SizedBox(height: 10),
           OutlinedButton.icon(
-            onPressed: widget.onOpenWifiControl,
+            onPressed: widget.onOpenNetworkSettings,
             icon: const Icon(Icons.wifi),
-            label: const Text('WiFi 绑定与状态'),
+            label: const Text('WiFi 配网与 NAS 设置'),
           ),
           const SizedBox(height: 10),
           OutlinedButton.icon(
@@ -296,7 +305,7 @@ class _WifiReadOnlyPageState extends State<WifiReadOnlyPage> {
           ),
           const SizedBox(height: 18),
           const Text(
-            '当前版本 WiFi 支持只读与实验写控制；主页其它设置和固件升级仍使用蓝牙。',
+            '主页控制使用当前选定通道（NAS MQTT 或蓝牙）；固件升级仍通过蓝牙完成。',
             style: TextStyle(color: Colors.white54, height: 1.45),
           ),
         ],

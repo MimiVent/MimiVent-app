@@ -8,9 +8,16 @@ import '../../../data/mimivent_controller.dart';
 import '../../../data/statistics_query.dart';
 import '../../../shared/widgets/version_compatibility_notice.dart';
 import '../../../shared/widgets/device_animations.dart';
+import '../../../shared/widgets/top_toast.dart';
 
 /// 统计页的时间范围。第一版提供常用预设，避免日期选择器占用空间。
-enum _StatisticsRange { today, yesterday, dayBeforeYesterday, sevenDays, custom }
+enum _StatisticsRange {
+  today,
+  yesterday,
+  dayBeforeYesterday,
+  sevenDays,
+  custom
+}
 
 extension on _StatisticsRange {
   String get wireValue => switch (this) {
@@ -41,9 +48,10 @@ class StatisticsPage extends StatefulWidget {
 class _StatisticsPageState extends State<StatisticsPage> {
   bool get _readOnly =>
       widget.controller.offlineViewing || !widget.controller.connected;
+
   /// 上次成功取到范围数据的时刻。2 分钟内切回本页直接复用缓存，
   /// 不再新建 TLS 会话（设备端每次会话约 18 KB 堆）。
-  DateTime? _rangeLoadedAt;
+  final Map<String, DateTime> _rangeLoadedAt = {};
 
   /// 断开后 controller.status 会被清空，而查询需要 tzOffsetSeconds 与范围能力。
   /// 记住最近一次已知值，断线期间仍能构造 query 命中缓存，而不是整页变空。
@@ -62,11 +70,13 @@ class _StatisticsPageState extends State<StatisticsPage> {
   StatisticsQuery? _customQuery;
   int? _selectedChartIndex;
   Timer? _refreshTimer;
+
   /// range 接口的刷新状态：旧接口标志不适用于它，否则界面永远显示"已同步"。
   bool _rangeRefreshing = false;
   Object? _rangeError;
   Timer? _retryTimer;
   bool _loadingMoreEvents = false;
+  Object? _eventLoadError;
   bool _loadingSelectedIntervalEvents = false;
   bool _selectedIntervalEventsIncomplete = false;
   int _selectedIntervalGeneration = 0;
@@ -75,6 +85,7 @@ class _StatisticsPageState extends State<StatisticsPage> {
   String? _yesterdayDataDay;
   String? _comparisonDeviceId;
   bool _yesterdayRequested = false;
+  int _supplementaryLoadGeneration = 0;
 
   @override
   void initState() {
@@ -103,17 +114,19 @@ class _StatisticsPageState extends State<StatisticsPage> {
     // 切换 Tab 或重连可能发生于父级构建期间，延后到帧末再通知加载状态。
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !_canSynchronize) return;
-      final loadedAt = _rangeLoadedAt;
+      final query = _rangeQuery();
+      final loadedAt = query == null ? null : _rangeLoadedAt[query.cacheKey];
       if (loadedAt != null &&
-          _rangeQuery() != null &&
+          query != null &&
+          widget.controller.statisticsRangeFor(query) != null &&
           DateTime.now().difference(loadedAt) < const Duration(minutes: 2)) {
-        // 缓存够新：直接复用，避免切 Tab 就新建一次 WiFi 会话。
+        // 缓存够新：直接复用，避免切 Tab 就新建一次 NAS 查询会话。
         // 这里不能 setState——postFrameCallback 里再触发重建会形成循环。
         return;
       }
       unawaited(_loadStatistics());
     });
-    // 兜底刷新从 1 分钟放宽到 5 分钟：设备端每次 WiFi 请求都要新建一次 TLS 会话
+    // 兜底刷新从 1 分钟放宽到 5 分钟：NAS 查询会话需要完成 HTTPS 校验和 MQTT 查询
     // （约 18 KB 堆），而 C3 空闲堆只有 36 KB，高频刷新会把它推到断链边缘。
     // 切到统计页时会立即刷新一次，用户想手动更新可下拉或切走再切回。
     _refreshTimer = Timer.periodic(const Duration(minutes: 5), (_) {
@@ -167,9 +180,7 @@ class _StatisticsPageState extends State<StatisticsPage> {
 
   void _showRangeUnavailable() {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-      content: Text('当前固件不支持按日期查询，请先升级固件'),
-    ));
+    TopToast.show(context, '当前固件不支持按日期查询，请先升级固件');
   }
 
   /// 两步选择：先起始日，再结束日（默认等于起始日），范围限定最近 30 天。
@@ -240,79 +251,108 @@ class _StatisticsPageState extends State<StatisticsPage> {
     var value = initial;
     return showModalBottomSheet<DateTime>(
       context: context,
+      isScrollControlled: true,
       backgroundColor: const Color(0xFF12211E),
       shape: const RoundedRectangleBorder(
           borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
-      builder: (sheetContext) => SafeArea(
-        top: false,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(6, 6, 6, 14),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  SizedBox(
-                    width: 76,
-                    child: TextButton(
-                      onPressed: () => Navigator.pop(sheetContext),
-                      child: Text(leftLabel,
-                          style: const TextStyle(
-                              color: MimiVentColors.muted, fontSize: 13)),
-                    ),
-                  ),
-                  Expanded(
-                    child: Padding(
-                      padding: const EdgeInsets.only(top: 10),
-                      child: Column(
-                        children: [
-                          Text(title,
-                              style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 16,
-                                  fontWeight: FontWeight.w700)),
-                          const SizedBox(height: 3),
-                          Text(subtitle,
-                              textAlign: TextAlign.center,
-                              style: const TextStyle(
-                                  color: MimiVentColors.muted,
-                                  fontSize: 11)),
-                        ],
+      builder: (sheetContext) {
+        final screenHeight = MediaQuery.sizeOf(sheetContext).height;
+        // 横屏时屏幕高度通常不足 450 logical px；缩短滚轮，给标题和操作按钮留空间。
+        final wheelHeight = (screenHeight * .35).clamp(120.0, 200.0);
+        return SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(6, 6, 6, 14),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SizedBox(
+                      width: 76,
+                      child: TextButton(
+                        onPressed: () => Navigator.pop(sheetContext),
+                        child: Text(leftLabel,
+                            style: const TextStyle(
+                                color: MimiVentColors.muted, fontSize: 13)),
                       ),
                     ),
-                  ),
-                  SizedBox(
-                    width: 76,
-                    child: TextButton(
-                      onPressed: () => Navigator.pop(sheetContext, value),
-                      child: Text(rightLabel,
-                          style: const TextStyle(
-                              color: MimiVentColors.mint,
-                              fontSize: 13,
-                              fontWeight: FontWeight.w700)),
+                    Expanded(
+                      child: Padding(
+                        padding: const EdgeInsets.only(top: 10),
+                        child: Column(
+                          children: [
+                            Text(title,
+                                style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.w700)),
+                            const SizedBox(height: 3),
+                            Text(subtitle,
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(
+                                    color: MimiVentColors.muted, fontSize: 11)),
+                          ],
+                        ),
+                      ),
                     ),
+                    SizedBox(
+                      width: 76,
+                      child: TextButton(
+                        onPressed: () => Navigator.pop(sheetContext, value),
+                        child: Text(rightLabel,
+                            style: const TextStyle(
+                                color: MimiVentColors.mint,
+                                fontSize: 13,
+                                fontWeight: FontWeight.w700)),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                SizedBox(
+                  height: wheelHeight,
+                  child: _DateWheel(
+                    first: first,
+                    last: last,
+                    initial: initial,
+                    onChanged: (picked) => value = picked,
                   ),
-                ],
-              ),
-              const SizedBox(height: 4),
-              _DateWheel(
-                first: first,
-                last: last,
-                initial: initial,
-                onChanged: (picked) => value = picked,
-              ),
-            ],
+                ),
+              ],
+            ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 
-  Future<void> _loadStatistics() async {
+  Future<void> _loadStatistics({bool useCache = false}) async {
     if (_range == _StatisticsRange.custom && _rangeQuery() == null) return;
+    final selectedRange = _range;
+    final supplementaryGeneration = ++_supplementaryLoadGeneration;
+    _eventLoadError = null;
+    _loadingMoreEvents = false;
     final query = _rangeQuery();
     if (query != null) {
+      final loadedAt = _rangeLoadedAt[query.cacheKey];
+      if (useCache &&
+          loadedAt != null &&
+          DateTime.now().difference(loadedAt) < const Duration(minutes: 2) &&
+          widget.controller.statisticsRangeFor(query) != null) {
+        setState(() {
+          _rangeRefreshing = false;
+          _rangeError = null;
+        });
+        // 首批事件如果尚未成功，仍允许补取；已成功的缓存直接呈现。
+        if (widget.controller.statisticsRangeFor(query)?['events'] == null) {
+          unawaited(_loadSupplementaryRangeData(query,
+              selectedRange: selectedRange,
+              generation: supplementaryGeneration));
+        }
+        return;
+      }
       if (mounted) {
         setState(() {
           _rangeRefreshing = true;
@@ -320,16 +360,29 @@ class _StatisticsPageState extends State<StatisticsPage> {
         });
       }
       try {
-        await widget.controller.refreshStatisticsRange(query);
+        await widget.controller.refreshStatisticsRange(query,
+            shouldRead: () => _isCurrentSupplementaryLoad(
+                selectedRange, supplementaryGeneration));
       } catch (error) {
         // 不 rethrow：调用方全是 unawaited(_loadStatistics())，抛出去会变成
         // "Dart 未捕获异常"写满诊断日志（PlatformDispatcher.onError 会记录完整堆栈）。
         // 失败已经由 _rangeError 驱动 UI 显示"同步失败"。
-        if (mounted) setState(() => _rangeError = error);
+        if (mounted &&
+            supplementaryGeneration == _supplementaryLoadGeneration) {
+          setState(() => _rangeError = error);
+        }
+        return;
       } finally {
-        if (mounted) setState(() => _rangeRefreshing = false);
+        if (mounted &&
+            supplementaryGeneration == _supplementaryLoadGeneration) {
+          setState(() => _rangeRefreshing = false);
+        }
       }
-      _rangeLoadedAt = DateTime.now();
+      if (!_isCurrentSupplementaryLoad(
+          selectedRange, supplementaryGeneration)) {
+        return;
+      }
+      _rangeLoadedAt[query.cacheKey] = DateTime.now();
       // 协议自检放在请求结束后做一次，避免在 build 里重复构造整份预览。
       if (!_protocolWarningLogged) {
         final raw = widget.controller.statisticsRangeFor(query);
@@ -342,34 +395,28 @@ class _StatisticsPageState extends State<StatisticsPage> {
               !first.containsKey('cov') &&
               !first.containsKey('bits')) {
             _protocolWarningLogged = true;
-            widget.controller.diagnostics?.warning('统计协议',
-                '范围响应含桶但缺少已知字段，可能与固件 key 名不一致');
+            widget.controller.diagnostics
+                ?.warning('统计协议', '范围响应含桶但缺少已知字段，可能与固件 key 名不一致');
           }
         }
       }
       if (!mounted || !_canSynchronize) return;
-      // 新接口不返回事件；单日范围再单独拉一页明细。
-      if (query.singleDay) {
-        await widget.controller.refreshRangeEventPage(query);
-      }
-      // 对比日：今天→昨天、昨天→前天、前天→大前天；缓存键稳定后只拉一次。
-      final offset = switch (_range) {
-        _StatisticsRange.today => 1,
-        _StatisticsRange.yesterday => 2,
-        _StatisticsRange.dayBeforeYesterday => 3,
-        _ => 0,
-      };
-      final tzForCompare = widget.controller.deviceTimezoneOffsetSeconds;
-      if (offset > 0 && tzForCompare != null) {
-        await widget.controller.refreshStatisticsRange(StatisticsQuery.day(
-          day: _localToday(DateTime.now()).subtract(Duration(days: offset)),
-          tzOffsetSeconds: tzForCompare,
-        ));
-      }
+      // 先结束首屏加载并显示主汇总。事件明细和对比日走低优先级后台
+      // 查询，避免用户等它们全部完成才能看到今日图表，也给控制请求让路。
+      unawaited(_loadSupplementaryRangeData(
+        query,
+        selectedRange: selectedRange,
+        generation: supplementaryGeneration,
+      ));
       return;
     }
     await widget.controller.refreshStatistics(_range.wireValue);
-    if (_range == _StatisticsRange.today) await _ensureYesterdayData();
+    if (_range == _StatisticsRange.today) {
+      unawaited(_ensureYesterdayData(
+        generation: supplementaryGeneration,
+        selectedRange: selectedRange,
+      ));
+    }
     if (!mounted || !_canSynchronize || _retryTimer != null) return;
     if (widget.controller.statisticsFailedFor(_range.wireValue) &&
         !widget.controller.statisticsLoadingFor(_range.wireValue)) {
@@ -380,7 +427,59 @@ class _StatisticsPageState extends State<StatisticsPage> {
     }
   }
 
-  Future<void> _ensureYesterdayData() async {
+  bool _isCurrentSupplementaryLoad(
+          _StatisticsRange selectedRange, int generation) =>
+      mounted &&
+      _canSynchronize &&
+      _range == selectedRange &&
+      generation == _supplementaryLoadGeneration;
+
+  Future<void> _loadSupplementaryRangeData(
+    StatisticsQuery query, {
+    required _StatisticsRange selectedRange,
+    required int generation,
+  }) async {
+    if (!_isCurrentSupplementaryLoad(selectedRange, generation)) return;
+    // 一次只发一个设备查询，避免争用固件的单个 MQTT 分片响应槽。
+    if (query.singleDay) {
+      if (!_loadingMoreEvents) {
+        await _loadMoreEvents(initial: true);
+      }
+    }
+    if (!_isCurrentSupplementaryLoad(selectedRange, generation)) return;
+
+    // 对比日：今天→昨天、昨天→前天、前天→大前天。
+    // 有缓存时直接用缓存，不为辅助卡片重复查询。
+    final offset = switch (selectedRange) {
+      _StatisticsRange.today => 1,
+      _StatisticsRange.yesterday => 2,
+      _StatisticsRange.dayBeforeYesterday => 3,
+      _ => 0,
+    };
+    final tzForCompare = widget.controller.deviceTimezoneOffsetSeconds;
+    if (offset == 0 || tzForCompare == null) return;
+    final compareQuery = StatisticsQuery.day(
+      day: _localToday(DateTime.now()).subtract(Duration(days: offset)),
+      tzOffsetSeconds: tzForCompare,
+    );
+    if (widget.controller.statisticsRangeFor(compareQuery) != null) return;
+    try {
+      await widget.controller.refreshStatisticsRange(
+        compareQuery,
+        priority: false,
+        shouldRead: () =>
+            _isCurrentSupplementaryLoad(selectedRange, generation),
+      );
+    } catch (_) {
+      // 辅助对比失败已由控制器记录；保留成功加载的主范围数据。
+    }
+  }
+
+  Future<void> _ensureYesterdayData({
+    required int generation,
+    required _StatisticsRange selectedRange,
+  }) async {
+    if (!_isCurrentSupplementaryLoad(selectedRange, generation)) return;
     final now = DateTime.now();
     final dayKey = '${now.year}-${now.month}-${now.day}';
     final current = widget.controller.statisticsFor(_range.wireValue);
@@ -392,10 +491,10 @@ class _StatisticsPageState extends State<StatisticsPage> {
       _yesterdayData = null;
       _yesterdayRequested = false;
     }
-    if (_yesterdayRequested || !_canSynchronize) return;
+    if (_yesterdayRequested) return;
     _yesterdayRequested = true;
     await widget.controller.refreshStatistics('yesterday');
-    if (!mounted) return;
+    if (!_isCurrentSupplementaryLoad(selectedRange, generation)) return;
     final data = widget.controller.statisticsFor('yesterday');
     if (data != null) setState(() => _yesterdayData = data);
   }
@@ -403,27 +502,68 @@ class _StatisticsPageState extends State<StatisticsPage> {
   bool _onScrollNotification(ScrollNotification notification) {
     if (notification.metrics.axis != Axis.vertical) return false;
     final supportsEventPages = _range == _StatisticsRange.today ||
-        _range == _StatisticsRange.yesterday;
+        _range == _StatisticsRange.yesterday ||
+        _range == _StatisticsRange.dayBeforeYesterday;
     if (widget.controller.connected &&
         !widget.controller.offlineViewing &&
         supportsEventPages &&
         notification.metrics.extentAfter < 180 &&
         !_loadingSelectedIntervalEvents &&
         !_loadingMoreEvents &&
-        widget.controller.statisticsHasMoreEventsFor(_range.wireValue)) {
+        _eventLoadError == null &&
+        _eventsHaveMore) {
       _loadMoreEvents();
     }
     // 继续向外冒泡，避免影响 Dashboard 的滚动标题行为。
     return false;
   }
 
-  Future<void> _loadMoreEvents() async {
-    if (_loadingSelectedIntervalEvents) return;
-    setState(() => _loadingMoreEvents = true);
+  bool get _eventsHaveMore {
+    final query = _rangeQuery();
+    return query == null
+        ? widget.controller.statisticsHasMoreEventsFor(_range.wireValue)
+        : widget.controller.statisticsRangeFor(query)?['eventsHasMore'] == true;
+  }
+
+  Future<void> _loadMoreEvents({bool initial = false}) async {
+    if (_loadingSelectedIntervalEvents ||
+        _loadingMoreEvents ||
+        !_canSynchronize) return;
+    final selectedRange = _range;
+    final generation = _supplementaryLoadGeneration;
+    setState(() {
+      _loadingMoreEvents = true;
+      _eventLoadError = null;
+    });
     try {
-      await widget.controller.loadMoreStatisticsEvents(_range.wireValue);
+      final query = _rangeQuery();
+      if (query != null) {
+        final cached = widget.controller.statisticsRangeFor(query);
+        final firstPage = initial || cached?['events'] == null;
+        final cursor = cached?['eventsNextCursor'];
+        if (!firstPage && cached?['eventsHasMore'] != true) return;
+        if (!firstPage && cursor is! num) {
+          throw StateError('事件分页游标缺失，请刷新统计后重试');
+        }
+        await widget.controller.refreshRangeEventPage(query,
+            beforeId: firstPage ? null : (cursor as num).toInt(),
+            priority: false,
+            shouldRead: () =>
+                _isCurrentSupplementaryLoad(selectedRange, generation));
+      } else {
+        await widget.controller.loadMoreStatisticsEvents(_range.wireValue);
+        if (widget.controller.statisticsFailedFor(_range.wireValue)) {
+          throw StateError('事件加载失败，请重试');
+        }
+      }
+    } catch (error) {
+      if (_isCurrentSupplementaryLoad(selectedRange, generation)) {
+        setState(() => _eventLoadError = error);
+      }
     } finally {
-      if (mounted) setState(() => _loadingMoreEvents = false);
+      if (mounted && generation == _supplementaryLoadGeneration) {
+        setState(() => _loadingMoreEvents = false);
+      }
     }
   }
 
@@ -534,8 +674,9 @@ class _StatisticsPageState extends State<StatisticsPage> {
   @override
   Widget build(BuildContext context) {
     final rangeQuery = _rangeQuery();
-    final rangeData =
-        rangeQuery == null ? null : widget.controller.statisticsRangeFor(rangeQuery);
+    final rangeData = rangeQuery == null
+        ? null
+        : widget.controller.statisticsRangeFor(rangeQuery);
     final data = widget.controller.statisticsFor(_range.wireValue);
     // 固件支持范围查询时，未拿到数据就显示空态——绝不能回落到旧接口：
     // 旧接口没有跨度桶，回落会让黄柱在"有/无"之间闪变。
@@ -551,12 +692,13 @@ class _StatisticsPageState extends State<StatisticsPage> {
             : data == null
                 ? _StatisticsPreview.emptyForRange(_range)
                 : _StatisticsPreview.fromDevice(_range, data,
-                currentMode: widget.controller.status?.mode,
-                snapshotOnly: _readOnly,
-                activityGapSeconds:
-                    (((widget.controller.settings?.autoExhaustMs ?? 120000) ~/
-                            1000)
-                        .clamp(60, 600)));
+                    currentMode: widget.controller.status?.mode,
+                    snapshotOnly: _readOnly,
+                    activityGapSeconds:
+                        (((widget.controller.settings?.autoExhaustMs ??
+                                    120000) ~/
+                                1000)
+                            .clamp(60, 600)));
     // 对比基准：今天→昨天、昨天→前天、前天→大前天；其它范围不显示增减。
     final comparisonOffset = switch (_range) {
       _StatisticsRange.today => 1,
@@ -583,8 +725,7 @@ class _StatisticsPageState extends State<StatisticsPage> {
             _StatisticsRange.yesterday, compareRange,
             currentMode: widget.controller.status?.mode,
             snapshotOnly: _readOnly);
-      } else if (_yesterdayData != null &&
-          _range == _StatisticsRange.today) {
+      } else if (_yesterdayData != null && _range == _StatisticsRange.today) {
         // 旧固件只有 today/yesterday 两个 mode，回落到缓存快照。
         previousView = _StatisticsPreview.fromDevice(
             _StatisticsRange.yesterday, _yesterdayData!,
@@ -627,7 +768,9 @@ class _StatisticsPageState extends State<StatisticsPage> {
                         const SizedBox(height: 4),
                         _rangePicker(),
                         const SizedBox(height: 8),
-                        if (_readOnly && data == null)
+                        // MQTT 切回 BLE 时会短暂没有活动连接；范围统计缓存仍有效，
+                        // 不能只因旧版 mode 缓存为空就把页面替换成离线空态。
+                        if (_readOnly && data == null && rangeData == null)
                           _offlineEmptyState()
                         else ...[
                           _summaryCard(view, comparison),
@@ -652,6 +795,7 @@ class _StatisticsPageState extends State<StatisticsPage> {
                               totalCount: view.eventTotal,
                               hasMore: view.eventsHasMore,
                               loadingMore: _loadingMoreEvents,
+                              loadError: _eventLoadError,
                             )
                           else
                             _dailyBreakdown(view.days),
@@ -739,36 +883,40 @@ class _StatisticsPageState extends State<StatisticsPage> {
     final cached = rangeMode
         ? widget.controller.statisticsRangeFor(rangeQuery) != null
         : widget.controller.statisticsIsCachedFor(_range.wireValue);
-    final cachedAt =
-        widget.controller.statisticsCacheUpdatedAtFor(_range.wireValue);
+    final cachedAt = rangeMode
+        ? widget.controller.statisticsRangeUpdatedAtFor(rangeQuery)
+        : widget.controller.statisticsCacheUpdatedAtFor(_range.wireValue);
     final cachedAtLabel = cachedAt == null
         ? ''
         : ' · ${cachedAt.month}/${cachedAt.day} ${cachedAt.hour.toString().padLeft(2, '0')}:${cachedAt.minute.toString().padLeft(2, '0')}';
     final offline = _readOnly;
+    final hasVisibleData = rangeMode
+        ? widget.controller.statisticsRangeFor(rangeQuery) != null
+        : data != null;
     // custom 且还没选日期时既没有请求也没有缓存，显示"等待首次同步"是误导。
     final awaitingCustomRange =
         _range == _StatisticsRange.custom && _customQuery == null;
     final label = awaitingCustomRange
         ? '尚未选择时间范围 · 点击「更多时间」开始'
         : offline
-        ? data == null
-            ? '离线只读 · 此范围尚未缓存'
-            : cachedAt == null
-                ? '离线缓存 · 更新时间未知'
-                : '离线缓存$cachedAtLabel'
-        : failed
-            ? cached
-                ? '同步失败 · 显示上次数据$cachedAtLabel'
-                : '同步暂不可用 · 将自动重试'
-            : loading
+            ? !hasVisibleData
+                ? '离线只读 · 此范围尚未缓存'
+                : cachedAt == null
+                    ? '离线缓存 · 更新时间未知'
+                    : '离线缓存$cachedAtLabel'
+            : failed
                 ? cached
-                    ? '显示本地缓存 · 正在更新$cachedAtLabel'
-                    : '正在同步设备数据'
-                // 用 cached 而不是 data：range 模式下数据存在 statisticsRangeFor 里，
-                // data（旧接口快照）恒为 null，用 data 判断会永远显示"等待首次同步"。
-                : cached
-                    ? '设备数据已同步 · 每 5 分钟刷新'
-                    : '等待首次同步';
+                    ? '同步失败 · 显示上次数据$cachedAtLabel'
+                    : '同步暂不可用 · 将自动重试'
+                : loading
+                    ? cached
+                        ? '显示本地缓存 · 正在更新$cachedAtLabel'
+                        : '正在同步设备数据'
+                    // 用 cached 而不是 data：range 模式下数据存在 statisticsRangeFor 里，
+                    // data（旧接口快照）恒为 null，用 data 判断会永远显示"等待首次同步"。
+                    : cached
+                        ? '设备数据已同步 · 每 5 分钟刷新'
+                        : '等待首次同步';
     final color = failed ? MimiVentColors.amber : MimiVentColors.mint;
     return SizedBox(
       height: 24,
@@ -789,7 +937,7 @@ class _StatisticsPageState extends State<StatisticsPage> {
                             ? Icons.sync_problem_rounded
                             : Icons.cloud_done_rounded,
                     size: 14,
-                    color: color.withOpacity(data == null ? .45 : .8),
+                    color: color.withOpacity(hasVisibleData ? .8 : .45),
                   ),
           ),
           const SizedBox(width: 7),
@@ -845,7 +993,7 @@ class _StatisticsPageState extends State<StatisticsPage> {
                       _selectedIntervalEventsIncomplete = false;
                       _loadingMoreEvents = false;
                     });
-                    unawaited(_loadStatistics());
+                    unawaited(_loadStatistics(useCache: true));
                   },
                   child: AnimatedContainer(
                     duration: const Duration(milliseconds: 180),
@@ -998,7 +1146,8 @@ class _StatisticsPageState extends State<StatisticsPage> {
             comparisonText: comparison == null
                 ? null
                 : (comparison.toiletAverageText ?? _kComparisonPlaceholder),
-            comparisonColor: comparison?.toiletAverageColor ?? MimiVentColors.muted,
+            comparisonColor:
+                comparison?.toiletAverageColor ?? MimiVentColors.muted,
           )),
           const SizedBox(width: 10),
           _metricSlot(_metricCard(
@@ -1140,7 +1289,8 @@ class _StatisticsPageState extends State<StatisticsPage> {
                               fontSize: 10,
                               height: 1.4),
                         )
-                      : Row(                          children: [
+                      : Row(
+                          children: [
                             Text(
                               selectedPoint.intervalLabel,
                               style: const TextStyle(
@@ -1152,28 +1302,28 @@ class _StatisticsPageState extends State<StatisticsPage> {
                             Expanded(
                               child: Text.rich(
                                 TextSpan(children: [
-                              TextSpan(
-                                text:
-                                    "排风 ${selectedPoint.runtimeAvailable ? _formatStatisticMinutes(selectedPoint.minutes) : '不可用'}",
-                                style:
-                                    const TextStyle(color: MimiVentColors.mint),
-                              ),
-                              const TextSpan(
-                                  text: " · ",
-                                  style:
-                                      TextStyle(color: MimiVentColors.muted)),
-                              TextSpan(
-                                text:
-                                    "感应 ${selectedPoint.activityAvailable ? _formatStatisticMinutes(selectedPoint.activityMinutes) : '不可用'}",
+                                  TextSpan(
+                                    text:
+                                        "排风 ${selectedPoint.runtimeAvailable ? _formatStatisticMinutes(selectedPoint.minutes) : '不可用'}",
+                                    style: const TextStyle(
+                                        color: MimiVentColors.mint),
+                                  ),
+                                  const TextSpan(
+                                      text: " · ",
+                                      style: TextStyle(
+                                          color: MimiVentColors.muted)),
+                                  TextSpan(
+                                    text:
+                                        "感应 ${selectedPoint.activityAvailable ? _formatStatisticMinutes(selectedPoint.activityMinutes) : '不可用'}",
+                                    style: const TextStyle(
+                                        color: MimiVentColors.amber),
+                                  ),
+                                ]),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                textAlign: TextAlign.end,
                                 style: const TextStyle(
-                                    color: MimiVentColors.amber),
-                              ),
-                            ]),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            textAlign: TextAlign.end,
-                            style: const TextStyle(
-                                fontSize: 10, fontWeight: FontWeight.w700),
+                                    fontSize: 10, fontWeight: FontWeight.w700),
                               ),
                             ),
                           ],
@@ -1544,8 +1694,7 @@ class _StatisticsPageState extends State<StatisticsPage> {
                           fontSize: 11,
                           fontWeight: FontWeight.w600)),
                   const SizedBox(height: 3),
-                  Text(
-                      _dailyDetailLine(day),
+                  Text(_dailyDetailLine(day),
                       style: const TextStyle(
                           color: MimiVentColors.muted, fontSize: 9)),
                 ],
@@ -1583,6 +1732,7 @@ class _StatisticsPageState extends State<StatisticsPage> {
     required int totalCount,
     required bool hasMore,
     required bool loadingMore,
+    Object? loadError,
   }) =>
       Container(
         padding: const EdgeInsets.fromLTRB(15, 14, 15, 5),
@@ -1611,11 +1761,18 @@ class _StatisticsPageState extends State<StatisticsPage> {
                 Divider(height: 1, color: Colors.white.withOpacity(.055)),
             ],
             if (loadingMore)
-              const _EventPaginationHint(label: '正在加载更多原始事件…', loading: true)
+              const _EventPaginationHint(label: '正在加载事件，请稍候…', loading: true)
+            else if (loadError != null)
+              TextButton.icon(
+                  onPressed: () => _loadMoreEvents(),
+                  icon: const Icon(Icons.refresh_rounded, size: 16),
+                  label: const Text('事件加载失败，点击重试'))
             else if (_readOnly && hasMore)
               const _EventPaginationHint(label: '仅显示已缓存事件，连接设备可加载其余记录')
             else if (hasMore)
-              const _EventPaginationHint(label: '继续上滑加载更早事件')
+              TextButton(
+                  onPressed: () => _loadMoreEvents(),
+                  child: const Text('加载更早事件'))
             else if (rawCount > 0)
               const _EventPaginationHint(label: '已显示全部可用事件'),
           ],
@@ -1788,18 +1945,19 @@ class _YesterdayComparison {
 /// 事件图标：新接口（fromRange）与旧接口（fromDevice）共用同一套。
 /// 两处各写一份会导致同一份数据在不同手机上显示不同图标。
 Widget _eventIconFor(String kind) => switch (kind) {
-      'activity' =>
-        const Icon(Icons.sensors_rounded, size: 16, color: MimiVentColors.amber),
+      'activity' => const Icon(Icons.sensors_rounded,
+          size: 16, color: MimiVentColors.amber),
       'resume' =>
         const Icon(Icons.sensors_rounded, size: 16, color: MimiVentColors.mint),
-      'manual' || 'automatic' || 'force' =>
+      'manual' ||
+      'automatic' ||
+      'force' =>
         const FanRotorGlyph(color: MimiVentColors.mint, size: 6),
       'pause' => const Icon(Icons.pause_circle_outline_rounded,
           size: 16, color: Color(0xFF9AC8FF)),
       'locked_off' => const Icon(Icons.power_settings_new_rounded,
           size: 16, color: MimiVentColors.red),
-      _ => const Icon(Icons.air_rounded,
-          size: 16, color: MimiVentColors.mint),
+      _ => const Icon(Icons.air_rounded, size: 16, color: MimiVentColors.mint),
     };
 
 class _StatisticsPreview {
@@ -1886,8 +2044,10 @@ class _StatisticsPreview {
     required String? currentMode,
     required bool snapshotOnly,
   }) {
-    final summary = (json['summary'] as Map?)?.cast<String, dynamic>() ?? const {};
-    final coverage = (json['coverage'] as Map?)?.cast<String, dynamic>() ?? const {};
+    final summary =
+        (json['summary'] as Map?)?.cast<String, dynamic>() ?? const {};
+    final coverage =
+        (json['coverage'] as Map?)?.cast<String, dynamic>() ?? const {};
     int? summaryInt(String key) {
       final value = summary[key];
       return value is num ? value.toInt() : null;
@@ -1970,8 +2130,27 @@ class _StatisticsPreview {
     }
 
     final dayCount = _intValue(json['dayCount']);
-    final from = DateTime.fromMillisecondsSinceEpoch(_intValue(json['from']) * 1000);
-    final to = DateTime.fromMillisecondsSinceEpoch(_intValue(json['to']) * 1000);
+    final from =
+        DateTime.fromMillisecondsSinceEpoch(_intValue(json['from']) * 1000);
+    final to =
+        DateTime.fromMillisecondsSinceEpoch(_intValue(json['to']) * 1000);
+    // 固件单日范围响应使用 summary，不附带多日专用的 days 数组。
+    // “更多时间”选择单日仍需展示与多日相同的按日概览，因此从同一份汇总
+    // 生成一行；缺失指标保持“—”，不把不可用误显示成真实的 0。
+    if (dayCount == 1 && days.isEmpty) {
+      final activityCount = summaryInt('activityCount');
+      final activitySpan = summaryInt('activitySpanSeconds');
+      final automaticCount = summaryInt('automaticCount');
+      final today = DateTime.now();
+      days.add(_DailySummary(
+        label: _dayLabel(from, DateTime(today.year, today.month, today.day)),
+        activityCount: activityCount ?? 0,
+        exhaustCount: automaticCount ?? 0,
+        runtimeMinutes: (runtimeSeconds / 60).round(),
+        activitySeconds: activitySpan,
+        activityAvailable: activitySpan != null,
+      ));
+    }
     // 详情降级文案：优先级 OUT_OF_RETENTION > timeUntrusted > CAPACITY_LIMITED（§13.5）。
     String? detailNotice;
     final detail = (json['detail'] as Map?)?.cast<String, dynamic>();
@@ -2021,7 +2200,8 @@ class _StatisticsPreview {
         final at = _eventTimestamp(event);
         final duration = _intValue(event['durationSeconds']);
         final isActivity = kind == 'activity';
-        final isFan = kind == 'automatic' || kind == 'manual' || kind == 'force';
+        final isFan =
+            kind == 'automatic' || kind == 'manual' || kind == 'force';
         final title = switch (kind) {
           'activity' => '检测到活动',
           'automatic' => '自动排风',
@@ -2252,8 +2432,7 @@ class _StatisticsPreview {
                 activityEventCount: index < activityBucketCount.length
                     ? activityBucketCount[index]
                     : 0,
-                intervalLabel:
-                    '${_date(today)} ${_hourInterval(index, 1)}',
+                intervalLabel: '${_date(today)} ${_hourInterval(index, 1)}',
                 startAt: today.add(Duration(hours: index)),
                 endAt: today.add(Duration(hours: index + 1)),
               ));
@@ -2270,7 +2449,8 @@ class _StatisticsPreview {
                 activityEventCount: index < activityBucketCount.length
                     ? activityBucketCount[index]
                     : 0,
-                intervalLabel: '${_date(today.subtract(const Duration(days: 1)))} '
+                intervalLabel:
+                    '${_date(today.subtract(const Duration(days: 1)))} '
                     '${_hourInterval(index * 2, 2)}',
                 startAt: today
                     .subtract(const Duration(days: 1))
@@ -2599,8 +2779,8 @@ class _StatisticsPreview {
               : 0,
       eventsHasMore: json['eventsHasMore'] == true,
       days: days,
-      detailNotice: json['eventsTruncated'] == true
-          ? '部分历史明细已淘汰，仅显示现有记录' : null,
+      detailNotice:
+          json['eventsTruncated'] == true ? '部分历史明细已淘汰，仅显示现有记录' : null,
     );
   }
 
@@ -3034,6 +3214,7 @@ class _DailySummary {
   final int activityCount;
   final int exhaustCount;
   final int runtimeMinutes;
+
   /// 当日感应跨度合计；不可用时为 null（activityAvailable 为 false）。
   final int? activitySeconds;
   final bool activityAvailable;
@@ -3092,8 +3273,7 @@ class _DateWheelState extends State<_DateWheel> {
     super.dispose();
   }
 
-  int _daysInMonth(int year, int month) =>
-      DateTime(year, month + 1, 0).day;
+  int _daysInMonth(int year, int month) => DateTime(year, month + 1, 0).day;
 
   bool _daySelectable(int day) {
     final candidate = DateTime(_year, _month, day);
@@ -3103,7 +3283,8 @@ class _DateWheelState extends State<_DateWheel> {
   bool _monthSelectable(int month) {
     for (var d = 1; d <= _daysInMonth(_year, month); d++) {
       final candidate = DateTime(_year, month, d);
-      if (!candidate.isBefore(widget.first) && !candidate.isAfter(widget.last)) {
+      if (!candidate.isBefore(widget.first) &&
+          !candidate.isAfter(widget.last)) {
         return true;
       }
     }

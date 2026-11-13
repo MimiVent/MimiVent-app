@@ -73,7 +73,11 @@ void main() {
     await tester.tap(find.text('统计'));
     await tester.pump();
     await tester.scrollUntilVisible(find.textContaining('部分历史明细已淘汰'), 180,
-        scrollable: find.byType(Scrollable).first);
+        scrollable: find
+            .descendant(
+                of: find.byKey(const PageStorageKey('statistics-page')),
+                matching: find.byType(Scrollable))
+            .first);
     expect(find.textContaining('部分历史明细已淘汰'), findsOneWidget);
     await tester.pumpWidget(const SizedBox.shrink());
     controller.dispose();
@@ -433,11 +437,19 @@ void main() {
     expect(find.textContaining('离线缓存'), findsOneWidget);
     expect(find.textContaining('10/28'), findsWidgets);
     await tester.scrollUntilVisible(find.textContaining('同步时运行中'), 180,
-        scrollable: find.byType(Scrollable).first);
+        scrollable: find
+            .descendant(
+                of: find.byKey(const PageStorageKey('statistics-page')),
+                matching: find.byType(Scrollable))
+            .first);
     expect(find.textContaining('同步时运行中'), findsOneWidget);
     expect(find.text('仅显示已缓存事件，连接设备可加载其余记录'), findsOneWidget);
     await tester.scrollUntilVisible(find.text('昨天'), -180,
-        scrollable: find.byType(Scrollable).first);
+        scrollable: find
+            .descendant(
+                of: find.byKey(const PageStorageKey('statistics-page')),
+                matching: find.byType(Scrollable))
+            .first);
     await tester.tap(find.text('昨天'));
     await tester.pump();
     expect(

@@ -29,6 +29,7 @@ class MimiVentBleManager extends ChangeNotifier
 
   final AppDiagnosticsLog? diagnostics;
   final List<ScanResult> _scanResults = [];
+  final Map<String, DateTime> _scanResultSeenAt = {};
   StreamSubscription<List<ScanResult>>? _scanSubscription;
   StreamSubscription<List<int>>? _notificationSubscription;
   StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
@@ -53,6 +54,9 @@ class MimiVentBleManager extends ChangeNotifier
   final BleGattScheduler _gattScheduler = BleGattScheduler();
   int _connectionAttempt = 0;
   int _scanAttempt = 0;
+  bool _scanInProgress = false;
+  bool _preScanInProgress = false;
+  int _preScanEpoch = 0;
   int _nextRequestId = 1;
   int _nextOtaRequestId = 1;
   int _lastLoggedOtaProgress = 0;
@@ -105,6 +109,16 @@ class MimiVentBleManager extends ChangeNotifier
   }
 
   List<ScanResult> get scanResults => List.unmodifiable(_scanResults);
+  List<ScanResult> freshScanResults({
+    Duration maxAge = const Duration(seconds: 35),
+  }) {
+    final now = DateTime.now();
+    return List.unmodifiable(_scanResults.where((result) {
+      final seenAt = _scanResultSeenAt[result.device.remoteId.str];
+      return seenAt != null && now.difference(seenAt) <= maxAge;
+    }));
+  }
+
   String get connectedName => _device?.platformName.isNotEmpty == true
       ? _device!.platformName
       : BleProtocol.deviceName;
@@ -165,52 +179,113 @@ class MimiVentBleManager extends ChangeNotifier
         body: request.body,
       );
 
-  Future<void> scan({Duration timeout = const Duration(seconds: 12)}) async {
+  Future<void> scan({Duration timeout = const Duration(seconds: 12)}) =>
+      _runScan(timeout: timeout, visible: true);
+
+  /// 前台低频预扫描：缓存设备但不改变连接状态，也不触发扫描选择面板。
+  /// 只在权限已授予且蓝牙已开启时运行，避免后台模式意外弹系统授权框。
+  Future<void> preScan({Duration timeout = const Duration(seconds: 3)}) async {
+    final epoch = ++_preScanEpoch;
+    if (isConnected || connectionStatus == BleConnectionStatus.connecting) {
+      return;
+    }
+    if (Platform.isAndroid && !await _hasAndroidScanPermissions()) {
+      if (epoch != _preScanEpoch) return;
+      diagnostics?.info('蓝牙预扫描', '尚未授予蓝牙扫描权限，跳过预扫描');
+      return;
+    }
+    if (epoch != _preScanEpoch) return;
+    if (FlutterBluePlus.adapterStateNow != BluetoothAdapterState.on) {
+      diagnostics?.info('蓝牙预扫描', '蓝牙未开启或尚不可用，跳过预扫描');
+      return;
+    }
+    await _runScan(timeout: timeout, visible: false, preScanEpoch: epoch);
+  }
+
+  Future<void> stopPreScan() async {
+    ++_preScanEpoch;
+    if (!_preScanInProgress) return;
+    ++_scanAttempt;
+    _preScanInProgress = false;
+    _scanInProgress = false;
+    try {
+      await FlutterBluePlus.stopScan();
+    } catch (_) {}
+    await _scanSubscription?.cancel();
+    _scanSubscription = null;
+  }
+
+  Future<void> _runScan({
+    required Duration timeout,
+    required bool visible,
+    int? preScanEpoch,
+  }) async {
+    if (visible && _preScanInProgress) await stopPreScan();
     // 防止页面自动扫描、手动刷新和断开后的扫描同时启动，导致旧任务覆盖新状态。
     if (isConnected ||
-        isScanning ||
-        connectionStatus == BleConnectionStatus.connecting) return;
+        _scanInProgress ||
+        (visible && isScanning) ||
+        connectionStatus == BleConnectionStatus.connecting ||
+        (!visible && preScanEpoch != _preScanEpoch)) return;
     final attempt = ++_scanAttempt;
-    lastError = null;
+    _scanInProgress = true;
+    _preScanInProgress = !visible;
+    if (visible) lastError = null;
     _scanResults.clear();
-    connectionStatus = BleConnectionStatus.scanning;
-    diagnostics?.info('蓝牙扫描', '开始扫描 MimiVent');
-    _notifyIfAlive();
+    _scanResultSeenAt.clear();
+    if (visible) {
+      connectionStatus = BleConnectionStatus.scanning;
+      diagnostics?.info('蓝牙扫描', '开始扫描 MimiVent');
+      _notifyIfAlive();
+    } else {
+      diagnostics?.info('蓝牙预扫描', '开始短时扫描 MimiVent');
+    }
     await _scanSubscription?.cancel();
-    if (attempt != _scanAttempt || !isScanning) return;
+    if (attempt != _scanAttempt || (visible && !isScanning)) return;
     _scanSubscription = FlutterBluePlus.onScanResults.listen(
       (results) {
-        if (attempt != _scanAttempt || !isScanning) return;
+        if (attempt != _scanAttempt || (visible && !isScanning)) return;
         for (final result in results) {
           if (!_isMimiVent(result)) continue;
-          if (!_scanResults
-              .any((item) => item.device.remoteId == result.device.remoteId)) {
+          final id = result.device.remoteId.str;
+          final existingIndex = _scanResults.indexWhere(
+            (item) => item.device.remoteId == result.device.remoteId,
+          );
+          if (existingIndex < 0) {
             _scanResults.add(result);
             diagnostics?.info(
-              'BLE 扫描结果',
+              visible ? 'BLE 扫描结果' : 'BLE 预扫描结果',
               'name=${_deviceName(result)}, rssi=${result.rssi} dBm, '
-                  'services=${result.advertisementData.serviceUuids.map((uuid) => uuid.str).join(',')}',
+              'services=${result.advertisementData.serviceUuids.map((uuid) => uuid.str).join(',')}',
             );
+          } else {
+            _scanResults[existingIndex] = result;
           }
+          _scanResultSeenAt[id] = DateTime.now();
         }
         _scanResults.sort((a, b) => _deviceName(a).compareTo(_deviceName(b)));
-        _notifyIfAlive();
+        if (visible) _notifyIfAlive();
       },
       onError: (Object error) {
-        if (attempt != _scanAttempt || !isScanning) return;
-        lastError = '扫描失败：$error';
-        diagnostics?.error('蓝牙扫描', lastError!);
-        connectionStatus = BleConnectionStatus.disconnected;
-        _notifyIfAlive();
+        if (attempt != _scanAttempt || (visible && !isScanning)) return;
+        if (visible) {
+          lastError = '扫描失败：$error';
+          diagnostics?.error('蓝牙扫描', lastError!);
+          connectionStatus = BleConnectionStatus.disconnected;
+          _notifyIfAlive();
+        } else {
+          diagnostics?.warning('蓝牙预扫描', '扫描失败：$error');
+        }
       },
     );
     try {
       if (!await FlutterBluePlus.isSupported) {
         throw Exception('此设备不支持蓝牙 LE');
       }
-      await _requestAndroidPermissions();
-      if (attempt != _scanAttempt || !isScanning) return;
-      if (Platform.isAndroid &&
+      if (visible) await _requestAndroidPermissions();
+      if (attempt != _scanAttempt || (visible && !isScanning)) return;
+      if (visible &&
+          Platform.isAndroid &&
           FlutterBluePlus.adapterStateNow != BluetoothAdapterState.on) {
         await FlutterBluePlus.turnOn();
       }
@@ -219,20 +294,42 @@ class MimiVentBleManager extends ChangeNotifier
       await FlutterBluePlus.startScan(timeout: timeout);
       await FlutterBluePlus.isScanning.where((scanning) => !scanning).first;
       if (attempt == _scanAttempt) {
-        diagnostics?.info('蓝牙扫描', '扫描结束，发现 ${_scanResults.length} 台设备');
+        diagnostics?.info(
+          visible ? '蓝牙扫描' : '蓝牙预扫描',
+          '扫描结束，发现 ${freshScanResults().length} 台设备',
+        );
       }
     } catch (error) {
       if (attempt == _scanAttempt) {
-        lastError = '无法扫描设备：$error';
-        diagnostics?.error('蓝牙扫描', lastError!);
+        if (visible) {
+          lastError = '无法扫描设备：$error';
+          diagnostics?.error('蓝牙扫描', lastError!);
+        } else {
+          diagnostics?.warning('蓝牙预扫描', '预扫描失败：$error');
+        }
       }
     } finally {
+      if (attempt == _scanAttempt) {
+        _scanInProgress = false;
+        _preScanInProgress = false;
+      }
       // 过期扫描的 finally 不能覆盖随后开始的连接或新一轮扫描状态。
-      if (attempt == _scanAttempt && isScanning) {
+      if (visible && attempt == _scanAttempt && isScanning) {
         connectionStatus = BleConnectionStatus.disconnected;
         _notifyIfAlive();
       }
     }
+  }
+
+  Future<bool> _hasAndroidScanPermissions() async {
+    final android = await DeviceInfoPlugin().androidInfo;
+    final requiredPermissions = android.version.sdkInt >= 31
+        ? [Permission.bluetoothScan, Permission.bluetoothConnect]
+        : [Permission.locationWhenInUse];
+    for (final permission in requiredPermissions) {
+      if (!(await permission.status).isGranted) return false;
+    }
+    return true;
   }
 
   Future<void> _requestAndroidPermissions() async {
@@ -300,6 +397,8 @@ class MimiVentBleManager extends ChangeNotifier
     }
     // 使当前扫描回调和 finally 失效，避免扫描结束把 connecting 改回 disconnected。
     ++_scanAttempt;
+    _scanInProgress = false;
+    _preScanInProgress = false;
     final attempt = ++_connectionAttempt;
     final connectStopwatch = Stopwatch()..start();
     _device = device;
@@ -1464,6 +1563,8 @@ class MimiVentBleManager extends ChangeNotifier
 
   Future<void> stopScan() async {
     ++_scanAttempt;
+    _scanInProgress = false;
+    _preScanInProgress = false;
     await FlutterBluePlus.stopScan();
     if (connectionStatus == BleConnectionStatus.scanning) {
       connectionStatus = BleConnectionStatus.disconnected;

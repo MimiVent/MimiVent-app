@@ -9,9 +9,12 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../ble/mimivent_ble_manager.dart';
-import '../wifi_control/wifi_binding_controller.dart';
-import '../wifi_control/wifi_binding_store.dart';
-import '../wifi_control/wifi_control_page.dart';
+import '../../shared/widgets/top_toast.dart';
+import '../local_network/nas_gateway_transport.dart';
+import '../local_network/wifi_binding.dart';
+import '../local_network/wifi_binding_controller.dart';
+import '../local_network/wifi_binding_store.dart';
+import '../local_network/wifi_binding_and_nas_page.dart';
 import 'wifi_credentials.dart';
 import 'wifi_network_picker.dart';
 
@@ -51,6 +54,7 @@ class _WifiProvisioningPageState extends State<WifiProvisioningPage> {
   String? _bindingNotice;
   bool _bindingFailed = false;
   bool _bindingActive = false;
+  bool _nasMqttReady = false;
 
   Future<String> _clientId() async {
     final prefs = await SharedPreferences.getInstance();
@@ -191,6 +195,7 @@ class _WifiProvisioningPageState extends State<WifiProvisioningPage> {
           _bindingNotice = null;
           _bindingFailed = false;
           _bindingActive = false;
+          _nasMqttReady = false;
         });
         final ssid = _ssid.text;
         final password = _password.text;
@@ -226,29 +231,78 @@ class _WifiProvisioningPageState extends State<WifiProvisioningPage> {
         throw StateError('连接结果待确认，请刷新设备状态');
       });
 
-  Future<bool> _hasActiveBinding(String? deviceId) async {
-    if (deviceId == null || deviceId.isEmpty) return false;
+  Future<WifiBinding?> _activeBinding(String? deviceId) async {
+    if (deviceId == null || deviceId.isEmpty) return null;
     try {
       final records = await WifiBindingStore().load();
-      return records.any((binding) =>
-          binding.deviceId == deviceId && binding.state == 'active');
+      for (final binding in records) {
+        if (binding.deviceId == deviceId && binding.state == 'active') {
+          return binding;
+        }
+      }
     } catch (_) {
+      return null;
+    }
+    return null;
+  }
+
+  Future<bool> _checkNasMqttState(WifiBinding binding) async {
+    final gateway = NasGatewayTransport();
+    final deadline = DateTime.now().add(const Duration(seconds: 15));
+    try {
+      while (mounted && DateTime.now().isBefore(deadline)) {
+        if (!mounted) return false;
+        final result = await gateway.tryReadState(binding);
+        final body = result?.body;
+        if (result?.statusCode == 200 &&
+            body?['deviceId'] == binding.deviceId &&
+            body?['tokenId'] == binding.tokenId &&
+            body?['bindingState'] == 'active' &&
+            body?['stale'] == false &&
+            body?['stateFreshness'] == 'fresh') {
+          final fanRunning = body?['fan'] == true;
+          if (mounted) {
+            setState(() {
+              _nasMqttReady = true;
+              _bindingNotice =
+                  '配网成功，NAS MQTT 已连接；已自动读取设备状态：风机${fanRunning ? '运行中' : '已停止'}。';
+            });
+            TopToast.show(context, 'NAS MQTT 配网成功，设备状态已自动更新');
+          }
+          return true;
+        }
+        if (DateTime.now().isBefore(deadline)) {
+          await Future<void>.delayed(const Duration(milliseconds: 1500));
+        }
+      }
+      if (mounted) {
+        setState(() {
+          _nasMqttReady = false;
+          _bindingNotice =
+              'WiFi 配网和手机绑定已成功，但 NAS 尚未收到设备实时 MQTT 状态。请确认设备已连接 Broker，再点“检查 NAS MQTT 状态”。';
+        });
+      }
       return false;
+    } finally {
+      gateway.dispose();
     }
   }
 
-  /// 配网只负责让设备联网；HTTPS 控制还需要本机 token/证书绑定。
+  /// 配网只负责让设备联网；NAS MQTT 控制还需要本机授权绑定。
   /// 配网成功后自动完成一次绑定，避免出现“WiFi 已连接但 App 没有绑定”。
   Future<bool> _bindAfterProvisioning(Map<String, dynamic> status) async {
     final deviceId = status['deviceId']?.toString();
-    if (await _hasActiveBinding(deviceId)) {
+    final existingBinding = await _activeBinding(deviceId);
+    if (existingBinding != null) {
       if (mounted) {
         setState(() {
-          _bindingNotice = 'WiFi 已连接，本机已有有效绑定';
+          _bindingNotice = 'WiFi 已连接，本机绑定有效，正在检查 NAS MQTT 状态…';
           _bindingFailed = false;
           _bindingActive = true;
+          _nasMqttReady = false;
         });
       }
+      await _checkNasMqttState(existingBinding);
       return true;
     }
     String? lastError;
@@ -258,13 +312,16 @@ class _WifiProvisioningPageState extends State<WifiProvisioningPage> {
         await controller.bind();
         if (controller.error == null &&
             controller.selected?.state == 'active') {
+          final binding = controller.selected!;
           if (mounted) {
             setState(() {
-              _bindingNotice = 'WiFi 已连接并完成本机绑定，返回主页即可切换 WiFi 控制';
+              _bindingNotice = 'WiFi 配网和本机绑定成功，正在检查 NAS MQTT 状态…';
               _bindingFailed = false;
               _bindingActive = true;
+              _nasMqttReady = false;
             });
           }
+          await _checkNasMqttState(binding);
           return true;
         }
         lastError = controller.error;
@@ -282,20 +339,26 @@ class _WifiProvisioningPageState extends State<WifiProvisioningPage> {
         _bindingNotice = 'WiFi 已连接，但本机绑定失败：${lastError ?? '未知错误'}';
         _bindingFailed = true;
         _bindingActive = false;
+        _nasMqttReady = false;
       });
     }
     return false;
   }
 
   Future<void> _openBindingManager() async {
-    await Navigator.of(context).push<void>(
-      MaterialPageRoute(builder: (_) => WifiControlPage(ble: widget.ble)),
+    final switchToMqtt = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(builder: (_) => WifiBindingAndNasPage(ble: widget.ble)),
     );
     if (!mounted) return;
+    if (switchToMqtt == true) {
+      Navigator.of(context).pop(true);
+      return;
+    }
     setState(() {
       _bindingNotice = null;
       _bindingFailed = false;
       _bindingActive = false;
+      _nasMqttReady = false;
     });
     await _refresh();
   }
@@ -397,9 +460,25 @@ class _WifiProvisioningPageState extends State<WifiProvisioningPage> {
                         final status = await _request('wifi.status');
                         await _bindAfterProvisioning(status);
                       }),
-              child: const Text('绑定此手机以启用 WiFi 控制'),
+              child: const Text('绑定此手机以启用 NAS MQTT 控制'),
             ),
           ],
+          if (_state == 'connected' && _bindingActive && !_nasMqttReady)
+            TextButton.icon(
+              onPressed: _busy
+                  ? null
+                  : () => _run(() async {
+                        final binding =
+                            await _activeBinding(widget.ble.connectedDeviceId);
+                        if (binding == null) {
+                          throw StateError('未找到本机有效绑定，请重新绑定此手机');
+                        }
+                        setState(() => _bindingNotice = '正在检查 NAS MQTT 状态…');
+                        await _checkNasMqttState(binding);
+                      }),
+              icon: const Icon(Icons.sync),
+              label: const Text('检查 NAS MQTT 状态'),
+            ),
           if (_bindingNotice != null) ...[
             const SizedBox(height: 12),
             Text(
@@ -421,10 +500,10 @@ class _WifiProvisioningPageState extends State<WifiProvisioningPage> {
                       }),
               child: const Text('重试本机绑定'),
             ),
-          if (_state == 'connected' && _bindingFailed)
+          if (_state == 'connected')
             TextButton(
               onPressed: _busy ? null : _openBindingManager,
-              child: const Text('管理设备绑定 / 清除全部绑定'),
+              child: const Text('WiFi 配网与 NAS MQTT 设置'),
             ),
           if (_error != null) ...[
             const SizedBox(height: 12),

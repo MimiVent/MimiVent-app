@@ -26,15 +26,23 @@ class WifiBinding {
       return value;
     }
 
-    if (j['version'] != 1 || j['port'] != 8443 || j['scheme'] != 'https') {
-      throw const FormatException('绑定版本或地址无效');
+    // 设备 HTTPS 已下线，控制改走 NAS MQTT。旧记录里的 port/scheme/host/pin
+    // 只用于兼容读取与展示，不再作为连接前提，也不应阻挡新格式记录。
+    if (j['version'] != 1) {
+      throw const FormatException('绑定版本无效');
     }
+    String optional(String key, String pattern) {
+      final value = j[key];
+      if (value is! String) return '';
+      return RegExp(pattern).hasMatch(value) ? value : '';
+    }
+
     return WifiBinding(
         deviceId: read('deviceId', r'^[0-9a-f]{32}$'),
         tokenId: read('tokenId', r'^[0-9a-f]{32}$'),
         token: read('token', r'^[A-Za-z0-9_-]{43}$'),
-        pin: read('certPinSha256', r'^[0-9a-f]{64}$'),
-        host: read('host', r'^[a-zA-Z0-9][a-zA-Z0-9.\-]{0,252}$'),
+        pin: optional('certPinSha256', r'^[0-9a-f]{64}$'),
+        host: optional('host', r'^[a-zA-Z0-9][a-zA-Z0-9.\-]{0,252}$'),
         clientId: read('clientId', r'^[A-Za-z0-9_-]{1,36}$'),
         state: read('bindingState', r'^(pending|active|invalid|blocked)$'));
   }

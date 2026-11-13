@@ -7,7 +7,7 @@ import 'package:crypto/crypto.dart';
 import 'ota_deflate.dart';
 
 /// `.mvota` v2：签名固定头、顺序分块记录、独立 raw-deflate 数据块。
-/// 每块最大 16 KiB；不可压缩时存原始块，保证包不会因压缩膨胀。
+/// 每块最大 4 KiB，与设备低内存 OTA 接收端一致；不可压缩时存原始块。
 class OtaPackage {
   const OtaPackage({
     required this.bytes,
@@ -19,7 +19,7 @@ class OtaPackage {
     required this.decodedImage,
   });
 
-  static const int blockSize = 16 * 1024;
+  static const int blockSize = 4 * 1024;
   static const int minimumImageSize = 1024;
   static const int maximumImageSize = 1769472;
   static const int fixedHeaderSize = 512;

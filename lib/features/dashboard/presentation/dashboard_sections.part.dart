@@ -15,21 +15,16 @@ extension _DashboardMainSections on _DashboardPageState {
           child: Row(
             children: [
               _navItem(
-                0,
-                (color) => FanRotorGlyph(color: color, size: 11),
-                '控制',
-              ),
+                  0, (color) => FanRotorGlyph(color: color, size: 11), '控制'),
               _navItem(
-                1,
-                (color) => Icon(Icons.tune_rounded, size: 14, color: color),
-                '时间设置',
-              ),
+                  1,
+                  (color) => Icon(Icons.tune_rounded, size: 14, color: color),
+                  '时间设置'),
               _navItem(
-                2,
-                (color) =>
-                    Icon(Icons.bar_chart_rounded, size: 15, color: color),
-                '统计',
-              ),
+                  2,
+                  (color) =>
+                      Icon(Icons.bar_chart_rounded, size: 15, color: color),
+                  '统计'),
             ],
           ),
         ),
@@ -116,32 +111,48 @@ extension _DashboardMainSections on _DashboardPageState {
         c.ble.connectionStatus == BleConnectionStatus.connecting;
     final scanning = c.ble.isScanning;
     final bleLinked = c.ble.isConnected;
+    final nasMqttActive = c.nasMqttActive;
+    final hasSynchronizedData = c.status != null && c.settings != null;
     final color = offline
         ? MimiVentColors.muted
-        : connecting || scanning || bleLinked
-            ? MimiVentColors.amber
-            : MimiVentColors.red;
+        : nasMqttActive && !connecting && !scanning
+            ? MimiVentColors.mint
+            : connecting || scanning || (bleLinked && !hasSynchronizedData)
+                ? MimiVentColors.amber
+                : MimiVentColors.red;
     final text = offline
         ? '离线模式 · 仅查看缓存数据'
+        : nasMqttActive
+            ? connecting || scanning
+                ? 'NAS MQTT 控制正常 · 正在准备蓝牙切换'
+                : 'NAS MQTT 控制 · 已连接'
+            : connecting
+                ? '正在连接蓝牙 · 请稍候…'
+                : scanning
+                    ? '正在搜索附近设备 · 请稍候…'
+                    : bleLinked
+                        ? hasSynchronizedData
+                            ? '蓝牙控制 · 已连接'
+                            : '蓝牙已连接 · 正在同步设备状态'
+                        : '设备未连接 · 可查看缓存数据';
+    final action = nasMqttActive
+        ? connecting || scanning
+            ? '蓝牙准备中…'
+            : '切换蓝牙'
         : connecting
-            ? '正在连接蓝牙 · 请稍候…'
+            ? '连接中…'
             : scanning
-                ? '正在搜索附近设备 · 请稍候…'
-                : bleLinked
-                    ? '蓝牙已连接 · 正在同步设备状态'
-                    : '设备未连接 · 可查看缓存数据';
-    final action = connecting
-        ? '连接中…'
-        : scanning
-            ? '搜索中…'
-            : '连接设备';
+                ? '搜索中…'
+                : '连接设备';
     final icon = offline
         ? Icons.offline_bolt_outlined
-        : connecting || scanning
-            ? Icons.bluetooth_searching
-            : bleLinked
-                ? Icons.bluetooth_connected
-                : Icons.bluetooth_disabled;
+        : nasMqttActive && !connecting && !scanning
+            ? Icons.cloud_done_outlined
+            : connecting || scanning
+                ? Icons.bluetooth_searching
+                : bleLinked
+                    ? Icons.bluetooth_connected
+                    : Icons.bluetooth_disabled;
     return Material(
       color: MimiVentColors.surfaceRaised,
       borderRadius: BorderRadius.circular(14),
@@ -195,8 +206,7 @@ extension _DashboardMainSections on _DashboardPageState {
                               : c.connected && !c.appVersionCompatible
                                   ? '请更新 MimiVent App'
                                   : c.connected
-                                      ? (c.status == null &&
-                                              c.lastError != null
+                                      ? (c.status == null && c.lastError != null
                                           ? '设备无响应'
                                           : '正在同步')
                                       : '等待连接',
@@ -313,22 +323,34 @@ extension _DashboardMainSections on _DashboardPageState {
               '临时排风时长',
               '临时暂停时长',
             ])
-              ListTile(
-                title: Text(title, style: const TextStyle(fontSize: 13)),
-                trailing: const Row(mainAxisSize: MainAxisSize.min, children: [
-                  Text('未同步',
-                      style:
-                          TextStyle(color: MimiVentColors.muted, fontSize: 11)),
-                  Icon(Icons.chevron_right_rounded,
-                      size: 18, color: MimiVentColors.muted),
-                ]),
-                onTap: _requireDeviceConnection,
-              ),
+              _unavailableSettingRow(title),
           ]),
         ),
         const SizedBox(height: 14),
         _diagnosticsEntry(),
       ]);
+
+  Widget _unavailableSettingRow(String title) => Semantics(
+        button: true,
+        label: '$title，未同步，连接设备后设置',
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: _requireDeviceConnection,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 13),
+            child: Row(children: [
+              Expanded(
+                child: Text(title, style: const TextStyle(fontSize: 13)),
+              ),
+              const Text('未同步',
+                  style: TextStyle(color: MimiVentColors.muted, fontSize: 11)),
+              const SizedBox(width: 6),
+              const Icon(Icons.chevron_right_rounded,
+                  size: 18, color: MimiVentColors.muted),
+            ]),
+          ),
+        ),
+      );
 
   Widget _scrollPage(String key, List<Widget> children) => LayoutBuilder(
         builder: (context, constraints) {
@@ -377,13 +399,14 @@ extension _DashboardMainSections on _DashboardPageState {
           ),
           const SizedBox(width: 10),
           Expanded(
-            child: _metricCard(
-              title: '风机运行',
-              value: DurationFormatter.clock(c.displayFanRunMs),
-              detail: '本次运行时长',
-              icon: Icons.schedule_rounded,
-              accent: status.fan ? MimiVentColors.amber : MimiVentColors.mint,
-            ),
+            child: _countdownBuilder(() => _metricCard(
+                  title: '风机运行',
+                  value: DurationFormatter.clock(c.displayFanRunMs),
+                  detail: '本次运行时长',
+                  icon: Icons.schedule_rounded,
+                  accent:
+                      status.fan ? MimiVentColors.amber : MimiVentColors.mint,
+                )),
           ),
         ]),
         const SizedBox(height: 12),

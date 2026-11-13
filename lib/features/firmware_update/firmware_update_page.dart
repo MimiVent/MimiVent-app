@@ -30,7 +30,7 @@ class FirmwareUpdatePage extends StatefulWidget {
 
 class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
     with WidgetsBindingObserver {
-  static const _minimumFirmwareVersion = '0.2.0';
+  static const _minimumFirmwareVersion = '0.7.0';
   final _versionController = TextEditingController();
   PlatformFile? _firmware;
   String? _otaPackagePath;
@@ -49,6 +49,7 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
   String? _taskId;
   String? _currentFirmwareVersion;
   int? _currentStatisticsSchema;
+
   /// 升级成功后的常驻提示：展示设备实际运行的版本，直到用户关闭或离开页面。
   bool _upgradeSucceeded = false;
   String? _upgradeSucceededVersion;
@@ -68,6 +69,8 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
   bool _abandonInProgress = false;
   bool _exitDialogOpen = false;
   bool _installCommandPending = false;
+  // 同版本重装需用户确认一次；确认后本次流程内不再重复弹窗。
+  bool _sameVersionConfirmed = false;
   bool _successNotified = false;
   bool _legacyProtocolActive = false;
   bool _backgroundPausePending = false;
@@ -76,6 +79,7 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
   String? _lastQueriedDeviceId;
   Timer? _connectionRefreshTimer;
   DateTime? _transferStartedAt;
+
   /// 本次传输的起始字节数。续传时设备已确认的部分不计入速度，
   /// 否则 "恢复的字节 ÷ 刚过去的几十毫秒" 会算出荒谬的速度与剩余时间。
   int? _transferBaseBytes;
@@ -109,7 +113,10 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.inactive ||
+    // inactive 只表示暂时失去焦点（例如通知栏、系统弹窗或切换窗口），
+    // 此时 App 仍可能正常运行，不能因此中断 OTA。Flutter 3.22 在真正
+    // 隐藏页面时会先发 hidden，再发 paused；只在隐藏/退后台时安全暂停。
+    if (state == AppLifecycleState.hidden ||
         state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached) {
       unawaited(_pauseBeforeBackground());
@@ -422,7 +429,9 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
           ?.group(1);
       minimumReadableSchema = int.tryParse(
         RegExp(r'MIMIVENT_MIN_READABLE_STORAGE_SCHEMA=(\d+)')
-                .firstMatch(binaryText)?.group(1) ?? '',
+                .firstMatch(binaryText)
+                ?.group(1) ??
+            '',
       );
       if (imageBytes.isEmpty ||
           imageBytes.first != 0xE9 ||
@@ -673,7 +682,9 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
         _firmwareStatisticsSchema = pendingTask.statisticsSchema;
         _firmwareMinimumReadableSchema = int.tryParse(
           RegExp(r'MIMIVENT_MIN_READABLE_STORAGE_SCHEMA=(\d+)')
-                  .firstMatch(binaryText)?.group(1) ?? '',
+                  .firstMatch(binaryText)
+                  ?.group(1) ??
+              '',
         );
         _firmwarePartitionProfile = partitionProfile;
         _firmwareSha256 = otaPackage.imageSha256;
@@ -710,17 +721,38 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
     // 白白花两分钟且可能打断安装。
     if (_installCommandPending) {
       if (mounted) {
-        setState(() => _status =
-            '安装指令已发送，正在等待设备重启；请勿重复上传');
+        setState(() => _status = '安装指令已发送，正在等待设备重启；请勿重复上传');
       }
       return;
     }
-    if (_isAlreadyRunningTarget()) {
-      if (mounted) {
-        setState(() => _status =
-            '设备当前已是 v$_firmwareVersion，无需重复安装；如需重装请先改选其它机制');
+    if (_isAlreadyRunningTarget() && !_sameVersionConfirmed) {
+      // 同版本不再硬拦：重装是合法的调试与恢复手段（例如固件参数调整后
+      // 需要重新写同一版本号）。改为一次确认，确认后本次流程放行。
+      final proceed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('重装同一版本'),
+          content: Text('设备当前已是 v$_firmwareVersion。重装会覆盖当前固件并重启设备，'
+              '耗时约 1–3 分钟。'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('仍要重装'),
+            ),
+          ],
+        ),
+      );
+      if (proceed != true) {
+        if (mounted) {
+          setState(() => _status = '已取消：设备已是 v$_firmwareVersion');
+        }
+        return;
       }
-      return;
+      _sameVersionConfirmed = true;
     }
     _successNotified = false;
     final firmware = _firmware;
@@ -1349,8 +1381,8 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
                   decoration: BoxDecoration(
                     color: MimiVentColors.mint.withOpacity(.10),
                     borderRadius: BorderRadius.circular(16),
-                    border: Border.all(
-                        color: MimiVentColors.mint.withOpacity(.45)),
+                    border:
+                        Border.all(color: MimiVentColors.mint.withOpacity(.45)),
                   ),
                   child: Row(children: [
                     const Icon(Icons.check_circle_rounded,
