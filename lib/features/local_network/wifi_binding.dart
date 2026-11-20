@@ -46,6 +46,18 @@ class WifiBinding {
         clientId: read('clientId', r'^[A-Za-z0-9_-]{1,36}$'),
         state: read('bindingState', r'^(pending|active|invalid|blocked)$'));
   }
+  // 同一份凭据在内存里可能有多个副本（页面选中项来自 dashboard 或 records）。
+  // DropdownButton 等控件按值比较，必须按身份字段判等而不是对象引用。
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is WifiBinding &&
+          other.deviceId == deviceId &&
+          other.tokenId == tokenId;
+
+  @override
+  int get hashCode => Object.hash(deviceId, tokenId);
+
   Map<String, dynamic> toJson() => {
         'version': 1,
         'scheme': 'https',

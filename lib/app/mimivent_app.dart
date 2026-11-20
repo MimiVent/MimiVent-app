@@ -446,6 +446,8 @@ class _MimiVentAppState extends State<MimiVentApp> with WidgetsBindingObserver {
       MaterialPageRoute(
         builder: (_) => WifiBindingAndNasPage(
           ble: controller.ble,
+          initialBinding: controller.activeBinding,
+          onSwitchToNasMqtt: _switchToNasMqtt,
           onOpenWifiProvisioning: () {
             final currentNavigator = _navigatorKey.currentState;
             if (currentNavigator == null) return;

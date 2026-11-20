@@ -41,6 +41,7 @@ part 'dashboard_status_cards.part.dart';
 
 enum _TopBarMenuAction {
   diagnostics,
+  localServices,
   wifiProvisioning,
   firmwareUpdate,
   connectDevice,
@@ -457,6 +458,9 @@ class _DashboardPageState extends State<DashboardPage> {
             switch (action) {
               case _TopBarMenuAction.diagnostics:
                 _openDiagnostics();
+              case _TopBarMenuAction.localServices:
+                // 本地网络与服务授权：未连蓝牙也可进入（用于“用加入码加入”）。
+                _openNasControlRecovery();
               case _TopBarMenuAction.wifiProvisioning:
                 _openWifiProvisioning();
               case _TopBarMenuAction.firmwareUpdate:
@@ -523,6 +527,14 @@ class _DashboardPageState extends State<DashboardPage> {
                     color: MimiVentColors.mint, size: 19),
                 SizedBox(width: 11),
                 Text('设备诊断'),
+              ]),
+            ),
+            const PopupMenuItem(
+              value: _TopBarMenuAction.localServices,
+              child: Row(children: [
+                Icon(Icons.lan_outlined, color: MimiVentColors.mint, size: 19),
+                SizedBox(width: 11),
+                Text('设备网络与 NAS 控制'),
               ]),
             ),
             if (c.connected &&

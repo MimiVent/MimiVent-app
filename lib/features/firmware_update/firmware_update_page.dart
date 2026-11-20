@@ -30,7 +30,7 @@ class FirmwareUpdatePage extends StatefulWidget {
 
 class _FirmwareUpdatePageState extends State<FirmwareUpdatePage>
     with WidgetsBindingObserver {
-  static const _minimumFirmwareVersion = '0.7.0';
+  static const _minimumFirmwareVersion = '0.7.1';
   final _versionController = TextEditingController();
   PlatformFile? _firmware;
   String? _otaPackagePath;

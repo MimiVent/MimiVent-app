@@ -256,7 +256,8 @@ class _WifiProvisioningPageState extends State<WifiProvisioningPage> {
         final body = result?.body;
         if (result?.statusCode == 200 &&
             body?['deviceId'] == binding.deviceId &&
-            body?['tokenId'] == binding.tokenId &&
+            // P2：Gateway 返回手机实例标识 appInstanceId。
+            body?['appInstanceId'] == binding.tokenId &&
             body?['bindingState'] == 'active' &&
             body?['stale'] == false &&
             body?['stateFreshness'] == 'fresh') {

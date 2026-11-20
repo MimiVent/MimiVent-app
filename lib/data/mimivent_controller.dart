@@ -158,6 +158,8 @@ class MimiVentController extends ChangeNotifier {
   WifiBinding? _wifiBinding;
   bool _nasMqttSessionReady = false;
   int _nasMqttSessionGeneration = 0;
+  Future<void>? _nasMqttActivationTask;
+  WifiBinding? _nasMqttActivationBinding;
   int _nasSnapshotRevision = 0;
   int _nasFastSyncUntilMs = 0;
   // 最近一次控制落地的时间戳。控制后几秒内到达的"陈旧"快照要丢弃：
@@ -194,6 +196,9 @@ class MimiVentController extends ChangeNotifier {
   DateTime? _fanRunStartedAt;
 
   bool get nasMqttActive => _wifiBinding != null && _nasMqttSessionReady;
+
+  /// 当前生效的网关绑定；MQTT 通道下由会话建立，供设置页直接选中。
+  WifiBinding? get activeBinding => _wifiBinding;
 
   /// 固件是否支持 /api/stats/range（依据 /api/status 的能力字段）。
   bool get supportsStatisticsRange {
@@ -966,7 +971,43 @@ class MimiVentController extends ChangeNotifier {
           {bool priority = false}) =>
       _nasGatewayExecutor.run(action, priority: priority);
 
-  Future<void> activateNasMqtt(WifiBinding binding) async {
+  Future<void> activateNasMqtt(WifiBinding binding) {
+    final running = _nasMqttActivationTask;
+    if (running != null) {
+      if (_nasMqttActivationBinding == binding) {
+        diagnostics?.info('NAS MQTT 会话', '合并同一绑定的并发激活请求');
+        return running;
+      }
+      return _activateNasMqttAfter(running, binding);
+    }
+    if (nasMqttActive && _wifiBinding == binding) {
+      return Future<void>.value();
+    }
+
+    _nasMqttActivationBinding = binding;
+    late final Future<void> task;
+    task = _activateNasMqtt(binding).whenComplete(() {
+      if (identical(_nasMqttActivationTask, task)) {
+        _nasMqttActivationTask = null;
+        _nasMqttActivationBinding = null;
+      }
+    });
+    _nasMqttActivationTask = task;
+    return task;
+  }
+
+  Future<void> _activateNasMqttAfter(
+      Future<void> running, WifiBinding binding) async {
+    try {
+      await running;
+    } catch (_) {
+      // 前一绑定的失败不能阻止最新请求继续尝试。
+    }
+    if (_disposed) return;
+    return activateNasMqtt(binding);
+  }
+
+  Future<void> _activateNasMqtt(WifiBinding binding) async {
     final generation = ++_nasMqttSessionGeneration;
     final bleDeviceId = ble.connectedDeviceId;
     _nasConfigurationDeadline = null;
@@ -1211,8 +1252,9 @@ class MimiVentController extends ChangeNotifier {
       );
     }
     data = result.body;
+    // P2：手机凭据标识是 appInstanceId；binding.tokenId 保存的就是它。
     if (data['deviceId'] != binding.deviceId ||
-        data['tokenId'] != binding.tokenId ||
+        data['appInstanceId'] != binding.tokenId ||
         data['bindingState'] != 'active') {
       throw const NasGatewayException(
           'GATEWAY_IDENTITY_MISMATCH', 'NAS 返回的设备或绑定身份不匹配');

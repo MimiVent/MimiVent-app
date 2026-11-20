@@ -727,7 +727,9 @@ WifiBinding _binding() => WifiBinding(
 
 Map<String, dynamic> _gatewayState() => {
       'deviceId': _binding().deviceId,
-      'tokenId': _binding().tokenId,
+      // P2：Gateway 返回手机实例标识 appInstanceId（binding.tokenId 保存的就是它）。
+      'appInstanceId': _binding().tokenId,
+      'role': 'admin',
       'bindingState': 'active',
       'protocolVersion': 1,
       'fan': false,

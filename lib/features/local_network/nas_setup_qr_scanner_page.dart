@@ -8,7 +8,10 @@ import 'nas_setup_config.dart';
 
 /// 支持实时相机扫码，也支持从手机截图/图片文件识别二维码。
 class NasSetupQrScannerPage extends StatefulWidget {
-  const NasSetupQrScannerPage({super.key});
+  const NasSetupQrScannerPage({super.key, this.rawMode = false});
+
+  /// true 时只返回扫描到的原始文本（用于“加入码”），不解析 NAS 配置。
+  final bool rawMode;
 
   @override
   State<NasSetupQrScannerPage> createState() => _NasSetupQrScannerPageState();
@@ -39,6 +42,12 @@ class _NasSetupQrScannerPageState extends State<NasSetupQrScannerPage> {
       _error = null;
     });
     try {
+      if (widget.rawMode) {
+        if (!mounted) return;
+        setState(() => _handling = false);
+        Navigator.pop(context, value);
+        return;
+      }
       final config = NasSetupConfig.parse(value);
       await _scanner.stop();
       if (mounted) Navigator.of(context).pop(config);

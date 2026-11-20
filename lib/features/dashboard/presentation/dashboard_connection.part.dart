@@ -71,6 +71,8 @@ extension _DashboardConnectionSection on _DashboardPageState {
       MaterialPageRoute(
         builder: (_) => WifiBindingAndNasPage(
           ble: c.ble,
+          initialBinding: c.activeBinding,
+          onSwitchToNasMqtt: widget.onSwitchToNasMqtt,
           onOpenWifiProvisioning: () {
             final navigator = Navigator.of(context);
             unawaited(navigator

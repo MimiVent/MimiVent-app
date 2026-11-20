@@ -7,6 +7,44 @@ class WifiBindingStore {
   int dropped = 0;
   Future<void> clearConfirmed() => channel
       .invokeMethod<void>('clear', {'value': 'REMOVE_LOCAL_WIFI_BINDINGS'});
+  Future<List<Map<String, dynamic>>> loadPendingSetups() async {
+    final raw = await channel.invokeMethod<String>('read_setup');
+    if (raw == null || raw.isEmpty) return const [];
+    final decoded = jsonDecode(raw);
+    if (decoded is! List) throw const FormatException('待恢复配置记录无效');
+    return decoded
+        .whereType<Map>()
+        .map((value) => Map<String, dynamic>.from(value))
+        .toList(growable: false);
+  }
+
+  Future<void> savePendingSetup(Map<String, dynamic> setup) async {
+    final pending = await loadPendingSetups();
+    final deviceId = setup['deviceId'];
+    if (deviceId is! String || deviceId.isEmpty) {
+      throw const FormatException('待恢复配置缺少设备身份');
+    }
+    final next = [
+      ...pending.where((value) => value['deviceId'] != deviceId),
+      Map<String, dynamic>.from(setup),
+    ];
+    if (next.length > 16) throw StateError('待恢复配置过多，请先完成其他设备配置');
+    await channel
+        .invokeMethod<void>('write_setup', {'value': jsonEncode(next)});
+  }
+
+  Future<void> clearPendingSetup(String deviceId) async {
+    final next = (await loadPendingSetups())
+        .where((value) => value['deviceId'] != deviceId)
+        .toList(growable: false);
+    if (next.isEmpty) {
+      await channel.invokeMethod<void>('clear_setup');
+    } else {
+      await channel
+          .invokeMethod<void>('write_setup', {'value': jsonEncode(next)});
+    }
+  }
+
   Future<List<WifiBinding>> load() async {
     final raw = await channel.invokeMethod<String>('read') ?? '[]';
     final list = jsonDecode(raw);

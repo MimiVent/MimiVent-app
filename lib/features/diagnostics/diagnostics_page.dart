@@ -42,7 +42,7 @@ class DiagnosticsPage extends StatelessWidget {
                   final switchToMqtt = await Navigator.of(context).push<bool>(
                     MaterialPageRoute(
                       builder: (_) =>
-                          WifiBindingAndNasPage(ble: controller!.ble),
+                          WifiBindingAndNasPage(ble: controller!.ble, initialBinding: controller!.activeBinding),
                     ),
                   );
                   if (switchToMqtt == true && context.mounted) {

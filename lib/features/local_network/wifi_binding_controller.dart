@@ -142,14 +142,88 @@ class WifiBindingController extends ChangeNotifier {
   }
 
   Future<void> load() => run(() async {
-        records = await store.load();
+        records = _dedupe(await store.load());
         secureStoreReady = true;
         selected = records.isEmpty ? null : records.first;
         if (selected != null) await _refreshPendingInfo(selected!);
         if (store.dropped > 0) error = '已忽略 ${store.dropped} 条损坏记录，其他设备记录已保留';
       });
+
+  /// 按当前蓝牙设备的 deviceId 选中正确的本机记录。
+  /// load() 只按顺序取 records.first；存在多条历史记录时会选错，
+  /// 导致后续读状态用错 appInstanceId 而被网关拒绝（AUTH_REQUIRED）。
+  Future<void> syncSelectedWithDevice() async {
+    if (!secureStoreReady) {
+      records = _dedupe(await store.load());
+      secureStoreReady = true;
+    }
+    final String device;
+    try {
+      final network = await request('wifi.status');
+      final value = network['deviceId'];
+      if (value is! String || value.isEmpty) return;
+      device = value;
+    } catch (_) {
+      return;
+    }
+    final candidates = records
+        .where((r) => r.deviceId == device && r.state == 'active')
+        .toList(growable: false);
+    if (candidates.isEmpty) return;
+    // 同行会有多条历史记录（旧的 appToken 已失效）。逐个试读状态，
+    // 选中真正有效的那条，避免后续生成邀请码/验证状态被网关拒绝。
+    WifiBinding chosen = candidates.first;
+    var anySucceeded = false;
+    var authRejected = false;
+    for (final candidate in candidates) {
+      try {
+        final result = await gatewayTransport.tryReadState(candidate);
+        if (result == null) continue;
+        if (result.statusCode == 200) {
+          chosen = candidate;
+          anySucceeded = true;
+          break;
+        }
+        if (result.statusCode == 401 || result.statusCode == 403) {
+          authRejected = true;
+        }
+      } catch (_) {
+        // 网关不可达时无法判定，交给后续操作报错。
+      }
+    }
+    if (!anySucceeded && authRejected) {
+      // 本机记录全部被网关拒绝：清掉，避免一直卡在 AUTH_REQUIRED。
+      records = records
+          .where((r) => r.deviceId != device || r.state != 'active')
+          .toList();
+      await persist(records);
+      selected = records.isEmpty ? null : records.first;
+      status = null;
+      error = '本机凭据已失效，请重新配置服务授权';
+      changed();
+      return;
+    }
+    if (selected?.tokenId == chosen.tokenId &&
+        selected?.deviceId == chosen.deviceId) {
+      return;
+    }
+    selected = chosen;
+    status = null;
+    unawaited(_refreshPendingInfo(chosen));
+    changed();
+  }
+
   void select(WifiBinding value) {
-    selected = value;
+    // 选中项必须是 records 里的同一实例：下拉框按值比较，
+    // 传入外部副本会让 DropdownButton 找不到匹配项而断言失败。
+    var target = value;
+    for (final record in records) {
+      if (record == value) {
+        target = record;
+        break;
+      }
+    }
+    selected = target;
     status = null;
     controlNotice = null;
     unawaited(_refreshPendingInfo(value));
@@ -170,10 +244,31 @@ class WifiBindingController extends ChangeNotifier {
     changed();
   }
 
+  /// 同一 (deviceId, tokenId) 只保留一条：反复配置会留下重复记录，
+  /// 导致下拉框出现 2 个同值 item 而触发 Flutter 断言。
+  List<WifiBinding> _dedupe(List<WifiBinding> input) {
+    final seen = <String>{};
+    final out = <WifiBinding>[];
+    for (final record in input) {
+      final key = '${record.deviceId}:${record.tokenId}';
+      if (seen.add(key)) {
+        out.add(record);
+      } else {
+        debugPrint('[bind] dropped duplicate $key');
+      }
+    }
+    return out;
+  }
+
   Future<void> persist(List<WifiBinding> next) async {
     if (_disposed) throw StateError('页面已关闭，请稍后恢复绑定');
-    await store.save(next);
-    records = next;
+    final unique = _dedupe(next);
+    await store.save(unique);
+    records = unique;
+    // 去重可能丢掉当前选中项，重新指向仍然存在的记录。
+    if (selected != null && !records.any((r) => r == selected)) {
+      selected = records.isEmpty ? null : records.first;
+    }
   }
 
   Future<Map<String, dynamic>> request(String op,
@@ -554,9 +649,7 @@ class WifiBindingController extends ChangeNotifier {
           '设备未执行该控制（HTTP ${result.body['httpStatus'] ?? '?'}）',
         );
       }
-    } on NasGatewayException catch (e) {
-      if (['REQUEST_PENDING', 'REQUEST_UNKNOWN', 'REQUEST_REJECTED']
-          .contains(e.code)) rethrow;
+    } on NasGatewayException {
       rethrow;
     } catch (_) {
       throw const NasGatewayException(
@@ -625,102 +718,361 @@ class WifiBindingController extends ChangeNotifier {
       secureStoreReady = true;
     }
     final network = await request('wifi.status');
-    // 绑定生命周期由 BLE 授权完成，不依赖设备 HTTPS 或 Gateway 在线。
     if (network['connected'] != true) {
       throw StateError('设备尚未连接 WiFi，请先完成配网');
     }
     final device = network['deviceId'];
     if (device is! String) throw StateError('设备未返回稳定身份');
-    final preferences = await SharedPreferences.getInstance();
-    const key = 'mimivent.wifi.client_id.v1';
-    final client = preferences.getString(key) ?? 'c-${randomId()}';
-    await preferences.setString(key, client);
-    WifiBinding? candidate;
-    for (final old in records) {
-      if (old.deviceId == device && old.state == 'pending') candidate = old;
-    }
-    await request('wifi.bind.open');
-    if (candidate != null) {
-      final remote = await request('wifi.bind.status',
-          extra: {'tokenId': candidate.tokenId});
-      if (!['pending', 'active'].contains(remote['bindingState'])) {
-        final expired = candidate;
-        await persist(records
-            .where((r) =>
-                r.tokenId != expired.tokenId || r.deviceId != expired.deviceId)
-            .toList());
-        candidate = null;
+
+    final checkpoints = await store.loadPendingSetups();
+    Map<String, dynamic>? checkpoint;
+    for (final value in checkpoints) {
+      if (value['deviceId'] == device) {
+        checkpoint = Map<String, dynamic>.from(value);
+        break;
       }
     }
-    if (candidate == null) {
-      if (records.length >= 16) throw StateError('本机记录过多，请先移除不用的设备');
-      for (final old in records
-          .where((r) => r.deviceId == device && r.state != 'active')) {
-        await request('wifi.bind.cancel', extra: {'tokenId': old.tokenId});
-      }
-      final beginKey = 'mimivent.wifi.begin.$device';
-      final beginId = preferences.getString(beginKey) ?? randomId(uuid: true);
-      await preferences.setString(beginKey, beginId);
-      final begin = await request('wifi.bind.begin',
-          extra: {'clientId': client, 'requestId': beginId, 'replace': true});
-      candidate =
-          WifiBinding.fromJson({...begin, 'version': 1, 'clientId': client});
-      if (candidate.deviceId != device) throw StateError('蓝牙返回的设备身份发生变化');
-      // commit 前持久化 pending；替换期间保留旧 active token，直到新授权成功。
-      await persist([...records, candidate]);
-      await preferences.remove(beginKey);
-      selected = candidate;
-      changed();
-    } else {
-      selected = candidate;
+
+    // 设备已完成单服务授权：本机有手机凭据就直接复用。
+    final service = await request('wifi.service.status');
+    if (checkpoint != null) {
+      await _resumeSetup(device, checkpoint, service);
+      return;
     }
-    final value = candidate.copy(
-        host: network['ip'] is String && (network['ip'] as String).isNotEmpty
-            ? network['ip'] as String
-            : candidate.host);
-    await updateRecord(value);
-    final beforeCommit =
-        await request('wifi.bind.status', extra: {'tokenId': value.tokenId});
-    if (beforeCommit['bindingState'] == 'pending') {
-      // token 由本次已授权 BLE 会话生成并返回；经 BLE 回送核验后再提交，
-      // 避免把设备 HTTPS 或尚未拿到 read grant 的 NAS 状态当作绑定前置条件。
-      final verification = await request('wifi.bind.verify', extra: {
-        'tokenId': value.tokenId,
-        'token': value.token,
-      });
-      if (verification['verified'] != true) {
-        throw StateError('设备未确认本次绑定凭据');
+    if (service['state'] == 'active') {
+      WifiBinding? existing;
+      for (final record in records) {
+        if (record.deviceId == device && record.state == 'active') {
+          existing = record;
+          break;
+        }
       }
-      try {
-        await request('wifi.bind.commit', extra: {'tokenId': value.tokenId});
-      } catch (_) {
-        final remote = await request('wifi.bind.status',
-            extra: {'tokenId': value.tokenId});
-        if (remote['bindingState'] != 'active') rethrow;
+      if (existing != null) {
+        selected = existing;
+        status = {
+          'deviceId': device,
+          'serviceId': service['serviceId'],
+          'bindingState': 'active',
+          'transport': 'gateway-mqtt',
+        };
+        changed();
+        return;
       }
+      throw StateError('设备已完成服务授权，但本机没有访问凭据；请在网关创建邀请码加入，或先在设备上清除服务授权');
     }
-    final active = value.copy(state: 'active');
-    final confirmed =
-        await request('wifi.bind.status', extra: {'tokenId': value.tokenId});
-    if (confirmed['bindingState'] != 'active') {
-      throw StateError('设备尚未完成绑定，请重新连接蓝牙后恢复');
+
+    final appInstanceId = await _appInstanceId();
+    final window = await gatewayTransport.openSetupWindow();
+    final setupId = window['setupId']?.toString();
+    final setupSecret = window['setupSecret']?.toString();
+    if (setupId == null || setupSecret == null) {
+      throw StateError('网关未返回有效配置窗口');
     }
-    // 绑定结果以设备 BLE 回执为准。Gateway 的状态快照可能要等下一次 MQTT
-    // 发布才包含新 token，不能因此回滚刚刚成功的绑定。
-    status = {
+    final session = await gatewayTransport.createSetupSession(
+      setupId: setupId,
+      setupSecret: setupSecret,
+      appInstanceId: appInstanceId,
+    );
+    final sessionToken = session['sessionToken']?.toString();
+    if (sessionToken == null) throw StateError('网关未返回配置会话');
+    final transactionId = setupId;
+    final serviceId = setupId.replaceAll('-', '');
+    final freshCheckpoint = <String, dynamic>{
       'deviceId': device,
-      'tokenId': active.tokenId,
-      'bindingState': 'active',
-      'transport': 'ble-mqtt',
+      'setupId': setupId,
+      'sessionToken': sessionToken,
+      'appInstanceId': appInstanceId,
+      'transactionId': transactionId,
+      'serviceId': serviceId,
+      'stage': 'session',
+      'updatedAtMs': DateTime.now().millisecondsSinceEpoch,
     };
     try {
-      final cached = await gatewayTransport.tryReadState(active);
-      if (cached?.statusCode == 200) status = cached!.body;
-    } catch (_) {
-      // MQTT 状态快照尚未到达时，绑定仍然有效；后续读取会提示 Gateway 状态。
+      await _saveSetupCheckpoint(freshCheckpoint);
+      await _finishSetup(device, freshCheckpoint, service);
+    } catch (error) {
+      await _handleSetupFailure(device, freshCheckpoint, error);
     }
-    await persist([...records.where((r) => r.deviceId != device), active]);
-    selected = active;
+  }
+
+  Future<void> _saveSetupCheckpoint(Map<String, dynamic> checkpoint,
+      {String? stage}) async {
+    if (stage != null) checkpoint['stage'] = stage;
+    checkpoint['updatedAtMs'] = DateTime.now().millisecondsSinceEpoch;
+    await store.savePendingSetup(checkpoint);
+  }
+
+  Future<void> _resumeSetup(String device, Map<String, dynamic> checkpoint,
+      Map<String, dynamic> service) async {
+    if (checkpoint['setupId'] is! String ||
+        checkpoint['sessionToken'] is! String ||
+        checkpoint['transactionId'] is! String ||
+        checkpoint['serviceId'] is! String ||
+        checkpoint['appInstanceId'] is! String) {
+      throw StateError('发现不完整的服务配置记录，请连接蓝牙后重试恢复');
+    }
+    try {
+      // 本地断点可能已超过 Gateway 的 24 小时会话 TTL。先用原令牌续期，
+      // 再恢复原 transaction，避免设备已激活的候选凭据失去核验通道。
+      await gatewayTransport.resumeSetupSession(
+        setupId: checkpoint['setupId'] as String,
+        sessionToken: checkpoint['sessionToken'] as String,
+      );
+      await _finishSetup(device, checkpoint, service);
+    } catch (error) {
+      await _handleSetupFailure(device, checkpoint, error);
+    }
+  }
+
+  Future<void> _finishSetup(String device, Map<String, dynamic> checkpoint,
+      Map<String, dynamic> service) async {
+    final setupId = checkpoint['setupId'] as String;
+    final sessionToken = checkpoint['sessionToken'] as String;
+    final transactionId = checkpoint['transactionId'] as String;
+    final serviceId = checkpoint['serviceId'] as String;
+    var stage = checkpoint['stage']?.toString() ?? 'session';
+
+    var candidateActivated =
+        service['candidateTransactionId'] == transactionId &&
+            service['candidateState'] == 'activated';
+    var deviceConfirmed = service['state'] == 'active' &&
+        service['credentialId'] == checkpoint['credentialId'];
+
+    if (!deviceConfirmed && !candidateActivated) {
+      final begin = await request('wifi.service.begin', extra: {
+        'transactionId': transactionId,
+        'serviceId': serviceId,
+      });
+      final credentialId = begin['credentialId']?.toString();
+      final serviceToken = begin['token']?.toString();
+      if (credentialId == null || serviceToken == null) {
+        throw StateError('设备未返回有效服务凭据');
+      }
+      checkpoint['credentialId'] = credentialId;
+      checkpoint['serviceToken'] = serviceToken;
+      await _saveSetupCheckpoint(checkpoint, stage: 'candidate_created');
+      stage = 'candidate_created';
+      await gatewayTransport.saveServiceCredential(
+        setupId: setupId,
+        sessionToken: sessionToken,
+        deviceId: device,
+        credentialId: credentialId,
+        token: serviceToken,
+      );
+      await _saveSetupCheckpoint(checkpoint, stage: 'gateway_staged');
+      stage = 'gateway_staged';
+      await request('wifi.service.activate',
+          extra: {'transactionId': transactionId});
+      candidateActivated = true;
+      await _saveSetupCheckpoint(checkpoint, stage: 'device_activated');
+      stage = 'device_activated';
+    } else if (candidateActivated) {
+      checkpoint['credentialId'] ??= service['candidateCredentialId'];
+      if (checkpoint['credentialId'] is! String ||
+          checkpoint['serviceToken'] is! String) {
+        throw StateError('设备候选授权已激活，但本机缺少恢复凭据；请清除候选后重新配置');
+      }
+      // 只在本地断点表明网关尚未暂存时补交；已核验会话不允许再次写入 staged credential。
+      if (const {'session', 'candidate_created', 'gateway_staged'}
+          .contains(stage)) {
+        await gatewayTransport.saveServiceCredential(
+          setupId: setupId,
+          sessionToken: sessionToken,
+          deviceId: device,
+          credentialId: checkpoint['credentialId'] as String,
+          token: checkpoint['serviceToken'] as String,
+        );
+      }
+      await _saveSetupCheckpoint(checkpoint, stage: 'device_activated');
+      stage = 'device_activated';
+    }
+
+    if (!deviceConfirmed) {
+      final verified = await _waitForServiceVerification(
+        setupId: setupId,
+        sessionToken: sessionToken,
+        deviceId: device,
+        credentialId: checkpoint['credentialId'] as String,
+        serviceToken: checkpoint['serviceToken'] as String,
+      );
+      if (!verified) {
+        throw StateError('服务已保留，网关核验暂未完成；请连接设备后重试恢复');
+      }
+      await _saveSetupCheckpoint(checkpoint, stage: 'verified');
+      stage = 'verified';
+      await request('wifi.service.confirm',
+          extra: {'transactionId': transactionId});
+      deviceConfirmed = true;
+      await _saveSetupCheckpoint(checkpoint, stage: 'device_confirmed');
+      stage = 'device_confirmed';
+    }
+
+    Map<String, dynamic> complete;
+    try {
+      complete = await gatewayTransport.completeSetup(
+        setupId: setupId,
+        sessionToken: sessionToken,
+      );
+    } on NasGatewayException catch (error) {
+      // 旧版 Gateway 可能已在启动清理时删除过期的暂存凭据。
+      // 若设备已确认新凭据，用本地加密断点补回同一候选并重新核验，不清旧授权。
+      if (error.code != 'SETUP_NOT_VERIFIED' ||
+          checkpoint['credentialId'] is! String ||
+          checkpoint['serviceToken'] is! String) {
+        rethrow;
+      }
+      await gatewayTransport.saveServiceCredential(
+        setupId: setupId,
+        sessionToken: sessionToken,
+        deviceId: device,
+        credentialId: checkpoint['credentialId'] as String,
+        token: checkpoint['serviceToken'] as String,
+      );
+      final verified = await gatewayTransport.verifySetup(
+        setupId: setupId,
+        sessionToken: sessionToken,
+      );
+      if (verified['verified'] != true) rethrow;
+      complete = await gatewayTransport.completeSetup(
+        setupId: setupId,
+        sessionToken: sessionToken,
+      );
+    }
+    final issuedInstance = complete['appInstanceId']?.toString();
+    final appToken = complete['appToken']?.toString();
+    if (issuedInstance == null || appToken == null) {
+      throw StateError('网关未返回手机访问凭据');
+    }
+    final binding = WifiBinding(
+      deviceId: device,
+      tokenId: issuedInstance,
+      token: appToken,
+      pin: '',
+      host: '',
+      clientId: 'gateway',
+      state: 'active',
+    );
+    await persist([...records.where((r) => r.deviceId != device), binding]);
+    final config = await gatewayTransport.loadConfig();
+    final gatewayUrl = config['url'] ?? '';
+    if (config['enabled'] != 'true' && gatewayUrl.isNotEmpty) {
+      await gatewayTransport.saveConfig(
+        url: gatewayUrl,
+        certificatePin: config['certificatePin'] ?? '',
+        enabled: true,
+      );
+    }
+    await store.clearPendingSetup(device);
+    selected = binding;
+    status = {
+      'deviceId': device,
+      'serviceId': serviceId,
+      'role': complete['role'],
+      'bindingState': 'active',
+      'transport': 'gateway-mqtt',
+    };
+    changed();
+  }
+
+  Future<void> _handleSetupFailure(
+      String device, Map<String, dynamic> checkpoint, Object error) async {
+    final setupId = checkpoint['setupId'] as String?;
+    final sessionToken = checkpoint['sessionToken'] as String?;
+    final transactionId = checkpoint['transactionId'] as String?;
+    var activated = const {
+      'device_activated',
+      'verified',
+      'device_confirmed',
+    }.contains(checkpoint['stage']);
+    var deviceCancelled = false;
+    if (!activated && transactionId != null) {
+      try {
+        final service = await request('wifi.service.status');
+        activated = (service['candidateTransactionId'] == transactionId &&
+                service['candidateState'] == 'activated') ||
+            (checkpoint['credentialId'] != null &&
+                service['state'] == 'active' &&
+                service['credentialId'] == checkpoint['credentialId']);
+      } catch (_) {}
+    }
+    if (activated) {
+      try {
+        await _saveSetupCheckpoint(checkpoint);
+      } catch (_) {}
+      throw StateError('服务配置已进入待恢复阶段，原授权和事务记录已保留；请连接设备后重试恢复。详情：$error');
+    }
+    if (transactionId != null) {
+      try {
+        await request('wifi.service.cancel',
+            extra: {'transactionId': transactionId});
+        deviceCancelled = true;
+      } catch (_) {}
+    }
+    if (setupId != null && sessionToken != null) {
+      try {
+        await gatewayTransport.cancelSetup(
+          setupId: setupId,
+          sessionToken: sessionToken,
+          devicePendingCancelled: deviceCancelled,
+        );
+        if (deviceCancelled) await store.clearPendingSetup(device);
+      } catch (_) {}
+    }
+    throw error;
+  }
+
+  /// 本机的稳定 App 实例标识（32 hex），用于 Gateway 手机凭据。
+  Future<String> _appInstanceId() async {
+    final preferences = await SharedPreferences.getInstance();
+    const key = 'mimivent.gateway.app_instance_id.v1';
+    final existing = preferences.getString(key);
+    if (existing != null && RegExp(r'^[0-9a-f]{32}$').hasMatch(existing)) {
+      return existing;
+    }
+    final generated = randomId();
+    await preferences.setString(key, generated);
+    return generated;
+  }
+
+  /// 激活后设备需要重新发布 state，Gateway 才能读到 service 字段完成核验。
+  Future<bool> _waitForServiceVerification({
+    required String setupId,
+    required String sessionToken,
+    required String deviceId,
+    required String credentialId,
+    required String serviceToken,
+  }) async {
+    final deadline = DateTime.now().add(const Duration(seconds: 20));
+    while (DateTime.now().isBefore(deadline)) {
+      try {
+        final result = await gatewayTransport.verifySetup(
+          setupId: setupId,
+          sessionToken: sessionToken,
+        );
+        if (result['verified'] == true) return true;
+      } on NasGatewayException catch (error) {
+        if (error.code == 'SETUP_SESSION_INVALID') rethrow;
+        if (error.code == 'SERVICE_NOT_STAGED') {
+          // 进程可能在设备激活后、Gateway 持久化状态恢复期间退出；凭据仍在 Keystore，按原事务补交。
+          try {
+            await gatewayTransport.saveServiceCredential(
+              setupId: setupId,
+              sessionToken: sessionToken,
+              deviceId: deviceId,
+              credentialId: credentialId,
+              token: serviceToken,
+            );
+          } on NasGatewayException catch (saveError) {
+            if (saveError.code == 'SETUP_SESSION_INVALID') rethrow;
+          } catch (_) {}
+        }
+        // 设备可能还在重连 MQTT，继续等待。
+      } catch (_) {
+        // 设备可能还在重连 MQTT，继续等待。
+      }
+      await Future<void>.delayed(const Duration(seconds: 2));
+    }
+    return false;
   }
 
   Future<void> revoke() => run(() async {
@@ -730,9 +1082,8 @@ class WifiBindingController extends ChangeNotifier {
         if (network['deviceId'] != binding.deviceId) {
           throw StateError('请通过蓝牙连接此记录对应的设备');
         }
-        await request(
-            binding.state == 'pending' ? 'wifi.bind.cancel' : 'wifi.revoke',
-            extra: {'tokenId': binding.tokenId});
+        // 设备端是单服务授权，没有每手机 token 可撤销；本机凭据移除即失去访问能力。
+        // 需要让其他手机也失效时，在网关的“手机管理”里撤销。
         await removeSelected();
       });
   Future<void> removeSelected() async {
@@ -755,51 +1106,31 @@ class WifiBindingController extends ChangeNotifier {
         secureStoreReady = true;
       });
 
-  /// 清除设备端全部 WiFi 授权；用于旧手机丢失/卸载后，3 个槽位被占满的恢复。
-  Future<void> resetDeviceBindings() => run(() async {
+  /// 同步清除设备服务凭据、Gateway 服务记录及本机的设备访问记录。
+  /// 任一已授权手机都可发起；完成后所有手机都需要重新加入。
+  Future<void> resetDeviceServiceAuthorization() => run(() async {
         final network = await request('wifi.status');
         final device = network['deviceId'];
         if (device is! String) throw StateError('设备未返回稳定身份');
-        await request('wifi.bind.reset', extra: {
-          'confirm': 'RESET_ALL_BINDINGS',
+        final binding = selected;
+        // 先清设备侧，再清 Gateway。若 BLE 清除失败，现有网关凭据仍可重试；
+        // 不能先撤销手机凭据，否则 BLE 中断后会失去恢复 Gateway 的授权。
+        await request('wifi.service.clear', extra: {
+          'confirm': 'CLEAR_SERVICE',
         });
+        if (binding != null && binding.deviceId == device) {
+          final gatewayReset = await gatewayTransport.resetDeviceAuth(binding);
+          if (!gatewayReset) {
+            throw StateError('设备服务授权已清除，但 NAS 授权记录尚未同步清除。请保持蓝牙连接后重试重置。');
+          }
+        }
         final remaining = records
             .where((binding) => binding.deviceId != device)
             .toList(growable: false);
         await persist(remaining);
+        await store.clearPendingSetup(device);
         selected = remaining.isEmpty ? null : remaining.first;
         status = null;
         error = null;
-      });
-
-  Future<Map<String, dynamic>> listDeviceClients() async {
-    final device = await request('wifi.status');
-    final clients = await request('wifi.clients');
-    final list = clients['clients'];
-    if (device['deviceId'] is! String ||
-        list is! List ||
-        list.any((item) =>
-            item is! Map ||
-            item['tokenId'] is! String ||
-            !RegExp(r'^[0-9a-f]{32}$').hasMatch(item['tokenId'] as String) ||
-            item['clientId'] is! String)) {
-      throw StateError('设备返回的绑定列表格式无效');
-    }
-    return {'deviceId': device['deviceId'], 'clients': clients['clients']};
-  }
-
-  Future<void> revokeDeviceClient(String deviceId, String tokenId) =>
-      run(() async {
-        final current = await request('wifi.status');
-        if (current['deviceId'] != deviceId) {
-          throw StateError('蓝牙连接的设备已变化，请重新打开管理列表');
-        }
-        await request('wifi.revoke', extra: {'tokenId': tokenId});
-        await persist(records
-            .where((r) => r.deviceId != deviceId || r.tokenId != tokenId)
-            .toList());
-        if (selected?.deviceId == deviceId && selected?.tokenId == tokenId) {
-          selected = records.isEmpty ? null : records.first;
-        }
       });
 }

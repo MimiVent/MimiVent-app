@@ -186,7 +186,7 @@ class NasGatewayTransport {
       final request = await client.getUrl(uri).timeout(_timeout);
       request.headers
         ..set(HttpHeaders.authorizationHeader, 'Bearer ${binding.token}')
-        ..set('X-Device-Token-Id', binding.tokenId);
+        ..set('X-App-Instance-Id', binding.tokenId);
       final response = await request.close().timeout(_timeout);
       final bytes = await response.fold<List<int>>(<int>[], (all, part) {
         if (all.length + part.length > 8192) {
@@ -204,6 +204,315 @@ class NasGatewayTransport {
       return null;
     }
   }
+
+  // ---- P2 单服务授权（Gateway 用 AuthorizationStore 管理窗口/会话/凭据）----
+  Future<Map<String, dynamic>> _setupRequest(
+    String path, {
+    Map<String, dynamic>? body,
+    Map<String, String> headers = const {},
+    String method = 'POST',
+  }) async {
+    final config = await loadConfig();
+    // 首次配置时网关还未启用（enabled 开关用于“是否走网关控制”），
+    // 这里只要求已填写地址与证书指纹。
+    final baseUrl = config['url'] ?? '';
+    if (baseUrl.isEmpty) {
+      throw const NasGatewayException(
+          'GATEWAY_NOT_CONFIGURED', '请先填写 NAS 网关地址');
+    }
+    final uri = Uri.parse(baseUrl).resolve(path);
+    final client = _httpClient(uri, config['certificatePin']!);
+    try {
+      final request = method == 'GET'
+          ? await client.getUrl(uri).timeout(_timeout)
+          : await client.postUrl(uri).timeout(_timeout);
+      for (final entry in headers.entries) {
+        request.headers.set(entry.key, entry.value);
+      }
+      if (body != null) {
+        request.headers.contentType = ContentType.json;
+        request.write(jsonEncode(body));
+      }
+      final response = await request.close().timeout(_timeout);
+      final bytes = await response.fold<List<int>>(<int>[], (all, part) {
+        if (all.length + part.length > 8192) {
+          throw const FormatException('网关响应超出长度限制');
+        }
+        return all..addAll(part);
+      }).timeout(_timeout);
+      final decoded = jsonDecode(utf8.decode(bytes));
+      if (decoded is! Map<String, dynamic>) {
+        throw const NasGatewayException('INVALID_RESPONSE', '网关响应格式无效');
+      }
+      if (response.statusCode != 200) {
+        final code = decoded['error']?.toString() ?? 'SETUP_FAILED';
+        final message = code == 'SERVICE_CREDENTIAL_REJECTED'
+            ? 'NAS 仍保留旧的手机授权，未能接受新服务凭据。请更新 NAS Gateway 后，在蓝牙连接状态下重试直接配置。'
+            : code == 'SETUP_WINDOW_INVALID_OR_EXPIRED'
+                ? 'NAS 配置窗口已过期，请重新点击直接配置。'
+                : '网关拒绝：$code';
+        throw NasGatewayException(code, message);
+      }
+      return decoded;
+    } on NasGatewayException {
+      rethrow;
+    } catch (error) {
+      throw NasGatewayException('SETUP_UNAVAILABLE', '无法连接 NAS 网关：$error');
+    }
+  }
+
+  /// 已加入服务的手机生成邀请码（24 小时有效，一次性）。
+  Future<Map<String, dynamic>> createInvite(WifiBinding binding) async {
+    final config = await loadConfig();
+    final baseUrl = config['url'] ?? '';
+    if (baseUrl.isEmpty) {
+      throw const NasGatewayException(
+          'GATEWAY_NOT_CONFIGURED', '请先填写 NAS 网关地址');
+    }
+    final uri =
+        Uri.parse(baseUrl).resolve('/api/v1/devices/${binding.deviceId}/apps');
+    final client = _httpClient(uri, config['certificatePin']!);
+    try {
+      final request = await client.postUrl(uri).timeout(_timeout);
+      request.headers
+        ..contentType = ContentType.json
+        ..set(HttpHeaders.authorizationHeader, 'Bearer ${binding.token}')
+        ..set('X-App-Instance-Id', binding.tokenId);
+      request.write('{}');
+      final response = await request.close().timeout(_timeout);
+      final text =
+          await response.transform(utf8.decoder).join().timeout(_timeout);
+      final decoded = jsonDecode(text);
+      if (decoded is! Map<String, dynamic>) {
+        throw const NasGatewayException('INVALID_RESPONSE', '网关响应格式无效');
+      }
+      if (response.statusCode != 200) {
+        throw NasGatewayException(
+          decoded['error']?.toString() ?? 'INVITE_FAILED',
+          '生成邀请码失败：${decoded['error'] ?? response.statusCode}',
+        );
+      }
+      return decoded;
+    } on NasGatewayException {
+      rethrow;
+    } catch (error) {
+      throw NasGatewayException('INVITE_UNAVAILABLE', '无法连接网关：$error');
+    }
+  }
+
+  /// 从 Gateway 查询所有手机凭据。手机管理不依赖 BLE，也不读取设备端旧槽位。
+  Future<Map<String, dynamic>> listApps(WifiBinding binding) async {
+    final generation = _captureConfigurationGeneration();
+    if (generation == null) throw _configurationChanged();
+    final config = await loadConfig();
+    if (!_isCurrentConfiguration(generation)) throw _configurationChanged();
+    final baseUrl = config['url'] ?? '';
+    if (baseUrl.isEmpty) {
+      throw const NasGatewayException('GATEWAY_NOT_CONFIGURED', '请先配置 NAS 网关');
+    }
+    final uri =
+        Uri.parse(baseUrl).resolve('/api/v1/devices/${binding.deviceId}/apps');
+    final client = _httpClient(uri, config['certificatePin'] ?? '');
+    try {
+      final request = await client.getUrl(uri).timeout(_timeout);
+      request.headers
+        ..set(HttpHeaders.authorizationHeader, 'Bearer ${binding.token}')
+        ..set('X-App-Instance-Id', binding.tokenId);
+      final response = await request.close().timeout(_timeout);
+      final bytes = await response.fold<List<int>>(<int>[], (all, part) {
+        if (all.length + part.length > 8192) {
+          throw const FormatException('手机列表响应超出长度限制');
+        }
+        return all..addAll(part);
+      }).timeout(_timeout);
+      if (!_isCurrentConfiguration(generation)) throw _configurationChanged();
+      final decoded = jsonDecode(utf8.decode(bytes));
+      if (decoded is! Map<String, dynamic>) {
+        throw const NasGatewayException('INVALID_RESPONSE', '手机列表响应格式无效');
+      }
+      if (response.statusCode != HttpStatus.ok) {
+        final code = decoded['error']?.toString() ?? 'APP_LIST_FAILED';
+        throw NasGatewayException(code, _appManagementError(code));
+      }
+      final apps = decoded['apps'];
+      if (decoded['deviceId'] != binding.deviceId ||
+          decoded['currentAppInstanceId'] != binding.tokenId ||
+          !const ['admin', 'control'].contains(decoded['currentRole']) ||
+          apps is! List ||
+          apps.any((item) =>
+              item is! Map<String, dynamic> ||
+              item['appInstanceId'] is! String ||
+              !RegExp(r'^[0-9a-f]{32}$')
+                  .hasMatch(item['appInstanceId'] as String) ||
+              item['name'] is! String ||
+              !const ['admin', 'control'].contains(item['role']) ||
+              item['revoked'] is! bool)) {
+        throw const NasGatewayException('INVALID_RESPONSE', '手机列表缺少有效的授权信息');
+      }
+      return decoded;
+    } on NasGatewayException {
+      rethrow;
+    } catch (error) {
+      if (!_isCurrentConfiguration(generation)) throw _configurationChanged();
+      throw NasGatewayException('APP_LIST_UNAVAILABLE', '无法读取已授权手机：$error');
+    }
+  }
+
+  /// 撤销某个 App 安装实例的 Gateway 凭据，不改变设备服务授权。
+  Future<void> revokeApp(WifiBinding binding, String appInstanceId) async {
+    if (!RegExp(r'^[0-9a-f]{32}$').hasMatch(appInstanceId)) {
+      throw const NasGatewayException('INVALID_APP_INSTANCE', '手机授权标识无效');
+    }
+    final generation = _captureConfigurationGeneration();
+    if (generation == null) throw _configurationChanged();
+    final config = await loadConfig();
+    if (!_isCurrentConfiguration(generation)) throw _configurationChanged();
+    final baseUrl = config['url'] ?? '';
+    if (baseUrl.isEmpty) {
+      throw const NasGatewayException('GATEWAY_NOT_CONFIGURED', '请先配置 NAS 网关');
+    }
+    final uri = Uri.parse(baseUrl)
+        .resolve('/api/v1/devices/${binding.deviceId}/apps/$appInstanceId');
+    final client = _httpClient(uri, config['certificatePin'] ?? '');
+    try {
+      final request = await client.deleteUrl(uri).timeout(_timeout);
+      request.headers
+        ..set(HttpHeaders.authorizationHeader, 'Bearer ${binding.token}')
+        ..set('X-App-Instance-Id', binding.tokenId);
+      final response = await request.close().timeout(_timeout);
+      final bytes = await response.fold<List<int>>(<int>[], (all, part) {
+        if (all.length + part.length > 8192) {
+          throw const FormatException('撤销响应超出长度限制');
+        }
+        return all..addAll(part);
+      }).timeout(_timeout);
+      if (!_isCurrentConfiguration(generation)) throw _configurationChanged();
+      final decoded = jsonDecode(utf8.decode(bytes));
+      if (decoded is! Map<String, dynamic>) {
+        throw const NasGatewayException('INVALID_RESPONSE', '撤销响应格式无效');
+      }
+      if (response.statusCode != HttpStatus.ok ||
+          decoded['deviceId'] != binding.deviceId ||
+          decoded['appInstanceId'] != appInstanceId ||
+          decoded['revoked'] != true) {
+        final code = decoded['error']?.toString() ?? 'APP_REVOKE_FAILED';
+        throw NasGatewayException(code, _appManagementError(code));
+      }
+    } on NasGatewayException {
+      rethrow;
+    } catch (error) {
+      if (!_isCurrentConfiguration(generation)) throw _configurationChanged();
+      throw NasGatewayException('APP_REVOKE_UNAVAILABLE', '撤销手机授权失败：$error');
+    }
+  }
+
+  String _appManagementError(String code) =>
+      const {
+        'ADMIN_REQUIRED': '当前 NAS Gateway 仍要求管理员权限，请更新 Gateway 后重试',
+        'LAST_ADMIN_CANNOT_REVOKE': '当前 NAS Gateway 仍启用管理员限制，请更新 Gateway 后重试',
+        'CANNOT_REVOKE_SELF': '不能撤销当前手机自己的 NAS 授权',
+        'APP_NOT_FOUND': '该手机授权已不存在或已被撤销',
+        'INVALID_BEARER': '当前手机凭据已失效，请重新加入服务',
+      }[code] ??
+      '网关手机管理失败（$code）';
+
+  /// 新手机用邀请码兑换自己的访问凭据；不需要设备蓝牙。
+  Future<Map<String, dynamic>> redeemInvite({
+    required String inviteCode,
+    required String appInstanceId,
+    required String name,
+  }) =>
+      _setupRequest('/api/v1/invites/redeem',
+          body: {'inviteCode': inviteCode, 'name': name},
+          headers: {'x-app-instance-id': appInstanceId});
+
+  /// 清除 Gateway 侧该设备的全部授权（服务凭据 + 所有手机凭据）。
+  /// 设备侧清除服务授权后必须同步调用，否则旧 admin 会阻塞重新配置。
+  Future<bool> resetDeviceAuth(WifiBinding binding) async {
+    final config = await loadConfig();
+    final baseUrl = config['url'] ?? '';
+    if (baseUrl.isEmpty) return false;
+    final uri =
+        Uri.parse(baseUrl).resolve('/api/v1/devices/${binding.deviceId}/reset');
+    final client = _httpClient(uri, config['certificatePin']!);
+    try {
+      final request = await client.postUrl(uri).timeout(_timeout);
+      request.headers
+        ..contentType = ContentType.json
+        ..set(HttpHeaders.authorizationHeader, 'Bearer ${binding.token}')
+        ..set('X-App-Instance-Id', binding.tokenId);
+      request.write('{}');
+      final response = await request.close().timeout(_timeout);
+      await response.drain<void>().timeout(_timeout);
+      return response.statusCode == 200;
+    } catch (error) {
+      debugPrint('[gw] resetDeviceAuth failed: $error');
+      return false;
+    }
+  }
+
+  /// 生成一次性配置窗口（5 分钟，单次使用）。
+  Future<Map<String, dynamic>> openSetupWindow() =>
+      _setupRequest('/api/v1/setup/windows');
+
+  /// 用窗口密钥建立配置会话；窗口一旦消费即失效。
+  Future<Map<String, dynamic>> createSetupSession({
+    required String setupId,
+    required String setupSecret,
+    required String appInstanceId,
+  }) =>
+      _setupRequest('/api/v1/setup/sessions',
+          body: {'setupId': setupId, 'setupSecret': setupSecret},
+          headers: {'x-app-instance-id': appInstanceId});
+
+  /// 恢复过期但尚未完成的配置会话；Gateway 会校验原会话令牌并续期。
+  Future<Map<String, dynamic>> resumeSetupSession({
+    required String setupId,
+    required String sessionToken,
+  }) =>
+      _setupRequest('/api/v1/setup/sessions/$setupId/resume',
+          body: {'sessionToken': sessionToken});
+
+  /// 把设备生成的服务凭据转交 Gateway（明文只落 Gateway 侧 0600 文件）。
+  Future<Map<String, dynamic>> saveServiceCredential({
+    required String setupId,
+    required String sessionToken,
+    required String deviceId,
+    required String credentialId,
+    required String token,
+  }) =>
+      _setupRequest('/api/v1/setup/sessions/$setupId/service', body: {
+        'sessionToken': sessionToken,
+        'deviceId': deviceId,
+        'credentialId': credentialId,
+        'token': token,
+      });
+
+  /// 只读核验：设备必须在 BLE 激活后重新上报 state，且 service.credentialId 匹配。
+  Future<Map<String, dynamic>> verifySetup({
+    required String setupId,
+    required String sessionToken,
+  }) =>
+      _setupRequest('/api/v1/setup/sessions/$setupId/verify',
+          body: {'sessionToken': sessionToken});
+
+  /// 完成配置并签发本手机访问凭据（appToken 只返回一次）。
+  Future<Map<String, dynamic>> completeSetup({
+    required String setupId,
+    required String sessionToken,
+  }) =>
+      _setupRequest('/api/v1/setup/sessions/$setupId/complete',
+          body: {'sessionToken': sessionToken});
+
+  Future<Map<String, dynamic>> cancelSetup({
+    required String setupId,
+    required String sessionToken,
+    bool devicePendingCancelled = false,
+  }) =>
+      _setupRequest('/api/v1/setup/sessions/$setupId/cancel', body: {
+        'sessionToken': sessionToken,
+        'devicePendingCancelled': devicePendingCancelled,
+      });
 
   /// 经 Gateway 发起设备 MQTT 只读查询。失败时抛出错误，不回退设备 HTTPS。
   Future<Map<String, dynamic>> readPath(
@@ -233,7 +542,7 @@ class NasGatewayTransport {
       request.headers
         ..contentType = ContentType.json
         ..set(HttpHeaders.authorizationHeader, 'Bearer ${binding.token}')
-        ..set('X-Device-Token-Id', binding.tokenId);
+        ..set('X-App-Instance-Id', binding.tokenId);
       request.write(jsonEncode({'path': path}));
       final response = await request.close().timeout(queryTimeout);
       final bytes = await response.fold<List<int>>(<int>[], (all, part) {
@@ -257,6 +566,18 @@ class NasGatewayTransport {
       if (response.statusCode != HttpStatus.ok) {
         final code = envelope['error']?.toString() ??
             'NAS_GATEWAY_HTTP_${response.statusCode}';
+        if (code == 'SERVICE_CREDENTIAL_MISMATCH') {
+          throw NasGatewayException(
+            code,
+            '设备与 NAS 的服务授权不同步；请任一已加入手机连接蓝牙，在“设备网络与 NAS 控制”中重置服务授权并重新配置，其他手机随后需要重新加入',
+          );
+        }
+        if (code == 'DEVICE_SERVICE_IDENTITY_UNAVAILABLE') {
+          throw NasGatewayException(
+            code,
+            '设备未上报服务授权状态；请确认固件版本并刷新设备状态',
+          );
+        }
         throw NasGatewayException(code, 'NAS 查询失败（$code）');
       }
       if (envelope['schemaVersion'] != 1 ||
@@ -271,6 +592,13 @@ class NasGatewayTransport {
       final body = Map<String, dynamic>.from(envelope['body'] as Map);
       if (statusCode != HttpStatus.ok) {
         final code = body['error']?.toString() ?? 'DEVICE_HTTP_$statusCode';
+        if (statusCode == HttpStatus.unauthorized &&
+            code == 'BINDING_INVALID') {
+          throw const NasGatewayException(
+            'SERVICE_CREDENTIAL_MISMATCH',
+            '设备拒绝 NAS 服务凭据；请任一已加入手机连接蓝牙重置服务授权并重新配置，其他手机随后需要重新加入',
+          );
+        }
         throw NasGatewayException(code, '设备查询失败（$code）');
       }
       return body;
@@ -312,7 +640,7 @@ class NasGatewayTransport {
       final request = await client.getUrl(uri).timeout(_timeout);
       request.headers
         ..set(HttpHeaders.authorizationHeader, 'Bearer ${binding.token}')
-        ..set('X-Device-Token-Id', binding.tokenId);
+        ..set('X-App-Instance-Id', binding.tokenId);
       final response = await request.close().timeout(_timeout);
       final bytes = await response.fold<List<int>>(<int>[], (all, part) {
         if (all.length + part.length > 4096) {
@@ -332,7 +660,9 @@ class NasGatewayTransport {
       if (body['requestId'] != requestId ||
           !['applied', 'rejected', 'pending', 'unknown']
               .contains(body['status']) ||
-          body['httpStatus'] is! int) return null;
+          body['httpStatus'] is! int) {
+        return null;
+      }
       return NasGatewayHttpResult(response.statusCode, body);
     } on SocketException {
       return null;
@@ -374,7 +704,7 @@ class NasGatewayTransport {
       request.headers
         ..contentType = ContentType.json
         ..set(HttpHeaders.authorizationHeader, 'Bearer ${binding.token}')
-        ..set('X-Device-Token-Id', binding.tokenId);
+        ..set('X-App-Instance-Id', binding.tokenId);
       request.write(jsonEncode({
         'version': 1,
         'requestId': requestId,
